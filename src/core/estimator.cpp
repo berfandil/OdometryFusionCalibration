@@ -11,7 +11,8 @@
 //     dt = (t1 - q0) seconds                   (ACTUAL elapsed motion, not a fixed step)
 //     for each registered source:
 //       B = query(q0, t1)                     (source-frame delta over the interval)
-//       A = X o B o X^-1                       (frame-align to base; X = sensor->base
+//       B_corr = { B.R, B.t / prior_scale }   (de-scale the reported translation, D20)
+//       A = X o B_corr o X^-1                  (frame-align to base; X = sensor->base
 //                                               prior extrinsic — see convention below)
 //       w = clamp(weight_prior * sigma_confidence)
 //     median of {A_i} weighted by {w_i}        (split-metric Weiszfeld)
@@ -73,9 +74,12 @@ struct Estimator::Impl {
     const ISource* sources[kMaxSourcesCap] = {};
     int            source_count = 0;
 
-    // Per-source prior extrinsic (sensor->base) and prior weight, looked up from the
-    // SensorConfig matching the source id (identity / 1.0 if no config provided).
+    // Per-source prior extrinsic (sensor->base), prior translation scale, and prior
+    // weight, looked up from the SensorConfig matching the source id (identity / 1.0 /
+    // 1.0 if no config provided). prior_scale de-scales the source's reported
+    // translation before the frame-align (D20 — inverts the sim's per-source scale).
     SE3    prior_extrinsic[kMaxSourcesCap];
+    Scalar prior_scale[kMaxSourcesCap];
     Scalar weight_prior[kMaxSourcesCap];
 
     // Scratch for the per-step fuse (no heap in step()).
@@ -121,6 +125,7 @@ Status Estimator::init(const Config& cfg) {
     for (int i = 0; i < kMaxSourcesCap; ++i) {
         impl_->sources[i]         = nullptr;
         impl_->prior_extrinsic[i] = SE3{};
+        impl_->prior_scale[i]     = Scalar(1);
         impl_->weight_prior[i]    = Scalar(1);
     }
     impl_->inited = true;
@@ -136,10 +141,15 @@ Status Estimator::add_source(const ISource* src) {
     }
     const int slot = impl_->source_count;
     impl_->sources[slot] = src;
-    // Bind the prior extrinsic + weight for this source from its SensorConfig.
+    // Bind the prior extrinsic + translation scale + weight for this source from its
+    // SensorConfig (defaults: identity / 1.0 / 1.0 when no config matches).
     const SensorConfig* sc = impl_->sensor_for(src->id());
     impl_->prior_extrinsic[slot] = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
-    impl_->weight_prior[slot]    = (sc != nullptr) ? sc->weight_prior   : Scalar(1);
+    impl_->weight_prior[slot]    = (sc != nullptr) ? sc->weight_prior    : Scalar(1);
+    // prior_scale must be positive (validate is expected to enforce this, but be safe:
+    // a non-positive scale would blow up the de-scale division in step()).
+    const Scalar ps = (sc != nullptr) ? sc->prior_scale : Scalar(1);
+    impl_->prior_scale[slot] = (ps > Scalar(0)) ? ps : Scalar(1);
     ++impl_->source_count;
     return Status::Ok;
 }
@@ -191,9 +201,17 @@ Status Estimator::step(Timestamp now) {
         if (!q.ok()) continue;
 
         const Delta& d = q.value();
-        // Frame-align: A = X o B o X^-1  (X = sensor->base prior extrinsic).
+        // De-scale the reported translation by the per-source prior_scale BEFORE the
+        // frame-align (D20). The source reports B with B.t already multiplied by `scale`
+        // (the sim applies scale to B.t AFTER the X-conjugation), so dividing B.t by the
+        // matching prior_scale and then conjugating inverts it exactly:
+        //   B_corr = { B.R, B.t / prior_scale } ;  A = X o B_corr o X^-1.
+        // prior_scale is guaranteed > 0 by add_source (guarded), so this never /0.
+        SE3 B_corr = d.motion;
+        B_corr.t   = d.motion.t / s.prior_scale[i];
+        // Frame-align: A = X o B_corr o X^-1  (X = sensor->base prior extrinsic).
         const SE3& X = s.prior_extrinsic[i];
-        const SE3 A  = se3::compose(se3::compose(X, d.motion), se3::inverse(X));
+        const SE3 A  = se3::compose(se3::compose(X, B_corr), se3::inverse(X));
 
         // Weight = prior x Sigma-confidence, clamped to [floor, cap].
         Scalar w = s.weight_prior[i] * sigma_confidence(d.cov);

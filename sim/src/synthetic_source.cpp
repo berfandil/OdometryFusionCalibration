@@ -30,7 +30,9 @@ SyntheticSource::SyntheticSource(const Trajectory& traj, const SourceParams& p)
     : traj_(&traj), p_(p) {}
 
 SE3 SyntheticSource::base_delta(Timestamp t0, Timestamp t1) const {
-    // Window shifted by the planted time offset; A = pose(ts)^{-1} o pose(te).
+    // CANONICAL SIGN: positive time_offset_s shifts the SAMPLED window LATER, so a query
+    // for [t0,t1] reads the true trajectory over [t0+off, t1+off]; A = pose(ts)^{-1} o
+    // pose(te). (This is the offset Slice-5 time-sync must recover with the right sign.)
     const Timestamp off = static_cast<Timestamp>(
         std::llround(p_.time_offset_s * Scalar(1e9)));
     const SE3 pose_ts = traj_->pose(t0 + off);
@@ -48,10 +50,14 @@ SE3 SyntheticSource::clean_reported_(Timestamp t0, Timestamp t1) const {
     return B;
 }
 
-Mat6 SyntheticSource::modeled_cov_(const SE3& reported) const {
+Mat6 SyntheticSource::modeled_cov_(const SE3& clean_delta) const {
     // Covariance consistent with the injected noise: per-axis variance from the
     // distance/angle-scaled sigma (floored), in [trans; rot] order (matches Delta::cov).
-    const Vec6 xi = se3::log(reported);
+    // Computed from the CLEAN pre-noise delta so the reported Sigma equals the sigma the
+    // noise was actually drawn with (review fix #5). On an outlier window the caller
+    // passes the CLEAN window delta here, not the gross outlier delta, so the reported
+    // Sigma is normal and does not down-weight the outlier (review fix #6).
+    const Vec6 xi = se3::log(clean_delta);
     const Scalar dist  = xi.head<3>().norm();
     const Scalar angle = xi.tail<3>().norm();
     const Scalar st = std::max(p_.noise_trans_floor, p_.noise_trans_per_m  * dist);
@@ -67,8 +73,13 @@ Mat6 SyntheticSource::modeled_cov_(const SE3& reported) const {
 
 bool SyntheticSource::in_any_(const std::vector<Window>& ws,
                               Timestamp t0, Timestamp t1) const {
-    // A window is "active" for [t0,t1] if the (offset-shifted) midpoint falls in it —
-    // the fault applies to the motion sampled over this query.
+    // A window is "active" for [t0,t1] if the (offset-shifted) MIDPOINT falls in it — the
+    // fault applies to the motion sampled over this query. Membership is ALL-OR-NOTHING:
+    // a query whose [t0,t1] straddles a fault-window edge is faulted (or not) for the WHOLE
+    // delta based solely on its midpoint; there is no partial-window fault. So a window
+    // boundary landing mid-query silently flips the entire reported delta. Acceptable for
+    // an oracle (faults are coarse-grained by design); the midpoint is shifted by the same
+    // time_offset_s as the sampled motion so the fault tracks the shifted window.
     const Scalar mid_s =
         (static_cast<Scalar>(t0) + static_cast<Scalar>(t1)) * Scalar(0.5) / Scalar(1e9)
         + p_.time_offset_s;
@@ -84,22 +95,30 @@ Expected<Delta> SyntheticSource::query(Timestamp t0, Timestamp t1) const {
     // Dropout: report a sensor gap.
     if (in_any_(p_.dropout_windows, t0, t1)) return Status::NoData;
 
+    // The CLEAN window delta (the reported sensor-frame motion absent any fault). Used
+    // both as the noise/covariance reference and as the reported delta on clean windows.
+    // On an outlier window we still derive Sigma and the noise sigmas from this clean
+    // delta so the reported Sigma is normal (review fixes #5/#6).
+    const SE3 B_clean = clean_reported_(t0, t1);
+
     SE3 B;
     if (in_any_(p_.outlier_windows, t0, t1)) {
         // Gross-wrong delta: integrate the outlier body twist over the window.
         const Scalar dt = static_cast<Scalar>(t1 - t0) / Scalar(1e9);
         B = se3::exp(p_.outlier_twist * dt);
     } else {
-        B = clean_reported_(t0, t1);
+        B = B_clean;
     }
 
-    // Add zero-mean Gaussian noise in the body tangent (deterministic per window).
+    // Add zero-mean Gaussian noise in the body tangent (deterministic per window). The
+    // noise sigmas scale with the CLEAN delta's magnitude (the motion actually intended),
+    // so the reported Sigma below matches the sigma the noise was drawn with (fix #5).
     const bool noisy = (p_.noise_trans_per_m   > Scalar(0)) ||
                        (p_.noise_rot_per_rad   > Scalar(0)) ||
                        (p_.noise_trans_floor   > Scalar(0)) ||
                        (p_.noise_rot_floor     > Scalar(0));
     if (noisy) {
-        const Vec6 xi = se3::log(B);
+        const Vec6 xi = se3::log(B_clean);
         const Scalar dist  = xi.head<3>().norm();
         const Scalar angle = xi.tail<3>().norm();
         const Scalar st = std::max(p_.noise_trans_floor, p_.noise_trans_per_m * dist);
@@ -108,8 +127,18 @@ Expected<Delta> SyntheticSource::query(Timestamp t0, Timestamp t1) const {
         std::mt19937_64 gen(mix_seed(p_.seed, t0, t1));
         std::normal_distribution<Scalar> nt(Scalar(0), st);
         std::normal_distribution<Scalar> nr(Scalar(0), sr);
+        // Draw into locals in EXPLICIT statement order, then assign. An Eigen comma-
+        // initializer (eps << nt(gen), ...) leaves the relative evaluation order of the
+        // six generator calls unspecified pre-C++17 (this target is C++14), so the noise
+        // would not be bit-reproducible across toolchains (review fix #3, DESIGN §10).
+        const Scalar e0 = nt(gen);
+        const Scalar e1 = nt(gen);
+        const Scalar e2 = nt(gen);
+        const Scalar e3 = nr(gen);
+        const Scalar e4 = nr(gen);
+        const Scalar e5 = nr(gen);
         Vec6 eps;
-        eps << nt(gen), nt(gen), nt(gen), nr(gen), nr(gen), nr(gen);
+        eps << e0, e1, e2, e3, e4, e5;
         // Right-perturb in the body tangent: B <- B o exp(eps).
         B = se3::compose(B, se3::exp(eps));
     }
@@ -118,7 +147,8 @@ Expected<Delta> SyntheticSource::query(Timestamp t0, Timestamp t1) const {
     d.motion = B;
     d.t0     = t0;
     d.t1     = t1;
-    d.cov    = p_.report_native_cov ? modeled_cov_(B) : Mat6::Identity();
+    // Cov from the CLEAN delta (normal even on outlier windows) — fixes #5/#6.
+    d.cov    = p_.report_native_cov ? modeled_cov_(B_clean) : Mat6::Identity();
     return d;
 }
 

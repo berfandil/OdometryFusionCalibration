@@ -4,7 +4,9 @@
 //
 // Measurement model (the inverse of the estimator's frame-align, D21). Over a query
 // window [t0, t1] the source:
-//   1. shifts the window by its planted time offset:   ts = t0 + off, te = t1 + off
+//   1. shifts the SAMPLED window LATER by its planted time offset (canonical sign —
+//      positive off => the source clock is ahead of base time):
+//          ts = t0 + off, te = t1 + off       (reads a later trajectory slice for off>0)
 //   2. reads the TRUE base motion from the trajectory:
 //          A = pose(ts)^{-1} o pose(te)                 (base-frame delta)
 //      (left-invariant body delta: the motion expressed at the body frame at ts).
@@ -21,12 +23,19 @@
 // Injection: an outlier window replaces B with a gross-wrong delta; a dropout window
 // makes query() return Status::NoData (a sensor gap).
 //
-// Determinism: the noise PRNG is a std::mt19937 seeded once from `seed` (a fixed seed
-// per source). Because query() is const but must advance the PRNG, the generator is
-// mutable. To keep the stream reproducible *independent of the call sequence*, each
-// window draws from a sub-generator seeded by hashing (seed, t0, t1) — so the noise on
-// a given window is a pure function of that window, not of how many queries preceded
-// it. This makes the rig deterministic regardless of tick alignment.
+// Determinism: each window draws from a std::mt19937_64 seeded by hashing (seed, t0, t1)
+// — so the noise on a given window is a pure function of that window, not of how many
+// queries preceded it. This makes the rig deterministic regardless of tick alignment.
+// The six body-tangent noise components are drawn into locals in explicit statement order
+// before assembling the Vec6, so the draw order is fixed across C++14 toolchains (an Eigen
+// comma-initializer would leave it unspecified pre-C++17).
+//
+// GOLDEN-REGRESSION CAVEAT (DESIGN §10): byte-stable golden output requires a FIXED stdlib.
+// std::mt19937_64 is portable, but std::normal_distribution's transform of the engine
+// stream is NOT specified by the standard — different stdlib implementations (libstdc++ /
+// libc++ / MSVC) emit different normal variates from the same engine. So replay/golden
+// regression is bit-exact only on a single stdlib; cross-stdlib comparison must use a
+// tolerance, not byte equality.
 #ifndef OFC_SIM_SYNTHETIC_SOURCE_HPP
 #define OFC_SIM_SYNTHETIC_SOURCE_HPP
 
@@ -54,7 +63,12 @@ struct SourceParams {
 
     SE3    X;                       // planted extrinsic (sensor->base). Identity = aligned.
     Scalar scale         = Scalar(1.0);   // planted translation scale (D20).
-    Scalar time_offset_s = Scalar(0.0);   // planted clock offset (this source leads/lags).
+    // Planted clock offset. CANONICAL SIGN CONVENTION (the contract Slice-5 time-sync
+    // must invert): POSITIVE time_offset_s shifts the SAMPLED window LATER. A query for
+    // the window [t0, t1] reads the TRUE trajectory over [t0 + off, t1 + off] — i.e. the
+    // source's clock is AHEAD of base time by `off`, so at base time t it reports the
+    // motion the base body actually had at t + off. Negative off reads an earlier slice.
+    Scalar time_offset_s = Scalar(0.0);
 
     // Noise model (deterministic, seeded). Per-distance translational sigma and
     // per-angle rotational sigma, applied in the body tangent of the reported delta.
@@ -111,8 +125,10 @@ private:
     bool in_any_(const std::vector<Window>& ws, Timestamp t0, Timestamp t1) const;
     // The clean reported sensor-frame delta B = scale_t( X^{-1} o A o X ) (no noise).
     SE3  clean_reported_(Timestamp t0, Timestamp t1) const;
-    // Synthesize the reported covariance from the noise model + motion magnitude.
-    Mat6 modeled_cov_(const SE3& reported) const;
+    // Synthesize the reported covariance from the noise model + motion magnitude of the
+    // CLEAN pre-noise delta (so the reported Sigma == the injected sigma; on an outlier
+    // window pass the clean window delta, not the gross outlier delta).
+    Mat6 modeled_cov_(const SE3& clean_delta) const;
 
     const Trajectory* traj_;
     SourceParams      p_;

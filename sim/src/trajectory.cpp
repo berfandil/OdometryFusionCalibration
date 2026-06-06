@@ -97,7 +97,13 @@ Vec6 Trajectory::twist(Timestamp t) const {
 Vec6 Trajectory::twist_s(Scalar t_s) const {
     if (segs_.empty()) return Vec6::Zero();
     const Scalar rel = t_s - t0_s_;
-    // At rest outside the trajectory's span.
+    // At rest outside the trajectory's span. HALF-OPEN convention: the span is [0, total),
+    // so twist drops to zero AT exactly rel == total (the `>=`), one tick before pose_s
+    // stops moving (pose_s clamps to the final boundary pose only for rel > total via
+    // segment_at_'s `rel >= total_s_` branch, which still returns the last segment's twist
+    // for the pose integral). Net: twist(end) == 0 while pose(end) is still the integrand's
+    // endpoint — harmless for queries, but twist(end) is NOT the instantaneous integrand of
+    // pose near end. Callers needing the end-of-motion twist should query just before end.
     if (rel < Scalar(0) || rel >= total_s_) return Vec6::Zero();
     Scalar tau = Scalar(0);
     const int k = segment_at_(rel, tau);
