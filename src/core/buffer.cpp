@@ -55,6 +55,7 @@ Status SourceBuffer::configure(const SensorConfig& sensor, OdomForm form,
     capacity_   = capacity;
     head_       = 0;
     count_      = 0;
+    any_native_ = false;
     configured_ = true;
     form_       = form;
     sensor_     = sensor;
@@ -64,8 +65,9 @@ Status SourceBuffer::configure(const SensorConfig& sensor, OdomForm form,
 }
 
 void SourceBuffer::reset() {
-    head_  = 0;
-    count_ = 0;
+    head_       = 0;
+    count_      = 0;
+    any_native_ = false;
 }
 
 const BufferEntry& SourceBuffer::at(int logical) const {
@@ -88,9 +90,15 @@ Status SourceBuffer::push_twist(Timestamp t, const Vec6& xi, const Mat6& cov) {
     } else {
         const BufferEntry& prev = at(count_ - 1);
         const Scalar dt = dt_seconds(prev.stamp, t);
+        // Per-sample exponential of the body twist. For a *constant* twist this
+        // sample-by-sample composition is EXACT, not an approximation: xi commutes
+        // with itself, so exp(xi*dt) composed n times equals exp(xi * n*dt). (The
+        // first-order error only appears when the twist varies between samples, or
+        // from the endpoint interpolation in query(), never from the composition.)
         const SE3 increment = se3::exp(xi * dt);
         e.cum_pose = se3::compose(prev.cum_pose, increment);
         e.incr_cov = cov * dt;   // integrate the per-second twist covariance
+        if (!cov.isZero(Scalar(0))) any_native_ = true;
     }
 
     const int phys = (head_ + count_) % capacity_;
@@ -117,6 +125,7 @@ Status SourceBuffer::push_increment(Timestamp t, const SE3& incr, const Mat6& co
         const BufferEntry& prev = at(count_ - 1);
         e.cum_pose = se3::compose(prev.cum_pose, incr);
         e.incr_cov = cov;
+        if (!cov.isZero(Scalar(0))) any_native_ = true;
     }
 
     const int phys = (head_ + count_) % capacity_;
@@ -140,6 +149,7 @@ Status SourceBuffer::push_absolute(Timestamp t, const SE3& pose, const Mat6& cov
     // covariance as the per-step increment covariance directly. The first entry has
     // no preceding increment, so its incr_cov is zero.
     e.incr_cov = (count_ == 0) ? Mat6::Zero() : cov;
+    if (count_ > 0 && !cov.isZero(Scalar(0))) any_native_ = true;
 
     const int phys = (head_ + count_) % capacity_;
     buf_[static_cast<std::size_t>(phys)] = e;
@@ -221,17 +231,20 @@ Mat6 SourceBuffer::modeled_cov(const SE3& motion) const {
 
 Mat6 SourceBuffer::combine_cov(const Mat6& native, const Mat6& modeled,
                                bool have_native) const {
-    // Per D7: no usable native covariance (provider disabled it, or none supplied)
-    // -> fall back to the modeled covariance.
-    if (!have_native || !sensor_.native_confidence) return modeled;
+    // Per D7: the native operand is the provider's accumulated native Sigma when one
+    // is available; when it is not (provider disabled native confidence, or no native
+    // cov was ever supplied) the native operand is the IDENTITY — NOT modeled-only.
+    // The configured combine rule then runs identically in both cases, so e.g. Sum
+    // still adds the modeled term to the identity, and Max takes max(Identity, modeled).
+    const Mat6 nat = have_native ? native : Mat6::Identity();
 
     switch (combine_) {
-        case ConfCombine::NativeOnly:  return native;
+        case ConfCombine::NativeOnly:  return nat;
         case ConfCombine::ModeledOnly: return modeled;
-        case ConfCombine::Sum:         return native + modeled;
-        case ConfCombine::Max:         return native.cwiseMax(modeled);
+        case ConfCombine::Sum:         return nat + modeled;
+        case ConfCombine::Max:         return nat.cwiseMax(modeled);
         case ConfCombine::Weighted:
-            return blend_ * native + (Scalar(1) - blend_) * modeled;
+            return blend_ * nat + (Scalar(1) - blend_) * modeled;
     }
     return modeled;   // unreachable; defensive default
 }
@@ -249,7 +262,12 @@ Expected<Delta> SourceBuffer::query(Timestamp t0, Timestamp t1) const {
     d.motion = se3::compose(se3::inverse(p0), p1);
 
     const Mat6 native  = accumulate_native_cov(t0, t1);
-    const bool have_native = !native.isZero(Scalar(0));
+    // "Native present?" is decided from the explicit SensorConfig::native_confidence
+    // flag bound at configure(), AND from whether any native covariance was actually
+    // supplied via a push. We deliberately do NOT infer it from the accumulated cov
+    // being (near) zero: a genuine source can legitimately report ~zero covariance,
+    // and an exact-zero float compare is brittle.
+    const bool have_native = sensor_.native_confidence && any_native_;
     const Mat6 modeled = modeled_cov(d.motion);
     d.cov = combine_cov(native, modeled, have_native);
 

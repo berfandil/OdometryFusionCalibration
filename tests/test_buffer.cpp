@@ -85,6 +85,9 @@ TEST_CASE("constant-velocity twist integrates to analytic delta over a sub-windo
     }
 
     // Query a sub-window [0.3s, 1.1s] -> duration 0.8s. Analytic: exp(xi * 0.8).
+    // For a constant twist the per-sample composition is EXACT (xi commutes with
+    // itself: exp(xi*dt)^n = exp(xi*n*dt)), so the only residual is the endpoint
+    // interpolation at the non-sample window bounds -> the small tolerances below.
     const Delta d = b.query(secs(0.3), secs(1.1)).value();
     const SE3 expected = se3::exp(xi * 0.8);
     CHECK(close(d.motion.R, expected.R, 1e-6));
@@ -256,9 +259,62 @@ TEST_CASE("native(+)modeled combine honors every ConfCombine rule") {
         CHECK(c(0, 0) == doctest::Approx(0.25 * nat_t + 0.75 * mod_t));
     }
     {
-        // native_confidence = false -> falls back to modeled regardless of combine.
+        // native_confidence = false -> per D7 the missing native Sigma is the
+        // identity, then the configured rule still runs: Sum -> Identity + modeled.
         const Mat6 c = build(ConfCombine::Sum, 0.5, false);
-        CHECK(c(0, 0) == doctest::Approx(mod_t));
+        CHECK(c(0, 0) == doctest::Approx(1.0 + mod_t));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D7 missing-native: absent native Sigma is the IDENTITY, then the configured
+// ConfCombine rule runs (NOT modeled-only). Exercise native-present vs
+// native_confidence=false for at least Sum and Max.
+// ---------------------------------------------------------------------------
+TEST_CASE("missing native covariance combines identity (not modeled-only) per D7") {
+    // One increment of 1 m along x, no rotation. native = 2*Identity (when present).
+    // modeled: per_m = 0.5 over 1 m -> trans var 0.25; per_rad = 0 -> rot var ~0.
+    SE3 step; step.t = Vec3(1.0, 0.0, 0.0);
+    const Mat6 native = 2.0 * Mat6::Identity();
+
+    auto build = [&](ConfCombine combine, bool native_conf) {
+        SourceBuffer b;
+        b.configure(make_sensor(0.5, 0.0, native_conf), OdomForm::Increment, 8,
+                    combine);
+        b.push_increment(secs(0.0), SE3{}, Mat6::Zero());
+        b.push_increment(secs(1.0), step, native);
+        return b.query(secs(0.0), secs(1.0)).value().cov;
+    };
+
+    const Scalar nat_t = 2.0;     // native trans diagonal (present)
+    const Scalar mod_t = 0.25;    // modeled trans diagonal
+    const Scalar id_t  = 1.0;     // identity native operand when absent
+
+    // --- Sum --------------------------------------------------------------
+    {
+        // native present: native + modeled.
+        const Mat6 c = build(ConfCombine::Sum, true);
+        CHECK(c(0, 0) == doctest::Approx(nat_t + mod_t));
+    }
+    {
+        // native absent (native_confidence=false): Identity + modeled, NOT modeled.
+        const Mat6 c = build(ConfCombine::Sum, false);
+        CHECK(c(0, 0) == doctest::Approx(id_t + mod_t));
+        // The identity native operand also shows through the rotation block, where
+        // the modeled rot var is ~0 here -> ~1 from Identity alone.
+        CHECK(c(3, 3) == doctest::Approx(id_t));
+    }
+
+    // --- Max --------------------------------------------------------------
+    {
+        // native present: max(2, 0.25) = 2.
+        const Mat6 c = build(ConfCombine::Max, true);
+        CHECK(c(0, 0) == doctest::Approx(nat_t));
+    }
+    {
+        // native absent: max(Identity, modeled) = max(1, 0.25) = 1, NOT modeled.
+        const Mat6 c = build(ConfCombine::Max, false);
+        CHECK(c(0, 0) == doctest::Approx(id_t));
     }
 }
 

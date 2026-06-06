@@ -27,17 +27,23 @@ enum class OdomForm { Twist, Increment, AbsolutePose };
 // previous entry, in [trans; rot] order (matching Delta::cov). First entry's
 // incr_cov is zero (no preceding increment).
 struct BufferEntry {
-    Timestamp stamp    = 0;
-    SE3       cum_pose;                  // identity by default
+    Timestamp stamp    = Timestamp(0);
+    SE3       cum_pose = SE3{};          // identity by default
     Mat6      incr_cov = Mat6::Zero();   // cov of increment (prev -> this)
 };
 
 // Fixed-capacity ring buffer for one odometry source.
 //
-// Covariance frame convention (this slice): incr_cov is expressed in the source's
-// body-increment tangent frame and accumulated additively across the window. This
-// is a simple, consistent first-order model; a fuller adjoint-transported model is
-// deferred (it is not needed for the median weighting this feeds).
+// Covariance convention (this slice, all three native forms): the covariance
+// supplied to a push helper is treated as the *per-step increment* covariance
+// (the covariance of the motion from the previous entry to this one), expressed in
+// the source's body-increment tangent frame, in [trans; rot] order (matching
+// Delta::cov). In particular, push_absolute does NOT difference two absolute-pose
+// covariances (the difference of two absolute Sigmas is not guaranteed PSD); it
+// takes the supplied Sigma directly as the increment covariance. query() then
+// accumulates these increments additively across the window. This is a simple,
+// consistent first-order model; a fuller adjoint-transported model is deferred (it
+// is not needed for the median weighting this feeds).
 class SourceBuffer {
 public:
     SourceBuffer() = default;
@@ -80,6 +86,10 @@ private:
     SE3  pose_at(Timestamp t) const;            // interpolated cum_pose at t (covered)
     Mat6 accumulate_native_cov(Timestamp t0, Timestamp t1) const;
     Mat6 modeled_cov(const SE3& motion) const;
+    // Per D7: combine the native and modeled covariances per the configured rule.
+    // When no usable native covariance is available (have_native == false) the
+    // native operand is the *identity* (D7: "missing native -> assume identity"),
+    // NOT modeled-only — so e.g. Sum still adds the modeled term to Identity.
     Mat6 combine_cov(const Mat6& native, const Mat6& modeled, bool have_native) const;
 
     std::vector<BufferEntry> buf_;          // sized in configure(); never grows after
@@ -87,6 +97,7 @@ private:
     int          head_       = 0;           // physical index of the oldest entry
     int          count_      = 0;
     bool         configured_ = false;
+    bool         any_native_ = false;       // a non-zero native cov was pushed at least once
     OdomForm     form_       = OdomForm::Increment;
     SensorConfig sensor_{};
     ConfCombine  combine_    = ConfCombine::Sum;
