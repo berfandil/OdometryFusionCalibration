@@ -15,7 +15,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: core lib builds with strict flags; Lie-op + `validate()` unit tests pass.
 **Deps**: none.
 
-## Slice 1 — Source buffers & uniform delta query  `[ ]`
+## Slice 1 — Source buffers & uniform delta query  `[x]`
 **Goal**: ingest a source and answer `delta(t0,t1) → (SE3, Σ)`.
 - Fixed-capacity ring buffer per source (preallocated).
 - `ISource` interface + adapters for native forms: twist→integrate, increments→compose, absolute→difference; in-window interpolation.
@@ -29,6 +29,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - ESKF predict on median delta; **adaptive Q** from spread; pose+twist state, SO(3)×ℝ³ error, dense 12×12.
 - Caller-pumped `step()`; `Result` struct (frontier state + predicted tip).
 - Frame-align deltas using **prior** extrinsics (calibration still fixed).
+- Add `confidence_blend` to the `Config` struct (CONFIG.md §4 knob; from Slice 1 it exists only as a `SourceBuffer::configure()` parameter).
 **Done when**: sim rig (known motion, N sources) → fused trajectory tracks GT within noise; NEES in-bounds; deterministic replay byte-stable.
 **Deps**: Slice 1. **This is the vertical slice everything else hangs off.**
 

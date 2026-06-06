@@ -40,6 +40,7 @@ Scope chosen up front: grill the **whole system architecture**, greenfield.
 - **Chosen**: `delta(t0,t1) → (SE3, Σ6×6)`; adapter converts twist/increment/absolute and interpolates in-window. Confidence = Σ.
 - **User refinement**: combine the provider's **native** Σ with a **modeled** Σ (configurable); missing native → identity.
 - **Why**: one "confidence" definition flows to median weight, adaptive Q, and histogram votes.
+- **Impl note (Slice 1)**: missing native Σ is treated as **identity** then run through the configured combine rule (not modeled-only); native-present is decided by the explicit `native_confidence` flag, not by inspecting the matrix. Absolute-pose providers' supplied Σ is taken as the per-step increment covariance (no differencing of absolute covariances — not PSD-safe).
 
 ## D8 — ESKF update step (revisited with full picture) → **integrator + optional absolute**
 - Confirmed D4 once calibration was settled as a separate subsystem.

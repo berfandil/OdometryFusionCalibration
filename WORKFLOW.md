@@ -17,6 +17,9 @@ Work advances **one step at a time** (a step = one roadmap slice from [`ISSUES.m
 ### Escalation
 If a sub-agent hits a question that needs the user's judgement, it surfaces it; the orchestrator relays it to the user and steers the agent with the answer. Do not guess on user-facing or irreversible decisions.
 
+### Environment note — who runs the review
+In this environment sub-agents **cannot spawn their own sub-agents**. So step 3 (self-review) is run by the **orchestrator**: after the implementer reports, the orchestrator launches a `caveman:cavecrew-reviewer` agent on the slice diff, then routes the findings to a fix agent (a fresh `general-purpose` agent — `SendMessage` to continue an existing agent is also unavailable). The green gate + self-commit still gate every slice.
+
 ### Sub-agent type
 Use a full-capability agent (`claude` / `general-purpose`) for implementation steps — they can spawn their own reviewer sub-agent and run the build. (The `cavecrew-builder` agent refuses 3+ file scope and cannot spawn sub-agents — not suitable for a full slice.)
 
@@ -41,7 +44,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 
 ## Progress
 - [x] Slice 0 — Lie ops, build, doctest harness (green: 14 cases / 25 assertions).
-- [ ] Slice 1 — Source buffers & uniform delta query.
+- [x] Slice 1 — Source buffers & uniform delta query (green: 31 cases / 287 assertions).
 - [ ] Slice 4 — Histogram primitive.
 - [ ] Slice 2 — Median fusion (first tracer bullet).
 - [ ] Sim rig (the calibration oracle) — required before Slices 6–8 run autonomously.
