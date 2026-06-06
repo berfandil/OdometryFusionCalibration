@@ -16,9 +16,17 @@
 //     B.t = scale * R_Xtrue^{-1} * A.t   =>   dir_B = B.t / ||B.t|| = R_Xtrue^{-1} * (±e_x).
 // We map the source's observed forward direction into the BASE frame through its
 // PRIOR extrinsic:  g_obs = R_Xprior * dir_B  (≈ e_x when the mount matches the prior).
-// REVERSE-FOLD: if g_obs points backward (dot(g_obs, fwd_sign*e_x) < 0) negate it, so
-// forward and reverse straight segments both land in the SAME forward hemisphere
-// (unimodal). The candidate rotation is the MINIMAL rotation in the base frame taking
+// REVERSE-FOLD: when the CONSENSUS (fused) motion is reverse (sign of fused_trans on the
+// base-forward axis is negative) negate g_obs, so forward and reverse straight segments both
+// land in the SAME hemisphere (unimodal). Folding by the consensus sign — not the source's
+// own g_obs.x — keeps this correct for a sideways / far-off-prior mount (whose g_obs.x is
+// noise). A folded g_obs that is still ≥90° off +e_x is outside Phase-1's small-deviation
+// regime and is SKIPPED (it would otherwise need a near-π so(3) log, which is singular).
+// With the fold OFF the reverse samples are not negated; staying backward they trip that
+// same ≥90° guard and are DROPPED — so fold-OFF simply discards the reverse half (it does
+// NOT deposit a 180°-off second peak; in the non-circular so(3) histogram such a near-π log
+// would only have edge-clamped into the boundary bins anyway, never a true bin at π).
+// The candidate rotation is the MINIMAL rotation in the base frame taking
 // e_x -> g_obs; its so(3) log φ = log(δR) is voted into THREE Histogram1D channels
 // (basepoint = the prior, i.e. φ ≈ 0 when the mount matches the prior — data sits near
 // the basepoint, no pole/antipode, isotropic resolution; per D11 store all 3 channels,
@@ -80,20 +88,34 @@ public:
     // = true defaults. Returns OutOfRange if id is out of range, CapacityExceeded at cap.
     Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true);
 
-    // Consume one FUSED step. `fused_omega` / `fused_v` are the consensus body twist
-    // angular / linear parts over the step (rad/s, m/s) used by the straight gate;
-    // `fused_trans` is the consensus translation over the step (m) used to fix the base
-    // forward sign. Per registered source i in [0, n): `ids[i]` is its id and
-    // `reported[i]` is its DE-SCALED reported sensor-frame delta B_corr (B with the
-    // translation divided by prior_scale, matching the estimator's pre-median de-scale —
-    // so the magnitude ratio recovers the RESIDUAL scale error vs the prior). The
-    // reference source must be present among `ids` for a scale vote to occur.
+    // Consume one FUSED step. `fused_omega` is the consensus body angular RATE over the
+    // step (rad/s, ÷dt) used by the straight gate's rotation test. `fused_trans` is the
+    // consensus translation DISPLACEMENT over the step (m, NOT a rate) — it is both the
+    // gate's translation test operand and the source of the consensus forward/reverse sign
+    // (its projection on the base-forward axis ±e_x) used by the reverse-fold. Per
+    // registered source i in [0, n): `ids[i]` is its id and `reported[i]` is its DE-SCALED
+    // reported sensor-frame delta B_corr (B with the translation divided by prior_scale,
+    // matching the estimator's pre-median de-scale — so the magnitude ratio recovers the
+    // RESIDUAL scale error vs the prior). The reference source must be present among `ids`
+    // for a scale vote to occur.
     //
     // GATE: votes are deposited ONLY when the fused motion is straight —
     //   ||fused_omega|| < straight_omega_max  AND  ||fused_trans|| > straight_trans_min
+    // NOTE the two gate operands have DIFFERENT time-normalization: straight_omega_max is a
+    // speed (rad/s) vs ||fused_omega||, while straight_trans_min is a per-step DISPLACEMENT
+    // (m) vs ||fused_trans|| — so straight_trans_min is CADENCE-DEPENDENT (halving dt halves
+    // the per-step displacement at fixed speed). Tune it for the deployment tick rate.
     // — and, when ref_cross_check is on, the reference source's reported delta also reads
     // "straight forward/back" (small rotation + sizable translation). Off-gate steps are a
     // no-op (the observability spine: yaw/pitch/scale are unobservable unless straight).
+    //
+    // REVERSE-FOLD: a far-off-prior / sideways mount's per-source g_obs.x is noise, so the
+    // fold uses the CONSENSUS forward/reverse sign (from fused_trans), not g_obs.x — forward
+    // and reverse straight segments collapse to ONE peak for any mount. A folded direction
+    // ≥90° off +e_x (outside Phase-1's small-deviation regime) is SKIPPED, never voted as a
+    // near-π so(3) log (which would be singular / NaN). With reverse_fold == false the
+    // reverse samples are NOT folded; staying backward they hit that same ≥90° guard and are
+    // dropped (fold-OFF discards the reverse half — no edge-clamped boundary-bin second peak).
     //
     // Returns Ok when the step was voted, NotReady when gated out (not an error),
     // NotInitialized if unconfigured.
@@ -150,7 +172,8 @@ private:
     HistogramConfig scale_cfg_{};
 
     // Per-source state. so3_[3*slot + c] is channel c (0=x,1=y,2=z) of the direction
-    // histogram; scale_[slot] is the scale histogram. prior_R_[slot] is R_Xprior.
+    // histogram; scale_[slot] is the scale histogram. prior_[slot] is the full SE3 prior
+    // extrinsic (its rotation R_Xprior is the basepoint the correction is applied on top of).
     Histogram1D so3_[3 * kMaxSources];
     Histogram1D scale_[kMaxSources];
     SE3         prior_[kMaxSources];

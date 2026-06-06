@@ -413,8 +413,12 @@ Status Estimator::step(Timestamp now) {
 
     // ---- Phase-1 calibration stage (Slice 6, D5/D11/D20) -------------------------
     // Drive the straight-gated calibrator with the fused consensus twist + per-source
-    // de-scaled reported deltas. The fused body angular speed is log(med.R)/dt; the fused
-    // translation over the step is med.t. The calibrator self-gates on the straight regime
+    // de-scaled reported deltas. The fused body angular SPEED is log(med.R)/dt (rad/s); the
+    // fused translation is the per-step DISPLACEMENT med.t (m, NOT ÷dt). NOTE the gate's two
+    // operands carry different time-normalization: straight_omega_max gates a speed, but
+    // straight_trans_min gates a per-step displacement — so straight_trans_min is
+    // CADENCE-DEPENDENT (scales with dt at fixed speed); tune it to the tick rate (see
+    // calibration.hpp observe()). The calibrator self-gates on the straight regime
     // (||omega||<straight_omega_max AND ||t||>straight_trans_min) and votes the 3-channel
     // so(3) direction + the magnitude-ratio scale. It runs at the SAME frontier as fusion
     // for now (the deeper fixed-lag frontier is a later refinement). NO feedback into

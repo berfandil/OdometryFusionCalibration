@@ -25,6 +25,11 @@ const Vec3 kFwd = (Vec3() << Scalar(1), Scalar(0), Scalar(0)).finished();
 
 Mat3 Phase1Calibrator::rotation_between(const Vec3& a, const Vec3& b) {
     // Minimal rotation taking unit vector a -> unit vector b (Rodrigues from cross/dot).
+    // CALLER CONTRACT: observe() applies the π-singularity guard (c = cos(a,b) ≥ 0) before
+    // calling this, so on the vote path θ < 90° and the result's so3::log is well away from
+    // the θ=π singularity. The antiparallel (c<0) branch below is a defensive fallback for
+    // any other caller; it builds a true 180° rotation whose so3::log is itself singular, so
+    // it must NOT be fed to so3::log without first being guarded by the caller.
     const Vec3 v = a.cross(b);
     const Scalar s = v.norm();                 // sin(theta)
     const Scalar c = a.dot(b);                 // cos(theta)
@@ -126,6 +131,17 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
     last_gate_straight_ = straight;
     if (!straight) return Status::NotReady;
 
+    // CONSENSUS forward/reverse sign (DESIGN §6: "fold into the consensus hemisphere").
+    // In the straight regime the base travels along ±e_x; the sign of the FUSED translation
+    // projected on the base-forward axis says whether this step is forward (+) or reverse
+    // (−). We fold each source's observed direction by THIS sign (not by the source's own
+    // g_obs.x, which is pure noise for a sideways mount), so forward and reverse segments
+    // land in the same hemisphere for ANY mount orientation. The straight gate's
+    // ‖fused_trans‖ > straight_trans_min_ already excludes the near-zero (ambiguous-sign)
+    // case; an exact zero x-projection ties deterministically to forward (no negation).
+    const Scalar fwd_proj = fused_trans.dot(kFwd);
+    const Scalar consensus_sign = (fwd_proj < Scalar(0)) ? Scalar(-1) : Scalar(1);
+
     // Optional reference cross-check (ice-slide / drone niche): require the reference
     // source's OWN reported delta to also read straight forward/back — a small rotation
     // and a translation that, mapped to the base frame through its prior, lies near the
@@ -180,18 +196,29 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // and near -e_x for REVERSE base motion.
         const Vec3 dir_B = bt / bn;
         Vec3 g_obs = prior_[slot].R * dir_B;
-        // REVERSE-FOLD (D5): fold any backward-hemisphere sample (g_obs.x < 0) into the
-        // +e_x forward hemisphere so forward and reverse straight segments BOTH peak at the
-        // same so(3) location (the distribution stays unimodal). The canonical target axis
-        // is always +e_x (the prior basepoint), so the fold compares against +e_x rather
-        // than the per-step base sign — robust even when the fused sign is near zero. With
-        // the fold OFF, a reverse sample stays at -e_x and produces a 180°-off second peak.
-        if (reverse_fold_ && g_obs.dot(kFwd) < Scalar(0)) g_obs = -g_obs;
+        // REVERSE-FOLD (D5, DESIGN §6): fold a reverse-segment sample into the SAME
+        // hemisphere as the forward segments using the CONSENSUS sign (sign of the fused
+        // translation on the base-forward axis), not the source's own g_obs.x. For a
+        // sideways/far-off mount g_obs.x is noise, so a fixed g_obs.x<0 test would split the
+        // forward and reverse samples across antipodal peaks; the consensus sign folds them
+        // correctly for any mount orientation. With the fold OFF (reverse_fold_ == false) we
+        // do NOT negate — a reverse sample stays backward (≥90° off +e_x) and is then dropped
+        // by the π-guard below (never voted; not edge-clamped boundary mass as before).
+        if (reverse_fold_ && consensus_sign < Scalar(0)) g_obs = -g_obs;
         const Scalar gn = g_obs.norm();
         if (gn < kUnitEps) continue;
         const Vec3 g_unit = g_obs / gn;
 
+        // π-SINGULARITY GUARD. Phase-1 is the SMALL-deviation-from-prior regime: a valid
+        // mount's folded forward direction sits near +e_x. If the folded direction is ≥90°
+        // off +e_x (cos(e_x, g_unit) < 0) the candidate rotation approaches 180°, whose
+        // so3::log is singular (s = θ/(2·sinθ) → ÷0 at θ=π → NaN/huge, lie.cpp:49). Such a
+        // sample is outside Phase-1's regime, so SKIP it rather than vote a π-rotation log —
+        // this guarantees no NaN/clamped-π mass ever enters the histogram.
+        if (g_unit.dot(kFwd) < Scalar(0)) continue;
+
         // Candidate rotation δR taking e_x -> g_unit; vote its so(3) log (3 channels).
+        // The guard above keeps θ < 90°, well clear of the so3::log singularity at π.
         const Mat3 dR  = rotation_between(kFwd, g_unit);
         const Vec3 phi = so3::log(dR);
         so3_[3 * slot + 0].add(phi.x(), Scalar(1));

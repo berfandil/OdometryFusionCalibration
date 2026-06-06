@@ -300,12 +300,17 @@ TEST_CASE("phase1 reverse-fold: reverse segment hits the same forward peak") {
     // pull x negative or split the histogram).
     CHECK(axis_fr.x() > 0.9);
 
-    // Contrast: with the fold DISABLED, the forward and reverse segments split into two
-    // hemispheres (a 180°-off second peak). The fwd-vs-reverse votes no longer pile into
-    // one peak, so the planted source's direction confidence is markedly LOWER than with
-    // the fold ON (which collapses both into the single forward peak). This is the
-    // observable signature of the fold keeping the distribution unimodal.
+    // Contrast: with the fold DISABLED the reverse-segment samples point backward
+    // (g_obs.x < 0 for this forward-ish mount). They are NOT folded into the forward peak,
+    // and — because they are then ≥90° off +e_x — the pi-singularity guard SKIPS them
+    // (rather than voting a near-pi so(3) log that would land as edge-clamped boundary-bin
+    // mass; see calibration.hpp). So fold-OFF DROPS the reverse half of the votes while
+    // fold-ON keeps them: fold-ON has strictly MORE vote mass, yet BOTH recover the correct
+    // forward axis (fold-OFF just from the forward votes alone). This replaces the old
+    // "180°-off second peak lowers confidence" signature — with the guard there is no second
+    // peak, only skipped votes.
     {
+        struct FoldRun { Scalar votes; Vec3 axis; Scalar conf; };
         auto run_fold = [&](bool fold) {
             Config c = make_cfg();
             c.reverse_fold = fold;
@@ -323,13 +328,124 @@ TEST_CASE("phase1 reverse-fold: reverse segment hits the same forward peak") {
             calp->set_prior(0, SE3{}, true);
             calp->set_prior(1, SE3{}, true);
             drive(*calp, fr, ref, planted, SE3{}, SE3{}, 1.0, 0.05, 3.95, 50.0);
-            return calp->extrinsic_confidence(1);
+            return FoldRun{calp->vote_count(1), calp->forward_axis(1),
+                           calp->extrinsic_confidence(1)};
         };
-        const Scalar conf_on  = run_fold(true);
-        const Scalar conf_off = run_fold(false);
-        CHECK(conf_on > conf_off);          // the fold concentrates the (else-split) votes
-        CHECK(conf_on > 0.3);               // and converges
+        const FoldRun on  = run_fold(true);
+        const FoldRun off = run_fold(false);
+        // Fold ON keeps the reverse votes; fold OFF skips them (guarded) -> fewer votes.
+        CHECK(on.votes > off.votes);
+        CHECK(off.votes > 0.0);             // forward votes still land
+        // Both converge to the SAME forward peak (no wrong 180°-off mass either way).
+        CHECK(on.conf  > 0.3);
+        CHECK(off.conf > 0.3);
+        CHECK(near_abs(on.axis.x(),  off.axis.x(), 1e-2));
+        CHECK(near_abs(on.axis.y(),  off.axis.y(), 1e-2));
+        CHECK(on.axis.x() > 0.9);
+        CHECK(off.axis.x() > 0.9);
     }
+}
+
+// ===========================================================================
+// Consensus-sign reverse-fold + pi-singularity guard
+//  * fold decided by the FUSED translation sign (robust for sideways mounts), and
+//  * a folded direction ≥90deg off +e_x is SKIPPED (never logs a pi-rotation -> no NaN).
+// ===========================================================================
+TEST_CASE("phase1 consensus-sign fold: reverse segment folds by FUSED sign, not g_obs.x") {
+    // Directly exercise the consensus-sign fold via observe() with hand-built inputs, so the
+    // fold rule is tested in ISOLATION (no oracle geometry coupling fused_trans to g_obs).
+    // The planted source mounts near-sideways: forward it reports a direction d with x ~ 0,
+    // so its own g_obs.x sign is meaningless. On the REVERSE segment its small x lands on the
+    // WRONG (positive) side from measurement noise — exactly the case where the OLD g_obs.x
+    // fold breaks. The consensus-sign fold must decide forward-vs-reverse from the FUSED
+    // translation sign, not g_obs.x, keeping the recovered axis on the single forward peak.
+    auto calp = make_calib(); Phase1Calibrator& cal = *calp;
+    Config c = make_cfg();
+    c.so3_hist.range_min = -2.0;                 // hold the near-sideways tilt (~pi/2)
+    c.so3_hist.range_max =  2.0;
+    REQUIRE(cal.configure(c, 0) == Status::Ok);
+    REQUIRE(cal.set_prior(0, SE3{}, true) == Status::Ok);   // reference, identity prior
+    REQUIRE(cal.set_prior(1, SE3{}, true) == Status::Ok);   // planted, identity prior
+
+    // Near-sideways direction the mount reports moving FORWARD (just inside the pi-guard's
+    // 90deg cone). x is small, so its SIGN is meaningless — the regime where folding by
+    // g_obs.x is unreliable and the consensus (fused) sign must decide instead.
+    Vec3 d(0.10, -0.995, 0.0); d.normalize();          // forward report -> -e_y hemisphere
+    // What the SAME mount reports moving REVERSE, with the small x landing on the WRONG
+    // (positive) side due to measurement noise: y flips to +e_y, x reads positive. A real
+    // antipode would have x<0, but near-sideways the x-sign is dominated by noise.
+    Vec3 e(0.15, 0.988, 0.0); e.normalize();           // reverse report, noisy x>0
+
+    SourceId ids[2] = {0, 1};
+    SE3 rep[2];
+    rep[0].R = Mat3::Identity();
+    rep[1].R = Mat3::Identity();
+    const Vec3 fwd_t(0.1, 0, 0);
+    const Vec3 rev_t(-0.1, 0, 0);
+
+    // Reverse-weighted run (40 forward, 80 reverse) so the reverse votes DOMINATE the
+    // histogram. The OLD `g_obs.x<0` fold sees the reverse reports' x>0 and does NOT fold
+    // them, piling 80 votes into the WRONG (+e_y) hemisphere -> the recovered axis flips to
+    // +e_y (an antipodal split won by the un-folded reverse mass). The consensus-sign fold
+    // folds every reverse vote by the fused -x sign; those that fall outside the 90deg cone
+    // are pi-guard-SKIPPED, so only the (correct, -e_y) forward votes survive -> a clean
+    // -e_y peak on d. This is the behavior the OLD fold cannot produce.
+    for (int k = 0; k < 40; ++k) {
+        rep[0].t = fwd_t;  rep[1].t = d * Scalar(0.1);
+        REQUIRE(cal.observe(2, ids, rep, Vec3::Zero(), fwd_t) == Status::Ok);
+    }
+    for (int k = 0; k < 80; ++k) {
+        rep[0].t = rev_t;  rep[1].t = e * Scalar(0.1);
+        REQUIRE(cal.observe(2, ids, rep, Vec3::Zero(), rev_t) == Status::Ok);
+    }
+
+    // Single peak in the -e_y hemisphere (the forward report d), NOT pulled to +e_y by the
+    // reverse mass. Finite throughout (pi-guard active -> no NaN).
+    const Vec3 got = cal.forward_axis(1);
+    CHECK(std::isfinite(got.x()));
+    CHECK(std::isfinite(got.y()));
+    CHECK(std::isfinite(got.z()));
+    CHECK(near_abs(got.y(), d.y(), 5e-2));
+    CHECK(got.y() < -0.9);                        // consensus fold kept the peak at -e_y
+}
+
+TEST_CASE("phase1 pi-guard: a beyond-90deg-off folded direction is skipped (no NaN vote)") {
+    // A mount so far off prior that, even after the consensus fold, the observed direction
+    // lands in the BACKWARD hemisphere relative to +e_x (cos(e_x, g) < 0). That is outside
+    // Phase-1's small-deviation regime and feeding it to rotation_between would build a
+    // near-pi rotation whose so3::log is singular (NaN). The guard SKIPS such votes: no
+    // NaN ever enters the histogram, and a fully-skipped source stays at its prior.
+    //
+    // yaw ~ 170 deg => R_Xtrue^{-1} * e_x ~ (cos 170, -sin 170, 0) ~ (-0.98, -0.17, 0):
+    // forward-hemisphere fold leaves g ~ (-0.98, ...), i.e. cos(e_x,g) < 0 -> skip.
+    const Scalar yaw_p = kPi - 0.17;            // ~170 deg
+    const SE3 X_planted = make_extrinsic(yaw_p, 0.0);
+
+    Trajectory traj = Trajectory::straight(2.0, 4.0);
+    SourceParams pr; pr.id = 0; pr.X = SE3{};      pr.scale = 1.0;
+    SourceParams pp; pp.id = 1; pp.X = X_planted;  pp.scale = 1.0;
+    SyntheticSource ref(traj, pr);
+    SyntheticSource planted(traj, pp);
+
+    auto calp = make_calib(); Phase1Calibrator& cal = *calp;
+    REQUIRE(cal.configure(make_cfg(), 0) == Status::Ok);
+    REQUIRE(cal.set_prior(0, SE3{}, true) == Status::Ok);
+    REQUIRE(cal.set_prior(1, SE3{}, true) == Status::Ok);
+
+    drive(cal, traj, ref, planted, SE3{}, SE3{}, 1.0, 0.05, 3.95, 50.0);
+
+    // Every beyond-90deg sample was skipped: no so(3) votes for the planted source, so its
+    // estimate stays pinned at the prior (forward axis e_x) and confidence is zero. Crucially
+    // the readout is FINITE (a leaked pi-log would have made the mode/axis NaN).
+    CHECK(cal.vote_count(1) == doctest::Approx(0.0));
+    const Vec3 f = cal.forward_axis(1);
+    CHECK(std::isfinite(f.x()));
+    CHECK(std::isfinite(f.y()));
+    CHECK(std::isfinite(f.z()));
+    CHECK(near_abs(f.x(), 1.0, 1e-9));
+    CHECK(near_abs(f.y(), 0.0, 1e-9));
+    CHECK(near_abs(f.z(), 0.0, 1e-9));
+    CHECK(cal.extrinsic_confidence(1) == doctest::Approx(0.0));
 }
 
 // ===========================================================================
