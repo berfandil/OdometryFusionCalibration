@@ -121,6 +121,14 @@ Mat6 adjoint(const SE3& T) {
     return A;
 }
 
+SE3 interpolate(const SE3& a, const SE3& b, Scalar u) {
+    const Scalar uc = std::max(Scalar(0), std::min(Scalar(1), u));
+    SE3 out;
+    out.R = a.R * so3::exp(uc * so3::log(a.R.transpose() * b.R));
+    out.t = (Scalar(1) - uc) * a.t + uc * b.t;
+    return out;
+}
+
 Scalar split_distance(const SE3& a, const SE3& b, Scalar lambda) {
     const Vec3 dr = so3::log(a.R.transpose() * b.R);
     const Vec3 dt = a.t - b.t;

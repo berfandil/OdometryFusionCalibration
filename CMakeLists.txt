@@ -28,6 +28,7 @@ endif()
 # exceptions on for Eigen/MSVC ergonomics (strict core, relaxed dev toolchain).
 add_library(ofc_core STATIC
     src/core/lie.cpp
+    src/core/buffer.cpp
     src/core/estimator.cpp
 )
 target_include_directories(ofc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

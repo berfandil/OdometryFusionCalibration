@@ -23,6 +23,12 @@ SE3  exp(const Vec6& xi);                   // [v; omega] -> SE3
 Vec6 log(const SE3& T);                     // SE3 -> [v; omega]
 Mat6 adjoint(const SE3& T);                 // Ad_T
 
+// Geodesic interpolation between two poses at fraction u in [0, 1]:
+//   R = Ra * exp(u * log(Ra^T Rb))   (SO(3) slerp via the rotation log)
+//   t = (1 - u) * ta + u * tb        (straight-line lerp in R^3)
+// u is clamped to [0, 1]. interpolate(a,b,0)=a, interpolate(a,b,1)=b.
+SE3  interpolate(const SE3& a, const SE3& b, Scalar u);
+
 // Split-metric geodesic distance used by the geometric median (D3):
 //   d^2 = ||log(Ra^T Rb)||^2 + lambda * ||ta - tb||^2
 Scalar split_distance(const SE3& a, const SE3& b, Scalar lambda);
