@@ -117,6 +117,14 @@ struct Estimator::Impl {
     bool     timesync_active = false;
     int      ticks_since_sync = 0;
 
+    // Per-source time-offset commit state (DESIGN §2/§6). A source's offset is COMMITTED
+    // (driving fusion) once its histogram concentration clears commit_concentration AND
+    // its vote count clears commit_min_votes (N_min); once committed it STAYS committed
+    // (hysteresis) until concentration falls below commit_drop. Fixed-capacity bool array
+    // (strict core); advanced once per step() in update_commit_state(). Indexed by the
+    // registered-source slot. Always false for the reference / when time-sync is off.
+    bool     offset_committed[kMaxSourcesCap] = {};
+
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
     Scalar weights[kMaxSourcesCap];
@@ -141,18 +149,32 @@ struct Estimator::Impl {
         return nullptr;
     }
 
-    // Effective per-source clock offset (seconds) applied to its fusion query. When
-    // time-sync is active AND the source's offset estimate is confident enough
-    // (histogram concentration >= cfg.commit_concentration), use the estimated offset;
-    // otherwise fall back to the configured prior (default 0). Slot `i` indexes the
-    // registered-source arrays.
-    Scalar effective_offset(int i) const {
-        if (timesync_active) {
+    // Advance every source's time-offset commit state for this step (DESIGN §2/§6).
+    // Runs the N_min + hysteresis gate on the current histogram reading; the resulting
+    // per-source bool then selects committed-estimate vs prior in effective_offset() and
+    // is surfaced as CalibSnapshot::committed. No-op (all false) when time-sync is off.
+    // Bounded by source_count; no heap.
+    void update_commit_state() {
+        for (int i = 0; i < source_count; ++i) {
+            if (sources[i] == nullptr) { offset_committed[i] = false; continue; }
             const SourceId id = sources[i]->id();
-            if (id != cfg.reference_sensor_id &&
-                timesync.confidence(id) >= cfg.commit_concentration) {
-                return timesync.offset(id);
+            if (!timesync_active || id == cfg.reference_sensor_id) {
+                offset_committed[i] = false;          // reference / time-sync off never commits
+                continue;
             }
+            offset_committed[i] = commit_gate(
+                offset_committed[i], timesync.confidence(id), timesync.vote_count(id),
+                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+        }
+    }
+
+    // Effective per-source clock offset (seconds) applied to its fusion query. When the
+    // source's offset estimate is COMMITTED (the N_min + hysteresis gate in
+    // update_commit_state has latched), use the estimated offset; otherwise fall back to
+    // the configured prior (default 0). Slot `i` indexes the registered-source arrays.
+    Scalar effective_offset(int i) const {
+        if (timesync_active && offset_committed[i]) {
+            return timesync.offset(sources[i]->id());
         }
         return prior_time_offset[i];
     }
@@ -180,6 +202,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->prior_scale[i]       = Scalar(1);
         impl_->weight_prior[i]      = Scalar(1);
         impl_->prior_time_offset[i] = Scalar(0);
+        impl_->offset_committed[i]  = false;
     }
 
     // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
@@ -261,6 +284,13 @@ Status Estimator::step(Timestamp now) {
             for (int i = 0; i < s.source_count; ++i) {
                 const ISource* src = s.sources[i];
                 if (src == nullptr) continue;
+                // ‖ω‖ at the frontier is a BACKWARD DIFFERENCE: the rotation magnitude of
+                // the delta over the single sub-interval [t1 - h, t1] (h = one common-grid
+                // period), divided by h. It is therefore the mean ‖ω‖ over the window
+                // ending at t1, not the instantaneous value at t1 — on a piecewise-constant
+                // trajectory a window straddling a turn-rate step reads a ramp, not the
+                // step. Harmless for xcorr: BOTH channels see the same backward-difference
+                // smoothing, so the time-OFFSET between them is preserved.
                 const Expected<Delta> wq = src->query(t1 - h, t1);
                 if (!wq.ok()) continue;
                 // NOTE: ‖ω‖ is sampled at the source's RAW timeline (no offset applied)
@@ -274,6 +304,11 @@ Status Estimator::step(Timestamp now) {
         s.timesync.update();
         ++s.ticks_since_sync;
     }
+
+    // Advance the per-source time-offset commit state (N_min + hysteresis, DESIGN §2/§6)
+    // once per step, after the vote. effective_offset() and the CalibSnapshot below read
+    // the latched flags. No-op (all false) when time-sync is off / for the reference.
+    s.update_commit_state();
 
     // Collect each covered source's frame-aligned delta + weight.
     int n = 0;
@@ -347,9 +382,10 @@ Status Estimator::step(Timestamp now) {
 
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
     // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED
-    // to its query (committed time-sync value if confident, else the prior) plus the
-    // time-sync histogram confidence. `committed` marks that the estimate cleared the
-    // commit-concentration gate (so it is actually driving fusion rather than the prior).
+    // to its query (committed time-sync value, else the prior) plus the time-sync
+    // histogram confidence. `committed` marks that the estimate cleared the N_min +
+    // hysteresis commit gate (so it is actually driving fusion rather than the prior) —
+    // it is the latched per-source state advanced in update_commit_state() above.
     for (int i = 0; i < s.source_count; ++i) {
         const SourceId id = s.sources[i]->id();
         CalibSnapshot& cs = s.result.calib[i];
@@ -357,11 +393,8 @@ Status Estimator::step(Timestamp now) {
         cs.extrinsic     = s.prior_extrinsic[i];
         cs.scale         = s.prior_scale[i];
         cs.time_offset_s = s.effective_offset(i);
-        const Scalar conf = s.timesync_active ? s.timesync.confidence(id) : Scalar(0);
-        cs.confidence    = conf;
-        cs.committed     = s.timesync_active &&
-                           (id != cfg.reference_sensor_id) &&
-                           (conf >= cfg.commit_concentration);
+        cs.confidence    = s.timesync_active ? s.timesync.confidence(id) : Scalar(0);
+        cs.committed     = s.offset_committed[i];
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).
@@ -452,6 +485,15 @@ Status validate(const Config& cfg) {
     for (int i = 0; i < 6; ++i) {
         if (cfg.q_floor[i] < 0.0) return Status::OutOfRange;   // each q_floor[i] >= 0
     }
+
+    // Time-sync knob ranges (CONFIG §5). Enforced here (config-standalone) as well as
+    // inside TimeSync::configure() — so a caller validating config with timesync OFF
+    // still catches them. match_metric is an enum (no range check). offset_hist is a
+    // HistogramConfig validated by Histogram1D::configure() at TimeSync setup.
+    if (cfg.excitation_min_var < 0.0)
+        return Status::OutOfRange;                        // ‖ω‖ variance gate >= 0
+    if (cfg.max_lag_s <= 0.0 || cfg.max_lag_s > 2.0)
+        return Status::OutOfRange;                        // max_lag_s in (0, 2]
 
     // TODO: per-sensor + histogram range checks.
     return Status::Ok;

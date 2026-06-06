@@ -109,6 +109,24 @@ TEST_CASE("trajectory: omega_varying() preset changes ||omega|| over time") {
     CHECK(max_w > 0.5);      // a strong-turn stretch exists
 }
 
+TEST_CASE("trajectory: omega_ramp() preset ramps ||omega|| up then down (smooth)") {
+    const Scalar peak = 1.0;
+    Trajectory tr = Trajectory::omega_ramp(2.0, peak, 60, 0.02);
+    // ‖ω‖(t) climbs from ~0 to the apex over the first half, then falls back to ~0.
+    const Scalar mid = tr.duration_s() * 0.5;
+    const Scalar early = tr.twist_s(mid * 0.5).tail<3>().norm();
+    const Scalar apex  = tr.twist_s(mid).tail<3>().norm();
+    const Scalar late  = tr.twist_s(mid + mid * 0.5).tail<3>().norm();
+    CHECK(apex > early);                 // rising limb
+    CHECK(apex > late);                  // falling limb
+    CHECK(apex <= peak + 1e-9);          // capped at the apex yaw rate
+    // Adjacent micro-segments differ by only a small step (the ramp is near-smooth),
+    // so the per-step ‖ω‖ increment stays well below the apex magnitude.
+    const Scalar w0 = tr.twist_s(0.01).tail<3>().norm();
+    const Scalar w1 = tr.twist_s(0.03).tail<3>().norm();
+    CHECK(std::abs(w1 - w0) < 0.1 * peak);
+}
+
 TEST_CASE("trajectory: clamps before t0 and after the end") {
     Trajectory tr = Trajectory::straight(2.0, 1.0);
     // Before start: identity pose, zero twist.

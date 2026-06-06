@@ -85,6 +85,16 @@ public:
     static Trajectory omega_varying(Scalar v = Scalar(2.0), Scalar wz = Scalar(0.6),
                                     Scalar seg_s = Scalar(1.0));
 
+    // omega_ramp: a SMOOTHLY varying ||omega||(t) — a triangular ramp (up then down)
+    // built from many tiny constant-twist steps so the piecewise-constant model
+    // approximates a continuous ramp. Unlike omega_varying() (flat-topped plateaus ->
+    // a flat-topped cross-correlation, weak parabola), the ramp gives a rounded xcorr
+    // peak, so the sub-sample parabolic refine is exercised END-TO-END. Used by the
+    // time-sync e2e sub-sample test. `peak_wz` is the apex yaw rate; `steps` is the
+    // number of micro-segments on each side of the ramp; `step_s` each segment's length.
+    static Trajectory omega_ramp(Scalar v = Scalar(2.0), Scalar peak_wz = Scalar(1.0),
+                                 int steps = 60, Scalar step_s = Scalar(0.02));
+
     // mixed: a representative driving scenario exercising every regime — straight,
     // curved arcs (both turn directions), a turn-in-place, and pitch (so all DOF see
     // excitation somewhere). The default scenario the rig end-to-end test drives.

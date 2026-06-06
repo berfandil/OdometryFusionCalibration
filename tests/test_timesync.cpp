@@ -132,7 +132,12 @@ TEST_CASE("timesync recovers a known integer lag under every metric") {
     }
 }
 
-TEST_CASE("timesync resolves a FRACTIONAL lag to sub-sample accuracy") {
+// All four metrics must resolve a POSITIVE fractional lag to sub-sample accuracy (the
+// parabolic refine is exercised by the non-integer 2.7-grid-step plant). On the smooth
+// shape() signal every metric — including the non-smooth L1/Ratio costs — recovers to
+// well under half a grid step (measured ~0.08*dt), so a single 0.5*dt tolerance asserts
+// genuine sub-sample recovery across the board.
+TEST_CASE("timesync resolves a FRACTIONAL lag to sub-sample accuracy (all metrics)") {
     const Scalar dt = 0.01;
     const int    N  = 400;
     const Scalar off = 0.027;          // 2.7 grid steps — needs the parabolic refine
@@ -142,8 +147,9 @@ TEST_CASE("timesync resolves a FRACTIONAL lag to sub-sample accuracy") {
         ref[k] = shape(t);
         src[k] = shape(t + off);
     }
-    // L2 + NCC are the smooth metrics; both should sub-sample resolve.
-    for (MatchMetric m : {MatchMetric::L2, MatchMetric::NCC}) {
+    const MatchMetric metrics[4] = {MatchMetric::L1, MatchMetric::L2,
+                                    MatchMetric::Ratio, MatchMetric::NCC};
+    for (MatchMetric m : metrics) {
         auto tsp = make_ts(); TimeSync& ts = *tsp;
         REQUIRE(ts.configure(make_cfg(m, 100.0, 0.1), 0) == Status::Ok);
         push_signal(ts, 0, ref, dt);
@@ -151,26 +157,37 @@ TEST_CASE("timesync resolves a FRACTIONAL lag to sub-sample accuracy") {
         ts.update();
         const Scalar est = ts.offset(1);
         INFO("metric=", static_cast<int>(m), " est=", est, " want=", off);
-        CHECK(near_abs(est, off, 0.4 * dt));
+        CHECK(est > 0.0);                       // SIGN: positive planted -> positive
+        CHECK(near_abs(est, off, 0.5 * dt));    // sub-sample recovery
     }
 }
 
-TEST_CASE("timesync recovers a NEGATIVE lag (source clock behind base)") {
+// All four metrics must recover a NEGATIVE fractional lag with the correct (negative)
+// sign and to sub-sample accuracy (the source clock is BEHIND base; the plant is a
+// non-integer -3.7 grid steps so the refine is genuinely exercised on the negative side).
+TEST_CASE("timesync recovers a NEGATIVE fractional lag (all metrics)") {
     const Scalar dt = 0.01;
     const int    N  = 400;
-    const Scalar off = -0.04;          // source reads an EARLIER base slice
+    const Scalar off = -0.037;         // source reads an EARLIER base slice, -3.7 steps
     std::vector<Scalar> ref(N), src(N);
     for (int k = 0; k < N; ++k) {
         const Scalar t = k * dt;
         ref[k] = shape(t);
         src[k] = shape(t + off);
     }
-    auto tsp = make_ts(); TimeSync& ts = *tsp;
-    REQUIRE(ts.configure(make_cfg(MatchMetric::L2, 100.0, 0.1), 0) == Status::Ok);
-    push_signal(ts, 0, ref, dt);
-    push_signal(ts, 1, src, dt);
-    ts.update();
-    CHECK(near_abs(ts.offset(1), off, 0.5 * dt));
+    const MatchMetric metrics[4] = {MatchMetric::L1, MatchMetric::L2,
+                                    MatchMetric::Ratio, MatchMetric::NCC};
+    for (MatchMetric m : metrics) {
+        auto tsp = make_ts(); TimeSync& ts = *tsp;
+        REQUIRE(ts.configure(make_cfg(m, 100.0, 0.1), 0) == Status::Ok);
+        push_signal(ts, 0, ref, dt);
+        push_signal(ts, 1, src, dt);
+        ts.update();
+        const Scalar est = ts.offset(1);
+        INFO("metric=", static_cast<int>(m), " est=", est, " want=", off);
+        CHECK(est < 0.0);                       // SIGN: negative planted -> negative
+        CHECK(near_abs(est, off, 0.5 * dt));    // sub-sample recovery
+    }
 }
 
 // ===========================================================================
@@ -262,7 +279,47 @@ TEST_CASE("timesync sim e2e: recovers a planted +0.03 s offset with the CORRECT 
     INFO("planted=", planted, " recovered=", est);
     CHECK(ts.confidence(1) > 0.0);
     CHECK(est > 0.0);                               // SIGN: positive planted -> positive
+    // Coarse tol: omega_varying() is piecewise-constant (flat-topped plateaus), so its
+    // cross-correlation peak is flat-topped and the parabolic refine has little curvature
+    // to bite on. This case pins the SIGN robustly; the omega_ramp() e2e below pins the
+    // SUB-SAMPLE refine on a smoothly-varying ‖ω‖ where the peak is rounded.
     CHECK(near_abs(est, planted, 1.5 * dt));
+}
+
+TEST_CASE("timesync sim e2e: SUB-SAMPLE recovery on a smooth ‖ω‖ ramp") {
+    // omega_ramp() ramps the yaw rate up then down through many tiny segments, so ‖ω‖(t)
+    // is (near-)smooth and the xcorr peak is rounded — exercising the sub-sample
+    // parabolic refine END-TO-END (the gap the coarse omega_varying() tol leaves open).
+    Trajectory tr = Trajectory::omega_ramp(/*v=*/2.0, /*peak_wz=*/1.0,
+                                           /*steps=*/60, /*step_s=*/0.02);
+
+    SourceParams pr; pr.id = 0; pr.scale = 1.0; pr.time_offset_s = 0.0;
+    SyntheticSource ref(tr, pr);
+
+    const Scalar planted = 0.027;                   // 2.7 grid steps — fractional
+    SourceParams ps; ps.id = 1; ps.scale = 1.0; ps.time_offset_s = planted;
+    SyntheticSource src(tr, ps);
+
+    const Scalar tick_hz = 100.0;
+    const Scalar dt = 1.0 / tick_hz;
+    const Scalar h  = dt;
+
+    auto tsp = make_ts(); TimeSync& ts = *tsp;
+    REQUIRE(ts.configure(make_cfg(MatchMetric::L2, tick_hz, 0.1), 0) == Status::Ok);
+
+    const double t0 = tr.t0_s() + 2 * h;
+    const double t1 = tr.end_s() - 0.05;
+    for (double t = t0; t <= t1; t += dt) {
+        ts.push(0, secs(t), omega_norm_at(ref, t, h));
+        ts.push(1, secs(t), omega_norm_at(src, t, h));
+    }
+    ts.update();
+
+    const Scalar est = ts.offset(1);
+    INFO("planted=", planted, " recovered=", est);
+    CHECK(ts.confidence(1) > 0.0);
+    CHECK(est > 0.0);                               // SIGN: positive planted -> positive
+    CHECK(near_abs(est, planted, 0.5 * dt));        // SUB-SAMPLE: within half a grid step
 }
 
 TEST_CASE("timesync sim e2e: straight() (no rotation) is gated -> no confident estimate") {
@@ -315,6 +372,43 @@ TEST_CASE("timesync sim e2e: deterministic (same input -> identical estimate)") 
 }
 
 // ===========================================================================
+// Commit gate: N_min + hysteresis (DESIGN §2/§6). The pure state machine the
+// estimator runs per source — commit only when concentration >= commit_concentration
+// AND votes >= commit_min_votes; once committed STAY committed until concentration
+// falls below commit_drop (re-open).
+// ===========================================================================
+TEST_CASE("commit gate requires BOTH concentration and N_min votes") {
+    const Scalar tau_commit = 0.6, tau_drop = 0.4;
+    const int    n_min      = 200;
+
+    // High concentration but too FEW votes -> NOT committed (the N_min gate).
+    CHECK_FALSE(commit_gate(/*prev=*/false, /*conf=*/0.95, /*votes=*/5,
+                            tau_commit, n_min, tau_drop));
+    // Enough votes but concentration below tau_commit -> NOT committed.
+    CHECK_FALSE(commit_gate(false, /*conf=*/0.55, /*votes=*/500,
+                            tau_commit, n_min, tau_drop));
+    // BOTH gates cleared -> commit.
+    CHECK(commit_gate(false, /*conf=*/0.7, /*votes=*/250, tau_commit, n_min, tau_drop));
+    // Exactly at both thresholds (>=) -> commit.
+    CHECK(commit_gate(false, /*conf=*/0.6, /*votes=*/200, tau_commit, n_min, tau_drop));
+}
+
+TEST_CASE("commit gate hysteresis: stays committed through a dip until commit_drop") {
+    const Scalar tau_commit = 0.6, tau_drop = 0.4;
+    const int    n_min      = 200;
+
+    // Once committed, a confidence dip BELOW tau_commit but ABOVE tau_drop stays
+    // committed (the hysteresis band) — and the vote gate no longer applies.
+    CHECK(commit_gate(/*prev=*/true, /*conf=*/0.5, /*votes=*/3, tau_commit, n_min, tau_drop));
+    CHECK(commit_gate(/*prev=*/true, /*conf=*/0.45, /*votes=*/0, tau_commit, n_min, tau_drop));
+    // Only a drop strictly BELOW tau_drop re-opens (un-commits).
+    CHECK_FALSE(commit_gate(/*prev=*/true, /*conf=*/0.39, /*votes=*/1000,
+                            tau_commit, n_min, tau_drop));
+    // At exactly tau_drop it remains committed (>= keeps it).
+    CHECK(commit_gate(/*prev=*/true, /*conf=*/0.4, /*votes=*/0, tau_commit, n_min, tau_drop));
+}
+
+// ===========================================================================
 // Estimator wiring (the integration the slice ships): the Estimator feeds ‖ω‖
 // into TimeSync each step, recovers a source's RELATIVE clock offset, applies it to
 // that source's fusion query, and surfaces it in CalibSnapshot. With time-sync OFF
@@ -356,7 +450,8 @@ TEST_CASE("estimator e2e: recovers + applies a RELATIVE planted offset, surfaces
     cfg.reference_sensor_id = 0;
     cfg.sensors             = sc;
     cfg.sensor_count        = 2;
-    cfg.commit_concentration = 0.5;     // a few sharp votes clear this
+    cfg.commit_concentration = 0.5;     // a few sharp votes clear the concentration gate
+    cfg.commit_min_votes     = 30;      // reachable with the SlidingK=64 offset hist
 
     Estimator est;
     REQUIRE(est.init(cfg) == Status::Ok);
@@ -376,7 +471,49 @@ TEST_CASE("estimator e2e: recovers + applies a RELATIVE planted offset, surfaces
     CHECK(last.calib[idx].confidence > 0.0);
     CHECK(last.calib[idx].time_offset_s > 0.0);                 // correct SIGN
     CHECK(near_abs(last.calib[idx].time_offset_s, planted, 0.02));
-    CHECK(last.calib[idx].committed);                           // cleared the commit gate
+    CHECK(last.calib[idx].committed);                           // cleared BOTH commit gates
+}
+
+TEST_CASE("estimator e2e: N_min gate blocks commit until enough votes accumulate") {
+    Trajectory tr = Trajectory::omega_varying();
+
+    const Scalar planted = 0.04;
+    SourceParams pr; pr.id = 0; pr.time_offset_s = 0.0;
+    SourceParams ps; ps.id = 1; ps.time_offset_s = planted;
+    SyntheticSource s0(tr, pr);
+    SyntheticSource s1(tr, ps);
+
+    SensorConfig sc[2];
+    sc[0].id = 0; sc[0].is_reference = true;
+    sc[1].id = 1;
+
+    Config cfg = make_cfg(MatchMetric::L2, 100.0, 0.1);
+    cfg.max_sources          = 2;
+    cfg.reference_sensor_id  = 0;
+    cfg.sensors              = sc;
+    cfg.sensor_count         = 2;
+    cfg.commit_concentration = 0.5;       // confidence easily clears this
+    // N_min set ABOVE what the SlidingK=64 hist can ever hold, so the concentration
+    // gate alone can never commit — proves votes are actually gated.
+    cfg.commit_min_votes     = 100000;
+
+    Estimator est;
+    REQUIRE(est.init(cfg) == Status::Ok);
+    REQUIRE(est.add_source(&s0) == Status::Ok);
+    REQUIRE(est.add_source(&s1) == Status::Ok);
+
+    std::vector<const ISource*> srcs = {&s0, &s1};
+    Result last;
+    REQUIRE(drive(est, tr, srcs, 0.3, tr.end_s() - 0.1, 100.0, last));
+
+    int idx = -1;
+    for (int i = 0; i < last.source_count; ++i) if (last.calib[i].id == 1) idx = i;
+    REQUIRE(idx >= 0);
+    // Confidence is high (sharp peak) but votes never reach N_min -> NOT committed,
+    // and the APPLIED offset falls back to the prior (0), NOT the estimate.
+    CHECK(last.calib[idx].confidence > 0.0);
+    CHECK_FALSE(last.calib[idx].committed);
+    CHECK(last.calib[idx].time_offset_s == doctest::Approx(0.0));
 }
 
 TEST_CASE("estimator e2e: timesync OFF leaves offsets at the prior (Slice-2 behavior)") {

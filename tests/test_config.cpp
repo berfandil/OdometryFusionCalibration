@@ -99,3 +99,27 @@ TEST_CASE("validate range-checks fusion/median knobs") {
     c.fusion_delay_s = 2.5;
     CHECK(validate(c) == Status::OutOfRange);
 }
+
+TEST_CASE("validate range-checks time-sync knobs (CONFIG 5)") {
+    // excitation_min_var must be >= 0.
+    Config c = good();
+    c.excitation_min_var = -1e-6;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.excitation_min_var = 0.0;                 // zero is allowed (no gate)
+    CHECK(validate(c) == Status::Ok);
+
+    // max_lag_s must be in (0, 2].
+    c = good();
+    c.max_lag_s = 0.0;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.max_lag_s = -0.1;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.max_lag_s = 2.5;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.max_lag_s = 2.0;                          // upper bound is inclusive
+    CHECK(validate(c) == Status::Ok);
+}

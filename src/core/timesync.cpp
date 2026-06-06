@@ -294,7 +294,12 @@ bool TimeSync::estimate_offset(const Channel& src, const Channel& ref,
         const Scalar sp = match_score(src, ref, best_lag + 1);
         if (sm > kNoScore && sp > kNoScore) {
             const Scalar denom = sm - Scalar(2) * s0 + sp;
-            if (std::abs(denom) > kParabEps) {
+            // Concavity precondition: best_lag is the argMAX, so the fitted parabola
+            // must open DOWNWARD (denom < 0) for its vertex to be a maximum. On a flat-
+            // topped plateau (s0 ties a neighbour) denom can be >= 0 and the vertex would
+            // point toward a MINIMUM — reject and keep the integer lag. The |denom|>eps
+            // guard (subsumed by denom < -eps) also avoids the divide-by-~0.
+            if (denom < -kParabEps) {
                 delta = Scalar(0.5) * (sm - sp) / denom;
                 if (delta >  Scalar(0.5)) delta =  Scalar(0.5);
                 if (delta < -Scalar(0.5)) delta = -Scalar(0.5);
@@ -342,6 +347,13 @@ int TimeSync::sample_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return 0;
     return chans_[s].count;
+}
+
+Scalar TimeSync::vote_count(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0 || s == ref_slot_) return Scalar(0);
+    return hists_[s].total();
 }
 
 } // namespace ofc

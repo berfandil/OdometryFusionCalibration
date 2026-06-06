@@ -144,6 +144,27 @@ Trajectory Trajectory::omega_varying(Scalar v, Scalar wz, Scalar seg_s) {
     return tr;
 }
 
+Trajectory Trajectory::omega_ramp(Scalar v, Scalar peak_wz, int steps, Scalar step_s) {
+    // A triangular ‖ω‖ ramp: yaw rate climbs linearly 0 -> peak_wz over `steps` micro-
+    // segments, then falls peak_wz -> 0 over another `steps`. Each segment holds a
+    // constant twist for step_s; with many short segments the piecewise-constant ‖ω‖(t)
+    // approximates a smooth triangle, so the cross-correlation peak is rounded (not flat-
+    // topped) and the parabolic sub-sample refine is genuinely exercised end-to-end.
+    Trajectory tr;
+    if (steps < 1) steps = 1;
+    for (int k = 1; k <= steps; ++k) {                 // ascending limb (skip wz==0 start)
+        const Scalar wz = peak_wz * static_cast<Scalar>(k) / static_cast<Scalar>(steps);
+        Vec6 xi; xi << v, 0, 0, 0, 0, wz;
+        tr.add_segment(xi, step_s);
+    }
+    for (int k = steps - 1; k >= 0; --k) {             // descending limb (down to wz==0)
+        const Scalar wz = peak_wz * static_cast<Scalar>(k) / static_cast<Scalar>(steps);
+        Vec6 xi; xi << v, 0, 0, 0, 0, wz;
+        tr.add_segment(xi, step_s);
+    }
+    return tr;
+}
+
 Trajectory Trajectory::mixed() {
     // A representative driving scenario: every regime gets excitation somewhere.
     Trajectory tr;

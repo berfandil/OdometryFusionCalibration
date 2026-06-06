@@ -38,6 +38,27 @@
 
 namespace ofc {
 
+// Commit-gate state machine for a calibrated DOF (DESIGN §2/§6). Returns the NEW
+// committed state given the previous one and the current histogram reading:
+//   * Not yet committed: commit only when the peak concentration clears
+//     `commit_concentration` (τ_commit) AND the vote count clears `commit_min_votes`
+//     (N_min) — so a burst of a few sharp votes cannot commit prematurely.
+//   * Already committed: STAY committed (hysteresis) until the concentration falls
+//     strictly below `commit_drop` (τ_drop), which re-opens the estimate. The N_min
+//     gate does not re-apply once committed.
+// Pure function — keeps no state of its own; the caller owns the per-source bool. The
+// estimator holds the previous-committed flags in its fixed Impl arrays (strict core).
+// Thresholds are validated by Config::validate (commit_drop < commit_concentration).
+inline bool commit_gate(bool prev_committed, Scalar confidence, Scalar votes,
+                        Scalar commit_concentration, int commit_min_votes,
+                        Scalar commit_drop) {
+    if (prev_committed) {
+        return confidence >= commit_drop;                  // hysteresis: re-open below τ_drop
+    }
+    return confidence >= commit_concentration &&
+           votes >= static_cast<Scalar>(commit_min_votes); // BOTH gates to first commit
+}
+
 // Cross-correlation time-sync over ‖ω‖(t). Configure once from a Config + the
 // reference source id, push resampled ‖ω‖ samples per source, periodically call
 // update() to run the xcorr + vote, then read offset()/confidence() per source.
@@ -98,6 +119,12 @@ public:
     // Number of grid samples currently buffered for source `id` (0 if unknown).
     int sample_count(SourceId id) const;
 
+    // Total vote mass currently in source `id`'s offset histogram (0 for the
+    // reference / unknown / unvoted). Drives the estimator's N_min commit gate
+    // (`commit_min_votes`): with unit-weight votes this is the live vote count
+    // (under SlidingK it saturates at the window size). No heap; bounded.
+    Scalar vote_count(SourceId id) const;
+
 private:
     // Per-source resampled ‖ω‖ ring on the common grid. We key samples by an integer
     // grid index g = round((stamp - epoch) / dt_ns); the ring holds the most recent
@@ -145,15 +172,19 @@ private:
     // the excitation gate. <= 0 when the span is empty.
     Scalar window_variance(const Channel& c, long long g0, long long g1) const;
 
-    // Active configuration.
-    bool        configured_  = false;
-    SourceId    reference_id_ = 0;
-    MatchMetric metric_      = MatchMetric::L2;
-    Scalar      sample_dt_   = Scalar(0.02);    // common-grid period (s) = 1/tick_rate
-    long long   dt_ns_       = 20000000;        // sample_dt_ in ns
-    int         max_lag_samp_ = 5;              // bounded lag scan radius (grid steps)
-    Scalar      excite_min_var_ = Scalar(0);    // ‖ω‖ variance gate
-    int         min_overlap_   = 4;             // minimum overlap samples to attempt xcorr
+    // Active configuration. configure() is the SOLE initializer of these fields and is
+    // a precondition for every operation that reads them (push/update/offset/... all
+    // short-circuit while !configured_), so the member initializers below are just safe
+    // zero/neutral values for a default-constructed-but-unconfigured instance — they are
+    // never the values used in a real computation (configure() overwrites them all).
+    bool        configured_   = false;
+    SourceId    reference_id_  = 0;
+    MatchMetric metric_        = MatchMetric::L2;   // overwritten by cfg.match_metric
+    Scalar      sample_dt_     = Scalar(0);         // set to 1/tick_rate_hz in configure()
+    long long   dt_ns_         = 0;                 // set to round(sample_dt_*1e9)
+    int         max_lag_samp_  = 0;                 // set from max_lag_s * tick_rate_hz
+    Scalar      excite_min_var_ = Scalar(0);        // set from cfg.excitation_min_var
+    int         min_overlap_   = 0;                 // set to 4 in configure()
 
     HistogramConfig hist_cfg_{};
 
