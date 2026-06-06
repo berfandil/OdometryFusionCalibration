@@ -1,0 +1,120 @@
+# Design Decision Log
+
+Record of the design-grilling session: each decision, the option chosen, the alternatives rejected, and the rationale (including the catches that grilling surfaced). The resulting specification lives in [`DESIGN.md`](./DESIGN.md); this file is the *why*.
+
+Scope chosen up front: grill the **whole system architecture**, greenfield.
+
+---
+
+## D1 — Motion domain → **platform-agnostic core**
+- **Chosen**: abstract manifold + plugins from day one.
+- **Rejected**: SE(3) ground robot (my rec), SE(2) planar, aerial 6-DOF.
+- **Why / resolution**: agnostic + lightweight only reconcile as **small generic core + thin platform plugins** — generality at the edges, never the center. Load-bearing for everything below.
+
+## D2 — Fusion engine → **ESKF on Lie groups**
+- **Chosen**: error-state KF, calibration handling decided separately later.
+- **Rejected**: IEKF, fixed-lag smoother, full incremental smoother (GTSAM).
+- **Why**: bounded compute/memory honors "lightweight"; error-state keeps manifold math clean. Accept weaker calibration observability vs a smoother; mitigate elsewhere.
+
+## D3 — Propagation input → **weighted geometric median of all odometries** (user's design)
+- **Chosen**: buffer each source, integrate over a common window to an SE(3) delta, collapse to one consensus via weighted **geometric median in SE(3)**.
+- **Corrections made**: (a) "median" requires the **unsquared** distance (Weiszfeld IRLS) — squaring gives the Karcher *mean* and loses robustness; (b) SE(3) has **no bi-invariant metric** → use a **split SO(3)/ℝ³ metric**; (c) needs **≥3 sources** to reject an outlier.
+- **Why**: robust consensus motion instead of trusting one source.
+
+## D4 — ESKF correction step → **robust integrator + optional absolute refs**
+- **Chosen**: predict on median; **Q from inter-source spread** (adaptive); corrections only from optional absolute-reference plugins; no absolute ref ⇒ honest dead-reckoning.
+- **Rejected**: fixed Q (wastes the spread signal); update from per-sensor KFs (double-counts → inconsistent covariance); const-vel predict with odom as updates (abandons median-drives-predict).
+- **Why**: a KF without an update is an integrator — name it honestly; the spread gives adaptive Q for free.
+
+## D5 — Calibration regime gating → **symmetric gates** (+ user refinements)
+- **Chosen**: Phase 1 gated straight (`‖ω‖<ε ∧ ‖t‖>δ`); Phase 2 gated turning (`‖ω‖>θ`), votes weighted by `‖ω‖`.
+- **Catch (load-bearing)**: roll and the **xyz lever-arm are unobservable in straight motion** — the user's original Phase 2 had no turn-gate. Straight-motion samples give *unconstrained* (not wrong) xyz that smear the histogram.
+- **User refinements**: reverse-direction handled explicitly; optional reference-sensor cross-check (ice-slide / drone niche); turn magnitude usable as vote weight.
+
+## D6 — Gauge & bootstrap → **base frame + pinned reference sensor**
+- **Chosen**: user base frame; one reference sensor pinned (extrinsic = prior) as the gauge; bootstrap all extrinsics from config priors and iterate; **cold-start switch** (reference-only-until-confident *or* median-from-start).
+- **Rejected**: float the gauge (underdetermined, never settles); raw-frame median (breaks for non-aligned mounts).
+- **Why**: odometry-only ⇒ **gauge freedom** — extrinsics recoverable only relative to a pinned anchor. The median needs frame-aligned deltas (needs extrinsics) while calibration needs the fused output → circular; bootstrap-from-prior breaks it.
+
+## D7 — Source contract → **uniform delta query + native ⊕ modeled Σ** (+ user refinement)
+- **Chosen**: `delta(t0,t1) → (SE3, Σ6×6)`; adapter converts twist/increment/absolute and interpolates in-window. Confidence = Σ.
+- **User refinement**: combine the provider's **native** Σ with a **modeled** Σ (configurable); missing native → identity.
+- **Why**: one "confidence" definition flows to median weight, adaptive Q, and histogram votes.
+
+## D8 — ESKF update step (revisited with full picture) → **integrator + optional absolute**
+- Confirmed D4 once calibration was settled as a separate subsystem.
+
+## D9 — Histogram vote aging → **configurable decay / sliding-K** (user)
+- **Chosen**: config between **exponential decay** and **sliding window of K**.
+- **Why (forced)**: bootstrap means early votes are computed with *wrong* priors → systematically biased → must wash out. Also tracks re-mount/thermal drift. Pure accumulation would never forget the bias.
+
+## D10 — Phase-2 cost → **hand-eye, split solve** + **pairwise** (user wants both, compared)
+- **Chosen**: implement two strategies and compare: (1) per-sensor hand-eye `A·X=X·B` vs fused base — **roll = 1-D rotation residual, xyz = linear-LS** `(R_A−I)t_X = R_X t_B − t_A`; (2) **pairwise** hand-eye between sensors with the reference extrinsic **fixed**.
+- **Key structure**: xyz is *linear* given rotation; roll is the only nonlinear DOF (1-D). The LS singularity at `R_A=I` independently re-derives the turn-gate.
+
+## D11 — Direction histogram (pole problem) → **3-channel so(3)/tangent @ per-sensor prior** (user's idea, refined)
+- **Discussion path**: rejected naive 2×1-D (yaw,pitch) — poles. Considered: 3-component Cartesian (anisotropic, ±1 boundary, renormalize); Fibonacci equal-area sphere; tangent-plane @ running estimate (recenter fights aging).
+- **Chosen**: the so(3) rotation vector of the minimal rotation, histogrammed per channel, basepoint = **each sensor's prior** forward.
+- **Insight**: this *is* the tangent-plane method with a **fixed** basepoint → kills the recenter con; data sits near the basepoint (small tilt, no pole/antipode, isotropic). **User correction**: store **all 3 channels** (φ_x≡0 only in the basepoint-aligned frame; noise makes it nonzero), take the so(3) mode, convert to yaw,pitch **at the end**.
+
+## D12 — Output timing → **lagged frontier + predicted tip**
+- **Chosen**: fixed-rate tick; fuse causally at `now − delay` (consistent state + Σ); also expose a predict-only extrapolation to `now` (inflated Σ) for control.
+- **Rejected**: lagged-only (no real-time tip); OOSM (complex); fixed-lag re-smoothing (drifts toward rejected smoother).
+
+## D13 — Output contract → **transport-agnostic library + adapters**
+- **Chosen**: pure C++ core, no middleware dep; callback + poll; rich result struct (frontier state, tip, per-sensor calib snapshot, diagnostics). ROS/DDS/zmq adapters outside core. Pose in an odom frame anchored at init (drifts); extrinsics in base frame.
+- **Rejected**: ROS-first (couples core); pose-only (hides calib/diagnostics); streaming IPC (transport dep).
+
+## D14 — Threading → **caller-pumped single-thread** (+ user: **C++14 / AUTOSAR**)
+- **Chosen**: core is a state machine the consumer pumps via `step()`; fusion + bounded calibration slice per step; lock-free, deterministic, trivially testable. Threading = external adapter.
+- **Constraint added by user**: **C++14** (AUTOSAR). Ripples: no `std::optional`/`variant`/`string_view`, likely no-exceptions, no runtime heap, bounded WCET, `double`/no-fast-math. Mostly *reinforces* prior choices.
+
+## D15 — Memory/error policy → **strict core, relaxed edges**
+- **Chosen**: core = no heap post-init, no exceptions, hand-rolled `Optional`/`Expected`, bounded loops, fixed-capacity from config; adapters + tests stay relaxed (off-target).
+- **Rejected**: strict-everywhere (painful test ergonomics); pragmatic-harden-later (retrofit touches every file); dual-build (#ifdef drift).
+
+## D16 — Time-sync → **xcorr of ‖ω‖ → offset histogram** (+ user: pluggable metric)
+- **Chosen**: cross-correlate the **extrinsic-invariant** ‖ω‖(t) signal (so temporal decouples from spatial and runs first), parabolic sub-sample, excitation-gated, vote into a per-source offset histogram (reuse the robustness primitive). Constant offset + slow track.
+- **User note**: make the **match metric pluggable** (L1, L2, ratio, NCC…) — worth sweeping.
+- **Rejected**: continuous SSD (no histogram robustness); joint-with-extrinsics (breaks the decoupling); ω-vector correlation (needs extrinsics first).
+
+## D17 — Weight refinement → **variance-EMA reliability, bias → calibration**
+- **Chosen**: `w ∝ 1/σ̂²` from **zero-mean** residual scatter (slow, floored/capped); the **systematic** residual routed to the calibrator, not the weight; Weiszfeld `1/d` handles per-step outliers. Final `w = prior × reliability × Σ-confidence`.
+- **Why**: downweighting a *systematically* disagreeing source masks a miscalibration the calibrator should fix, and risks majority lock-in suppressing a correct minority. Split bias from variance.
+
+## D18 — Per-sensor KF → **CV twist ESKF (ℝ⁶)** (+ user: fixed-lag smoother)
+- **Chosen**: per-sensor (config on/off) constant-velocity error-state KF on body twist, random-walk accel; smoothed twist + refined Σ.
+- **User insight (load-bearing)**: calibration tolerates latency → run it as a **fixed-lag RTS smoother** (two-sided) at a **deeper frontier** (`now − delay − L`). Two-sided smoothing is near-zero-phase → dissolves the over-smoothing-lag worry. Fusion stays causal; calibration gets nicer odometry.
+
+## D19 — Config system → **validated POD struct + adapter parsing**
+- **Chosen**: core takes one validated config struct, preallocates once at init; YAML/JSON/ROS loaders are adapters that *build* the struct.
+- **Rejected**: built-in file config (parser + heap + IO in core); compile-time config (recompile to retune); hybrid compile-sizes (capacities need recompile).
+- **Requirement**: a **config-reference doc** documenting every knob (user-stressed).
+
+## D20 — Scale calibration → **straight-regime magnitude-ratio histogram**
+- **Chosen**: per-source translation scale `s_i` = magnitude ratio vs the pinned reference, recovered in the **straight** regime (pure translation → zero lever-arm confound), voted into a scale histogram, fed back **pre-median**. Per-source on/off; metric sources fixed at 1.
+- **Rejected**: joint-with-lever-arm in Phase 2 (nonlinear, confounds); none (wrong for wheel-scale drift / mono-VO); single global scale (per-source by nature).
+- **Why**: real for automotive (tire pressure/wear drifts wheel-odom scale); slots into existing regime + machinery.
+
+## D21 — ESKF state → **pose + twist, SO(3)×ℝ³ error, calib external**
+- **Chosen**: state = `SE(3)` pose + `ℝ⁶` twist; decoupled `SO(3)×ℝ³` pose error (matches split-metric median) + `ℝ⁶` twist; dense 12×12; calibration params **not** in state.
+- **Rejected**: pose-only coupled (cruder twist Σ/tip); IEKF-coupled (declined path); augmented-with-calib (contradicts separate-histogram calibration, bloats filter).
+
+## D22 — Absolute refs → **generic measurement plugin + optional per-source bias states**
+- **Chosen**: one interface `evaluate(state) → (residual, H, R)` + stamp, Mahalanobis-gated; position/pose/orientation agnostic; **loop-closure excluded** (needs past states ⇒ smoother). **Plus optional per-source bias states** (config per-source).
+- **Why the bias states** (user's GPS/IMU experience): the classic "like a charm" GPS/INS drift removal comes from **online IMU bias estimation via GPS cross-covariance** — the plain plugin (no bias states) corrects fused pose but *can't recalibrate a raw IMU*. Bias is a fast nuisance state observable only via an absolute ref at the fusion level → belongs in the filter (genuinely different from the slow geometric extrinsics in histograms). Off by default; enable for a raw-IMU source.
+
+## D23 — Startup → **lifecycle state machine, degrade-don't-block** (+ user: persistence)
+- **Chosen**: `INIT → WARMUP → DEGRADED → NOMINAL`; emit best-available (reference-only) output ASAP, auto-upgrade as calibration converges; readiness + confidence exposed; graceful downgrade on fault; gauge anchored at first fused tick.
+- **User addition — warm-restart persistence**: config on/off, periodic; persist **calibration state**; **double-buffer ping-pong** (two files + sequence counter, version-tagged + checksummed) so a crash mid-write keeps the last good state; invalidate on setup change via manual delete **+ auto config-hash guard**; serialize/deserialize in core, file IO in adapter.
+
+## D24 — Validation → **layered, sim-GT backbone**
+- **Chosen**: unit (per block) + **sim rig with known ground truth** (only place calibration *correctness* is checkable) + **observability self-tests** (each DOF converges only in its regime → guards the spine) + **NEES/NIS** consistency (a Σ-publishing filter must prove calibration of its own covariance) + recorded-data **golden regression** (determinism → byte-stable).
+
+---
+
+## Leaf defaults (locked)
+Confidence-combine = **sum** (configurable); Phase-2 histograms roll = circular S¹, xyz = 3×1-D; commit on peak-concentration ≥ τ ∧ votes ≥ N with hysteresis; Weiszfeld bounded iters + ε-regularized `1/d` + split-metric weight `λ`; gate thresholds documented; reverse-fold into the consensus/prior hemisphere before voting.
+
+## The spine, in one sentence
+Each calibration DOF is observable in exactly one motion regime, and the math hands you the gate for free (the lever-arm least-squares goes singular precisely when there is no rotation). Every gate, vote, and weight derives from that.
