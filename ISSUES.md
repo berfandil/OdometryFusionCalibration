@@ -47,7 +47,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: mode-recovery + aging + circular-wrap unit tests pass.
 **Deps**: Slice 0. (Can proceed in parallel with 2–3.)
 
-## Slice 5 — Time-sync  `[ ]`
+## Slice 5 — Time-sync  `[x]`
 **Goal**: per-source clock-offset estimation.
 - ‖ω‖ resample + pluggable-metric cross-correlation, parabolic sub-sample, excitation gate.
 - Vote into per-source offset histogram; feed offset back into the delta query.
