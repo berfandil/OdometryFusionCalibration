@@ -9,7 +9,7 @@ Work advances **one step at a time** (a step = one roadmap slice from [`ISSUES.m
 ### Per-step lifecycle
 1. **Brief** — the orchestrator (main thread) authors a detailed task brief for the step's sub-agent: goal, scope, exact interfaces/signatures, math, done-criteria, and the verification command. The brief points the agent at the source-of-truth docs.
 2. **Plan-first (TDD)** — the sub-agent writes a short plan *before* coding, then works test-first (red → green → refactor).
-3. **Self-review** — after implementing, the sub-agent **spawns its own reviewer sub-agent**, then fixes **all** findings.
+3. **Review (orchestrator-driven, file hand-off)** — after the implementer commits, the orchestrator launches a separate **reviewer sub-agent** that writes its findings to `reviews/slice-<n>-findings.md`; the orchestrator then launches a **fix agent** (implementer role) that reads that file and fixes **all** findings, re-verifies green, and commits. (Sub-agents here can't spawn sub-agents or be resumed, so the findings file is the hand-off between the reviewer and the implementer role.)
 4. **Verify** — the sub-agent must get a green gate: `powershell -File scripts/dev.ps1 -Task test` (build + all tests pass). No commit on red.
 5. **Commit** — the sub-agent commits its own work with a clear message (ending in the standard `Co-Authored-By` line).
 6. **Report** — the orchestrator briefly summarizes what happened, proposes the next step, and **waits** for the user's instruction.
@@ -17,8 +17,12 @@ Work advances **one step at a time** (a step = one roadmap slice from [`ISSUES.m
 ### Escalation
 If a sub-agent hits a question that needs the user's judgement, it surfaces it; the orchestrator relays it to the user and steers the agent with the answer. Do not guess on user-facing or irreversible decisions.
 
-### Environment note — who runs the review
-In this environment sub-agents **cannot spawn their own sub-agents**. So step 3 (self-review) is run by the **orchestrator**: after the implementer reports, the orchestrator launches a `caveman:cavecrew-reviewer` agent on the slice diff, then routes the findings to a fix agent (a fresh `general-purpose` agent — `SendMessage` to continue an existing agent is also unavailable). The green gate + self-commit still gate every slice.
+### Review mechanics
+The orchestrator drives the review (step 3) because sub-agents here cannot spawn sub-agents or be resumed:
+1. Launch a **reviewer sub-agent** (`caveman:cavecrew-reviewer`) on the slice diff; it **writes `reviews/slice-<n>-findings.md`** (severity-tagged, one finding per line).
+2. Launch a **fix agent** (`general-purpose`, implementer role) given that findings-file path; it reads it, fixes every finding, re-runs the green gate, and commits.
+3. The orchestrator independently re-runs the gate, updates the source-of-truth docs, summarizes, and waits.
+Findings files are kept in `reviews/` as the per-slice review record.
 
 ### Sub-agent type
 Use a full-capability agent (`claude` / `general-purpose`) for implementation steps — they can spawn their own reviewer sub-agent and run the build. (The `cavecrew-builder` agent refuses 3+ file scope and cannot spawn sub-agents — not suitable for a full slice.)
