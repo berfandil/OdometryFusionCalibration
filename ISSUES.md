@@ -69,7 +69,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: planted roll/xyz recovered under turning; **observability self-test**: frozen under pure-straight; LS singularity at `R_A=I` handled.
 **Deps**: Slice 6.
 
-## Slice 8 — Commit, hysteresis & feedback loop  `[ ]`
+## Slice 8 — Commit, hysteresis & feedback loop  `[x]`
 **Goal**: close the calibration→fusion loop.
 - Commit on `τ_commit` ∧ `N_min` with hysteresis; atomic swap of extrinsics/scale/offset into fusion between steps.
 - Bootstrap convergence (prior → refined) verified end-to-end.

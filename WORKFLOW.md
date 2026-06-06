@@ -55,6 +55,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Slice 5 — Time-sync (‖ω‖ xcorr → offset histogram, commit N_min + hysteresis) (green: 115 cases / 4370 assertions).
 - [x] Slice 6 — Phase-1 calibration: straight-gated yaw/pitch (3-ch so(3) @ prior) + per-source scale; observability self-test (green: 124 cases / 4565 assertions).
 - [x] Slice 7 — Phase-2 calibration: turn-gated roll (S¹) + xyz lever-arm (hand-eye LS), both strategies, vote_weight honored, observability self-test (green: 138 cases / 5031 assertions).
+- [x] Slice 8 — Commit + feedback loop: per-DOF commit gate (mass + hysteresis), atomic swap, **contractive** re-anchor (extrinsic/scale/offset converge from large priors), cold-start switch (green: 148 cases / 5160 assertions). **Calibration spine complete.**
 - (remaining slices per `ISSUES.md`).
 
 ## Sub-agent task-brief template

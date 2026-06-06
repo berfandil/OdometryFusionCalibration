@@ -75,7 +75,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 |---|---|---|---|---|
 | `phase2_strategy` | enum | `vs_fused_base` | {`vs_fused_base`, `pairwise_pinned_ref`} | Hand-eye strategy (the two are compared empirically). |
 | `commit_concentration` | double | 0.6 | (0, 1] | `τ_commit`: peak mass ÷ total required to commit. |
-| `commit_min_votes` | int | 200 | [1, ∞) | `N_min` votes required to commit. **Must be consistent with the target histogram's aging**: under `sliding_k` aging, `total()` saturates at ~`sliding_k`, so set `commit_min_votes ≤ sliding_k` (or use decay aging) or commit can never trigger. |
+| `commit_min_votes` | int | 200 | [1, ∞) | `N_min` votes required to commit. **Must be consistent with the target histogram's aging**: under `sliding_k` aging, `total()` saturates at ~`sliding_k`, so set `commit_min_votes ≤ sliding_k` (or use decay aging) or commit can never trigger. Also a vote-**mass** threshold (not a count) under any non-`one` `vote_weight` (votes are Σ-confidence/‖ω‖-scaled) — re-tune per `vote_weight`. |
 | `commit_drop` | double | 0.4 | (0, commit_concentration) | `τ_drop`: hysteresis — re-open below this. |
 | `vote_weight` | enum | `combo` | {`one`, `confidence`, `rotation`, `combo`} | Per-vote weight: `one`=1; `rotation`=‖fused_ω‖ (Phase-1 floors it since straight-gated ω≈0 → effectively no-op there; meaningful in Phase-2's turn regime); `confidence`=per-source Σ-confidence (the inverse-cov fusion weight); `combo`=rotation×confidence. Honored in both calibration phases. |
 | `so3_hist` | HistogramConfig | — | — | Phase-1 direction (3-channel so(3)). |
