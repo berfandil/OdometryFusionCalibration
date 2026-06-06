@@ -1,16 +1,27 @@
-// ofc/core/estimator.cpp — the caller-pumped fusion facade (Slice 2).
+// ofc/core/estimator.cpp — the caller-pumped fusion facade (Slice 2 + Slice 5 time-sync).
 //
 // STRICT CORE: all working memory lives in Impl and is sized from Config at init();
 // step() allocates nothing; no exceptions; bounded loops.
 //
-// Slice 2 pipeline (no calibration, no absolute corrections yet — DESIGN §§4-5):
+// TIME-SYNC (Slice 5, D16). When cfg.timesync_enabled, each step() samples every
+// source's ‖ω‖ over a small sub-interval ending at the frontier, feeds it (keyed to
+// base time) into TimeSync, and runs a bounded update() (‖ω‖ xcorr -> per-source offset
+// histogram). A source's committed offset (histogram concentration >= commit_concentration)
+// then SHIFTS its fusion query interval earlier by `off` so its internal +off re-shift
+// lands back on true base time (sign per D21 — REMOVES a planted offset); below the gate,
+// the configured prior is used. The offset + confidence are surfaced in CalibSnapshot.
+// With time-sync OFF the per-source offset is exactly the prior (default 0) — Slice-2
+// behavior unchanged.
+//
+// Slice 2 pipeline (no extrinsic/scale calibration, no absolute corrections — DESIGN §§4-5):
 //   per step(now): frontier t1 = now - fusion_delay
 //     integration interval [q0, t1]:
 //       q0 = last_t1        (steady state — picks up where the last fuse ended)
 //       q0 = t1 - window_s  (bootstrap of the FIRST fuse — no prior frontier yet)
 //     dt = (t1 - q0) seconds                   (ACTUAL elapsed motion, not a fixed step)
 //     for each registered source:
-//       B = query(q0, t1)                     (source-frame delta over the interval)
+//       B = query(q0 - off, t1 - off)         (source-frame delta; off = committed/prior
+//                                               clock offset, removed per Slice 5)
 //       B_corr = { B.R, B.t / prior_scale }   (de-scale the reported translation, D20)
 //       A = X o B_corr o X^-1                  (frame-align to base; X = sensor->base
 //                                               prior extrinsic — see convention below)
@@ -34,6 +45,7 @@
 #include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
+#include "ofc/core/timesync.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +73,17 @@ Scalar sigma_confidence(const Mat6& cov) {
     constexpr Scalar kEps = Scalar(1e-9);
     return Scalar(1) / (std::max(Scalar(0), mean_diag) + kEps);
 }
+
+// ‖ω‖ extraction for time-sync (DESIGN §6 time-offset row, D16): the body angular-rate
+// MAGNITUDE over a small sub-interval [t-h, t]. From the source's reported SE(3) delta
+// over that window, ‖ω‖ ≈ ‖log(ΔR)‖ / h. This is extrinsic-invariant (a rotation
+// magnitude survives the sensor->base conjugation), so it can be sampled per source
+// BEFORE any spatial calibration and cross-correlated against the reference. dt is the
+// sub-interval length in seconds (> 0).
+Scalar omega_norm_from_delta(const SE3& motion, Scalar dt) {
+    if (!(dt > Scalar(0))) return Scalar(0);
+    return so3::log(motion.R).norm() / dt;
+}
 } // namespace
 
 // All working memory lives here and is sized from Config at init().
@@ -81,6 +104,18 @@ struct Estimator::Impl {
     SE3    prior_extrinsic[kMaxSourcesCap];
     Scalar prior_scale[kMaxSourcesCap];
     Scalar weight_prior[kMaxSourcesCap];
+    // Per-source prior clock offset (seconds). Sign per D21 / CONFIG §9: positive =>
+    // source clock ahead of base; its reported [t0,t1] reads true [t0+off, t1+off].
+    Scalar prior_time_offset[kMaxSourcesCap];
+
+    // Time-sync (Slice 5, D16). When cfg.timesync_enabled, each step() feeds every
+    // source's current ‖ω‖ sample into `timesync` and periodically runs update(); the
+    // committed per-source offset shifts that source's fusion query interval so the
+    // planted clock skew is removed before fusion. Heap-resident inside Impl (the
+    // strict-core no-post-init-heap contract: Impl is allocated once in init()).
+    TimeSync timesync;
+    bool     timesync_active = false;
+    int      ticks_since_sync = 0;
 
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
@@ -105,6 +140,22 @@ struct Estimator::Impl {
         }
         return nullptr;
     }
+
+    // Effective per-source clock offset (seconds) applied to its fusion query. When
+    // time-sync is active AND the source's offset estimate is confident enough
+    // (histogram concentration >= cfg.commit_concentration), use the estimated offset;
+    // otherwise fall back to the configured prior (default 0). Slot `i` indexes the
+    // registered-source arrays.
+    Scalar effective_offset(int i) const {
+        if (timesync_active) {
+            const SourceId id = sources[i]->id();
+            if (id != cfg.reference_sensor_id &&
+                timesync.confidence(id) >= cfg.commit_concentration) {
+                return timesync.offset(id);
+            }
+        }
+        return prior_time_offset[i];
+    }
 };
 
 Estimator::Estimator() : impl_(nullptr) {}
@@ -122,12 +173,24 @@ Status Estimator::init(const Config& cfg) {
     impl_->eskf_started = false;
     impl_->last_t1      = 0;
     impl_->has_last_t1  = false;
+    impl_->ticks_since_sync = 0;
     for (int i = 0; i < kMaxSourcesCap; ++i) {
-        impl_->sources[i]         = nullptr;
-        impl_->prior_extrinsic[i] = SE3{};
-        impl_->prior_scale[i]     = Scalar(1);
-        impl_->weight_prior[i]    = Scalar(1);
+        impl_->sources[i]           = nullptr;
+        impl_->prior_extrinsic[i]   = SE3{};
+        impl_->prior_scale[i]       = Scalar(1);
+        impl_->weight_prior[i]      = Scalar(1);
+        impl_->prior_time_offset[i] = Scalar(0);
     }
+
+    // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
+    // configs skip it entirely (behave exactly as before — offsets stay at the priors).
+    impl_->timesync_active = false;
+    if (cfg.timesync_enabled) {
+        const Status ts = impl_->timesync.configure(cfg, cfg.reference_sensor_id);
+        if (!ok(ts)) return ts;
+        impl_->timesync_active = true;
+    }
+
     impl_->inited = true;
     return Status::Ok;
 }
@@ -150,6 +213,8 @@ Status Estimator::add_source(const ISource* src) {
     // a non-positive scale would blow up the de-scale division in step()).
     const Scalar ps = (sc != nullptr) ? sc->prior_scale : Scalar(1);
     impl_->prior_scale[slot] = (ps > Scalar(0)) ? ps : Scalar(1);
+    impl_->prior_time_offset[slot] =
+        (sc != nullptr) ? sc->prior_time_offset_s : Scalar(0);
     ++impl_->source_count;
     return Status::Ok;
 }
@@ -184,12 +249,43 @@ Status Estimator::step(Timestamp now) {
     }
     const Scalar dt = static_cast<Scalar>(t1 - q0) / kNanosPerSec;
 
+    // ---- Time-sync sampling (Slice 5, D16) --------------------------------------
+    // Feed each source's current ‖ω‖ sample (over a small sub-interval ending at the
+    // frontier t1) into the cross-correlator, keyed to BASE/query time, then run a
+    // bounded update() once per tick. The ‖ω‖ sub-interval is one common-grid period
+    // (sample_dt) so samples land on the time-sync grid. No-op when time-sync is off.
+    if (s.timesync_active) {
+        const Scalar h_s  = s.timesync.sample_dt();
+        const Timestamp h = secs_to_ns(h_s);
+        if (h > 0 && t1 - h > 0) {
+            for (int i = 0; i < s.source_count; ++i) {
+                const ISource* src = s.sources[i];
+                if (src == nullptr) continue;
+                const Expected<Delta> wq = src->query(t1 - h, t1);
+                if (!wq.ok()) continue;
+                // NOTE: ‖ω‖ is sampled at the source's RAW timeline (no offset applied)
+                // — the planted skew between two sources' ‖ω‖ streams is exactly what
+                // the cross-correlation measures. Applying the offset here would cancel
+                // the very signal we are trying to recover.
+                const Scalar wn = omega_norm_from_delta(wq.value().motion, h_s);
+                s.timesync.push(src->id(), t1, wn);
+            }
+        }
+        s.timesync.update();
+        ++s.ticks_since_sync;
+    }
+
     // Collect each covered source's frame-aligned delta + weight.
     int n = 0;
     for (int i = 0; i < s.source_count; ++i) {
         const ISource* src = s.sources[i];
         if (src == nullptr) continue;
-        const Expected<Delta> q = src->query(q0, t1);
+        // Apply the source's committed clock offset to its fusion query: shift the
+        // interval EARLIER by `off` so the source's internal +off re-shift lands back
+        // on true base time [q0, t1] (sign per D21 — removes a planted offset). When
+        // time-sync is off / not yet confident this is the configured prior (default 0).
+        const Timestamp off = secs_to_ns(s.effective_offset(i));
+        const Expected<Delta> q = src->query(q0 - off, t1 - off);
 
         // Diagnostics (best-effort; coverage flag set regardless of fuse outcome).
         SourceHealth& h = s.result.health[i];
@@ -247,6 +343,25 @@ Status Estimator::step(Timestamp now) {
         s.result.health[i].residual =
             se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
         ++k;
+    }
+
+    // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
+    // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED
+    // to its query (committed time-sync value if confident, else the prior) plus the
+    // time-sync histogram confidence. `committed` marks that the estimate cleared the
+    // commit-concentration gate (so it is actually driving fusion rather than the prior).
+    for (int i = 0; i < s.source_count; ++i) {
+        const SourceId id = s.sources[i]->id();
+        CalibSnapshot& cs = s.result.calib[i];
+        cs.id            = id;
+        cs.extrinsic     = s.prior_extrinsic[i];
+        cs.scale         = s.prior_scale[i];
+        cs.time_offset_s = s.effective_offset(i);
+        const Scalar conf = s.timesync_active ? s.timesync.confidence(id) : Scalar(0);
+        cs.confidence    = conf;
+        cs.committed     = s.timesync_active &&
+                           (id != cfg.reference_sensor_id) &&
+                           (conf >= cfg.commit_concentration);
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).

@@ -13,6 +13,7 @@ add_executable(ofc_tests
     test_eskf.cpp
     test_fusion.cpp
     test_histogram.cpp
+    test_timesync.cpp
     test_sim.cpp
 )
 target_link_libraries(ofc_tests PRIVATE ofc_core ofc_sim doctest::doctest)

@@ -79,6 +79,7 @@ struct Config {
     bool         timesync_enabled = true;
     MatchMetric  match_metric = MatchMetric::L2;
     Scalar       max_lag_s    = 0.10;
+    Scalar       excitation_min_var = 1e-4;   // min ‖ω‖ variance to accept a window (CONFIG §5)
 
     // Gates
     Scalar straight_omega_max = 0.05;
