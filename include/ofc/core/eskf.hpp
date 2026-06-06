@@ -42,8 +42,9 @@ public:
     // does not carry over). Qmap places the 6x6 process noise `q_pose` into the pose
     // block and `q_pose / dt^2` into the twist block (delta uncertainty over dt maps
     // to a velocity uncertainty). `q_pose` is in [trans; rot] order.
-    // Advances `stamp` by dt (in nanoseconds). dt <= 0 is treated as a no-op-ish
-    // guard (uses a tiny positive dt to avoid division by zero).
+    // Does NOT touch `stamp`: the caller (estimator) owns the absolute frontier clock
+    // and stamps the published state itself. dt <= 0 is treated as a no-op-ish guard
+    // (uses a tiny positive dt to avoid division by zero).
     void predict(const SE3& delta, Scalar dt, const Mat6& q_pose);
 
     // Const-velocity extrapolation `dt_ahead` seconds past the frontier:

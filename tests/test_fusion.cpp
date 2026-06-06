@@ -177,6 +177,24 @@ TEST_CASE("median rejects a biased outlier source and still tracks GT") {
     // not rejected. With the median + 3 inliers it tracks GT closely.
     CHECK(close(f.pose.t, gt.t, 5e-2));
     CHECK(close(f.pose.R, gt.R, 5e-2));
+
+    // Prove REJECTION (not lucky averaging): the biased source (id 3) must sit far
+    // from the consensus — a large residual — while the three inliers sit close. The
+    // median's 1/d reweight is what collapses the outlier's pull.
+    const Result& r = est.latest();
+    REQUIRE(r.source_count == N);
+    Scalar outlier_resid = -1.0;
+    Scalar max_inlier_resid = 0.0;
+    for (int i = 0; i < r.source_count; ++i) {
+        const SourceHealth& h = r.health[i];
+        REQUIRE(h.in_window);
+        if (h.id == 3) outlier_resid = h.residual;
+        else           max_inlier_resid = std::max(max_inlier_resid, h.residual);
+    }
+    // The biased source's residual is large in absolute terms...
+    CHECK(outlier_resid > 0.1);
+    // ...and dwarfs every inlier's residual (rejection, not averaging).
+    CHECK(outlier_resid > 10.0 * max_inlier_resid);
 }
 
 // ---------------------------------------------------------------------------

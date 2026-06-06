@@ -58,3 +58,44 @@ TEST_CASE("validate rejects out-of-range reference sensor") {
     c.reference_sensor_id = 99;               // >= max_sources
     CHECK(validate(c) == Status::OutOfRange);
 }
+
+TEST_CASE("validate range-checks fusion/median knobs") {
+    // confidence_blend must be in [0, 1].
+    Config c = good();
+    c.confidence_blend = 1.5;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.confidence_blend = -0.1;
+    CHECK(validate(c) == Status::OutOfRange);
+
+    // weiszfeld_tol must be in (0, 1).
+    c = good();
+    c.weiszfeld_tol = 0.0;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.weiszfeld_tol = 1.0;
+    CHECK(validate(c) == Status::OutOfRange);
+
+    // weight_cap must be >= 1.
+    c = good();
+    c.weight_cap = 0.5;
+    CHECK(validate(c) == Status::OutOfRange);
+
+    // tip_cov_inflation must be >= 1.
+    c = good();
+    c.tip_cov_inflation = 0.9;
+    CHECK(validate(c) == Status::OutOfRange);
+
+    // q_scale must be > 0; q_floor entries must be >= 0.
+    c = good();
+    c.q_scale = 0.0;
+    CHECK(validate(c) == Status::OutOfRange);
+    c = good();
+    c.q_floor[3] = -1e-6;
+    CHECK(validate(c) == Status::OutOfRange);
+
+    // fusion_delay_s must be in [0, 2].
+    c = good();
+    c.fusion_delay_s = 2.5;
+    CHECK(validate(c) == Status::OutOfRange);
+}

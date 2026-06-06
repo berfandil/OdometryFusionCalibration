@@ -87,6 +87,59 @@ TEST_CASE("predict accumulates a multi-step straight trajectory") {
 // ---------------------------------------------------------------------------
 // Covariance growth + symmetry + PSD
 // ---------------------------------------------------------------------------
+TEST_CASE("one predict pins covariance to F P0 F^T + Qmap (analytic)") {
+    // Hand-compute the closed-form propagation for a CONCRETE step so a wrong F
+    // (e.g. Ad(delta) instead of Ad(delta^-1), or an identity twist block) FAILS.
+    // F = blkdiag( Ad(delta^-1), 0 ),  Qmap = blkdiag( q_pose, q_pose/dt^2 ).
+    Eskf f;
+
+    // A non-symmetric, non-isotropic P0 so an asymmetric error in F is exposed.
+    Mat12 P0 = Mat12::Zero();
+    for (int i = 0; i < 12; ++i) P0(i, i) = 0.1 * (i + 1);
+    P0(0, 3) = P0(3, 0) = 0.02;     // pose trans<->rot coupling
+    P0(6, 9) = P0(9, 6) = 0.03;     // twist v<->omega coupling
+    f.init(SE3{}, P0);
+
+    // Delta with BOTH a rotation and an offset translation -> Ad(delta^-1) is neither
+    // identity nor equal to Ad(delta) (catches the inverse-adjoint sign of the bug).
+    SE3 delta;
+    delta.R = so3::exp(Vec3(0.10, -0.20, 0.30));
+    delta.t = Vec3(0.7, -0.4, 0.2);
+    const Scalar dt = 0.05;
+
+    Mat6 q_pose;
+    q_pose.setZero();
+    for (int i = 0; i < 6; ++i) q_pose(i, i) = 0.001 * (i + 1);
+
+    f.predict(delta, dt, q_pose);
+
+    // Build the expected propagation independently from the same primitives.
+    const Mat6 Ad_inv = se3::adjoint(se3::inverse(delta));
+    Mat12 F = Mat12::Zero();
+    F.block<6, 6>(0, 0) = Ad_inv;           // twist block stays zero
+    Mat12 Q = Mat12::Zero();
+    Q.block<6, 6>(0, 0) = q_pose;
+    Q.block<6, 6>(6, 6) = q_pose / (dt * dt);
+    Mat12 P_expect = F * P0 * F.transpose() + Q;
+    P_expect = 0.5 * (P_expect + P_expect.transpose());   // matches eskf symmetrize
+
+    CHECK(close(f.cov(), P_expect, 1e-12));
+
+    // Guard: the wrong (forward-adjoint) F would give a materially different P, so
+    // the analytic check above is genuinely discriminating.
+    const Mat6 Ad_fwd = se3::adjoint(delta);
+    Mat12 F_wrong = Mat12::Zero();
+    F_wrong.block<6, 6>(0, 0) = Ad_fwd;
+    Mat12 P_wrong = F_wrong * P0 * F_wrong.transpose() + Q;
+    P_wrong = 0.5 * (P_wrong + P_wrong.transpose());
+    CHECK_FALSE(close(f.cov(), P_wrong, 1e-6));
+
+    // The published twist covariance mirrors the 6x6 twist block.
+    CHECK(close(f.state().twist.cov, f.cov().block<6, 6>(6, 6), 1e-12));
+    CHECK(is_symmetric(f.cov()));
+    CHECK(is_psd(f.cov()));
+}
+
 TEST_CASE("covariance grows under predict and stays symmetric PSD") {
     Eskf f;
     f.init(SE3{}, 0.01 * Mat12::Identity());

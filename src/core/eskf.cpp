@@ -53,6 +53,11 @@ void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
     // --- mean propagation ---------------------------------------------------
     state_.pose     = se3::compose(state_.pose, delta);   // T <- T o delta
     state_.twist.xi = se3::log(delta) / dt_eff;           // const-velocity readout
+    // ACCEPTED SLICE-2 APPROXIMATION: the published twist.cov below is q_pose/dt^2
+    // only (the fresh-readout noise). It ignores that delta's own posterior pose
+    // covariance also feeds the readout. This is consistent with the "re-read the
+    // twist each step" model; a tighter coupling lands with the later reliability
+    // work — recorded as a modeling approximation, not a bug.
 
     // --- covariance propagation: P <- F P F^T + Qmap ------------------------
     // Pose block of F is the inverse adjoint (right-error of the right composition).
@@ -61,6 +66,12 @@ void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
     Mat12 F = Mat12::Zero();
     F.block<6, 6>(0, 0) = Ad_inv;
     // twist block stays zero: twist error is reset by the fresh log(delta)/dt read.
+    // ACCEPTED SLICE-2 APPROXIMATION: F and Qmap are block-diagonal, so the
+    // pose<->twist cross-covariance is forced to 0 every predict even though
+    // twist = log(delta)/dt is a deterministic function of the same delta that moves
+    // the pose (they ARE correlated). Tip extrapolation (pose+twist) is therefore
+    // mildly over/under-confident. A future correct model couples them via the
+    // readout Jacobian (reliability/coupling improve in a later slice).
 
     Mat12 Q = Mat12::Zero();
     Q.block<6, 6>(0, 0) = q_pose;                         // pose increment noise
@@ -71,7 +82,11 @@ void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
     // Keep the published per-twist covariance consistent with the 12x12 block.
     state_.twist.cov = state_.cov.block<6, 6>(6, 6);
 
-    state_.stamp += secs_to_ns(dt_eff);
+    // NOTE: the filter does NOT maintain an absolute timeline. The estimator owns
+    // the frontier clock and stamps the published state with the real frontier t1
+    // (and the tip with `now`); accumulating dt here from 0 would diverge from that
+    // real timeline, so we deliberately leave state_.stamp untouched in predict()
+    // (review fix — was `state_.stamp += dt_eff`, which was masked but inconsistent).
 }
 
 void Eskf::predict_tip(Scalar dt_ahead, Scalar inflation, State& tip_out) const {

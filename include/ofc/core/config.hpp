@@ -65,6 +65,8 @@ struct Config {
     Scalar     weiszfeld_eps  = 1e-9;
     Scalar     metric_lambda  = 1.0;
     bool       adaptive_q     = true;
+    Scalar     q_scale        = 1.0;   // multiplier on the spread-derived Q (CONFIG §3)
+    Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};  // per-axis min Q ([trans;rot])
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;

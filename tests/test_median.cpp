@@ -47,6 +47,50 @@ TEST_CASE("median of one input is a passthrough") {
     CHECK(r.converged);
 }
 
+TEST_CASE("median of zero inputs is identity with zero spread") {
+    // Degenerate count: n == 0 returns identity, spread 0, converged.
+    const median::Result r = median::solve(nullptr, nullptr, 0, params());
+    CHECK(close(r.value.R, Mat3::Identity(), 1e-12));
+    CHECK(close(r.value.t, Vec3::Zero(), 1e-12));
+    CHECK(r.spread == doctest::Approx(0.0));
+    CHECK(r.converged);
+}
+
+TEST_CASE("all-zero weights fall back to uniform (n>=3)") {
+    // Three inputs spread along x; with all-zero weights the solver uses uniform
+    // weights, so the result must match the equal-weight median exactly (and the
+    // spread must be the non-zero uniform RMS, NOT understated to 0).
+    SE3 xs[3];
+    xs[0] = make_se3(Vec3(0, 0, 0.0), Vec3(0.0, 0.0, 0.0));
+    xs[1] = make_se3(Vec3(0, 0, 0.0), Vec3(1.0, 0.0, 0.0));
+    xs[2] = make_se3(Vec3(0, 0, 0.0), Vec3(2.0, 0.0, 0.0));
+    const Scalar w_zero[3] = {0.0, 0.0, 0.0};
+    const Scalar w_unit[3] = {1.0, 1.0, 1.0};
+
+    const median::Result r_zero = median::solve(xs, w_zero, 3, params());
+    const median::Result r_unit = median::solve(xs, w_unit, 3, params());
+
+    CHECK(close(r_zero.value.t, r_unit.value.t, 1e-9));
+    CHECK(close(r_zero.value.R, r_unit.value.R, 1e-9));
+    CHECK(r_zero.spread == doctest::Approx(r_unit.spread).epsilon(1e-9));
+    CHECK(r_zero.spread > 0.1);    // uniform-fallback spread is reported, not 0
+}
+
+TEST_CASE("negative weights are clamped to the uniform fallback (n==2)") {
+    // Both weights <= 0 -> uniform fallback -> equal-weight geodesic midpoint, and a
+    // finite (non-NaN) spread (the negative-weight guard must hold in the RMS too).
+    const SE3 a = make_se3(Vec3(0, 0, 0.0), Vec3(0.0, 0.0, 0.0));
+    const SE3 b = make_se3(Vec3(0, 0, 0.0), Vec3(4.0, 0.0, 0.0));
+    const SE3 xs[2] = {a, b};
+    const Scalar ws[2] = {-1.0, -3.0};
+
+    const median::Result r = median::solve(xs, ws, 2, params());
+    // Uniform fallback -> midpoint at x = 2.0 (not weighted toward either).
+    CHECK(r.value.t.x() == doctest::Approx(2.0).epsilon(1e-9));
+    CHECK(std::isfinite(r.spread));
+    CHECK(r.spread > 0.0);
+}
+
 TEST_CASE("median of two equal-weight inputs is the geodesic midpoint") {
     const SE3 a = make_se3(Vec3(0, 0, 0.0), Vec3(0.0, 0.0, 0.0));
     const SE3 b = make_se3(Vec3(0, 0, kPi / 2), Vec3(2.0, 0.0, 0.0));

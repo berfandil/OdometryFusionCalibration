@@ -28,12 +28,21 @@ namespace {
 
 // Weighted RMS split-distance of the inputs to a pose m: the spread that drives
 // the adaptive Q. sqrt( sum(w_i d_i^2) / sum(w_i) ).
+//
+// `ws` are the raw caller weights; the spread MUST use the SAME effective weights
+// the solver used: each entry clamped to >= 0, and (when the raw set is all <= 0)
+// uniform 1.0 (signalled by `uniform`). Using the raw weights would (a) let a
+// negative weight subtract from the accumulators and yield NaN/garbage, and
+// (b) report 0 for the all-<=0 uniform-fallback case even though the median is the
+// well-defined uniform solution — understating Q. We clamp/substitute here so the
+// effective weights match w_of() in solve() exactly.
 Scalar weighted_rms_spread(const SE3& m, const SE3* xs, const Scalar* ws, int n,
-                           Scalar lambda) {
+                           Scalar lambda, bool uniform) {
     Scalar acc_w  = Scalar(0);
     Scalar acc_d2 = Scalar(0);
     for (int i = 0; i < n; ++i) {
-        const Scalar w = ws[i];
+        const Scalar w = uniform ? Scalar(1)
+                                 : ((ws[i] > Scalar(0)) ? ws[i] : Scalar(0));
         const Scalar d = se3::split_distance(m, xs[i], lambda);
         acc_w  += w;
         acc_d2 += w * d * d;
@@ -82,7 +91,8 @@ Result solve(const SE3* deltas, const Scalar* weights, int n, const Params& p) {
         const Scalar denom = w0 + w1;
         const Scalar u = (denom > Scalar(0)) ? (w1 / denom) : Scalar(0.5);
         out.value = se3::interpolate(deltas[0], deltas[1], u);
-        out.spread = weighted_rms_spread(out.value, deltas, weights, n, p.lambda);
+        out.spread = weighted_rms_spread(out.value, deltas, weights, n, p.lambda,
+                                         uniform);
         out.iters = 1;
         out.converged = true;
         return out;
@@ -126,6 +136,9 @@ Result solve(const SE3* deltas, const Scalar* weights, int n, const Params& p) {
         const Vec3 r_step  = r_acc / usum;          // tangent update about R_m
 
         // Tangent step norm (split metric, same lambda) measures convergence.
+        // NOTE: this folds rotation (rad) and lambda*translation (m) into one
+        // scalar, so `p.tol` is a threshold in SPLIT-METRIC units (matching the
+        // solver's own metric), NOT a pure-radian tolerance.
         const Vec3 t_step = t_new - m.t;
         const Scalar step_norm =
             std::sqrt(r_step.squaredNorm() + p.lambda * t_step.squaredNorm());
@@ -137,7 +150,7 @@ Result solve(const SE3* deltas, const Scalar* weights, int n, const Params& p) {
     }
 
     out.value  = m;
-    out.spread = weighted_rms_spread(m, deltas, weights, n, p.lambda);
+    out.spread = weighted_rms_spread(m, deltas, weights, n, p.lambda, uniform);
     return out;
 }
 

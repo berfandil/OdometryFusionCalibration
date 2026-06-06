@@ -4,16 +4,24 @@
 // step() allocates nothing; no exceptions; bounded loops.
 //
 // Slice 2 pipeline (no calibration, no absolute corrections yet — DESIGN §§4-5):
-//   per step(now): frontier t1 = now - fusion_delay; t0 = t1 - window
+//   per step(now): frontier t1 = now - fusion_delay
+//     integration interval [q0, t1]:
+//       q0 = last_t1        (steady state — picks up where the last fuse ended)
+//       q0 = t1 - window_s  (bootstrap of the FIRST fuse — no prior frontier yet)
+//     dt = (t1 - q0) seconds                   (ACTUAL elapsed motion, not a fixed step)
 //     for each registered source:
-//       B = query(t0, t1)                     (source-frame windowed delta)
+//       B = query(q0, t1)                     (source-frame delta over the interval)
 //       A = X o B o X^-1                       (frame-align to base; X = sensor->base
 //                                               prior extrinsic — see convention below)
 //       w = clamp(weight_prior * sigma_confidence)
 //     median of {A_i} weighted by {w_i}        (split-metric Weiszfeld)
-//     ESKF predict on the median delta (dt = window), adaptive Q from the spread
+//     ESKF predict on the median delta (dt = t1 - q0), adaptive Q from the spread
+//     on success: last_t1 <- t1               (gap/overlap-free across ticks)
 //     populate Result.frontier and Result.tip
-//   Returns NotReady until >= 1 source covers the window (full lifecycle is Slice 3).
+//   Returns NotReady until >= 1 source covers the interval (full lifecycle is Slice 3).
+//   NOTE: `window_s` is the bootstrap/lookback interval for the first fuse only; the
+//   integrator no longer assumes one window per tick, so tick cadence may differ from
+//   window_s without opening integration gaps/overlaps (review fix — DESIGN §7).
 //
 // Frame-align convention (documented): each SensorConfig::prior_extrinsic X is the
 // sensor->base transform (a point/twist expressed in the sensor frame maps to base
@@ -41,7 +49,12 @@ Timestamp secs_to_ns(Scalar s) {
 
 // Sigma-confidence of a windowed delta: an inverse-covariance scalar. We use
 // 1 / (mean diagonal + eps) so a tighter (smaller-Sigma) source weighs more. This
-// is the prior x Sigma-confidence weight of DESIGN §4 (reliability EMA is Slice 9).
+// is the prior x Sigma-confidence weight of DESIGN §4.
+// PLACEHOLDER (unit-mixing): the mean over all 6 diagonal entries blends
+// translation (m^2) and rotation (rad^2) variances into one scalar, so a source
+// with tiny rad var but huge m var gets a misleading confidence. This is an
+// accepted Slice-2 placeholder until the Slice 9 reliability EMA replaces it with a
+// properly unit-separated weight.
 Scalar sigma_confidence(const Mat6& cov) {
     const Scalar mean_diag = cov.diagonal().mean();
     constexpr Scalar kEps = Scalar(1e-9);
@@ -72,6 +85,13 @@ struct Estimator::Impl {
     Eskf   eskf;
     bool   eskf_started = false;
 
+    // End of the last successfully-fused window. The next predict integrates the
+    // actual motion over [last_t1, t1] (dt = t1 - last_t1), so integration is
+    // gap/overlap-free regardless of how the caller spaces step() ticks. Only
+    // advanced on a successful fuse; a step with no covering source leaves it put.
+    Timestamp last_t1     = 0;
+    bool      has_last_t1 = false;
+
     // Resolve the SensorConfig for a given source id (linear scan, bounded by
     // sensor_count). Returns nullptr if none.
     const SensorConfig* sensor_for(SourceId id) const {
@@ -96,6 +116,8 @@ Status Estimator::init(const Config& cfg) {
     impl_->result.phase = Phase::Init;
     impl_->source_count = 0;
     impl_->eskf_started = false;
+    impl_->last_t1      = 0;
+    impl_->has_last_t1  = false;
     for (int i = 0; i < kMaxSourcesCap; ++i) {
         impl_->sources[i]         = nullptr;
         impl_->prior_extrinsic[i] = SE3{};
@@ -133,16 +155,31 @@ Status Estimator::step(Timestamp now) {
     Impl& s = *impl_;
     const Config& cfg = s.cfg;
 
-    // Causal frontier window [t0, t1].
+    // Causal frontier at t1 = now - delay. We integrate the ACTUAL motion since the
+    // last fused frontier: the query/predict interval is [q0, t1] with
+    //   q0 = last_t1          (steady state — gap/overlap-free between ticks)
+    //   q0 = t1 - window_s    (bootstrap of the first fused step — no prior frontier)
+    // and dt = (t1 - q0) in seconds. So `window_s` is now the BOOTSTRAP / LOOKBACK
+    // interval for the very first fuse, not a fixed per-tick step: the integrator is
+    // correct regardless of tick cadence (DESIGN §7). last_t1 only advances on a
+    // successful fuse, so a skipped (uncovered) step never opens an integration gap.
     const Timestamp t1 = now - secs_to_ns(cfg.fusion_delay_s);
-    const Timestamp t0 = t1 - secs_to_ns(cfg.window_s);
+    const Timestamp q0 = s.has_last_t1 ? s.last_t1 : (t1 - secs_to_ns(cfg.window_s));
+
+    // Degenerate / non-causal interval guard: nothing to integrate.
+    if (t1 <= q0) {
+        s.result.phase     = Phase::Warmup;
+        s.result.tip_valid = false;
+        return Status::NotReady;
+    }
+    const Scalar dt = static_cast<Scalar>(t1 - q0) / kNanosPerSec;
 
     // Collect each covered source's frame-aligned delta + weight.
     int n = 0;
     for (int i = 0; i < s.source_count; ++i) {
         const ISource* src = s.sources[i];
         if (src == nullptr) continue;
-        const Expected<Delta> q = src->query(t0, t1);
+        const Expected<Delta> q = src->query(q0, t1);
 
         // Diagnostics (best-effort; coverage flag set regardless of fuse outcome).
         SourceHealth& h = s.result.health[i];
@@ -195,23 +232,30 @@ Status Estimator::step(Timestamp now) {
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).
+    // q_scale / q_floor come from Config (CONFIG §3). Adaptive: floor + q_scale*spread^2.
+    // Non-adaptive: just the per-axis floor (no spread term).
     Mat6 q_pose;
     if (cfg.adaptive_q) {
-        const Scalar floor[6] = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
-        q_pose = Eskf::adaptive_q(med.spread, Scalar(1), floor);
+        q_pose = Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor);
     } else {
-        q_pose = Scalar(1e-4) * Mat6::Identity();
+        q_pose = Eskf::adaptive_q(Scalar(0), cfg.q_scale, cfg.q_floor);
     }
 
-    // ESKF predict on the median delta over the window. Anchor the odom frame at the
+    // ESKF predict on the median delta over the integrated interval [q0, t1] (dt is
+    // the actual elapsed time, NOT a fixed window). Anchor the odom frame at the
     // first fused tick (pose starts at identity — gauge anchored at init, DESIGN §7).
     if (!s.eskf_started) {
         s.eskf.init(SE3{}, Mat12::Identity());
         s.eskf_started = true;
     }
-    s.eskf.predict(med.value, cfg.window_s, q_pose);
+    s.eskf.predict(med.value, dt, q_pose);
 
-    // Frontier state.
+    // This fuse succeeded: advance the integration frontier so the next step picks
+    // up exactly where this one ended (no gap, no overlap).
+    s.last_t1     = t1;
+    s.has_last_t1 = true;
+
+    // Frontier state. Drive the published stamp from the real frontier t1.
     s.result.frontier        = s.eskf.state();
     s.result.frontier.stamp  = t1;
     s.result.phase           = Phase::Nominal;
@@ -254,6 +298,28 @@ Status validate(const Config& cfg) {
     if (cfg.metric_lambda <= 0.0)                    return Status::OutOfRange;
     if (cfg.commit_drop >= cfg.commit_concentration) return Status::InvalidConfig;
     if (cfg.reference_sensor_id >= cfg.max_sources)  return Status::OutOfRange;
+
+    // Median / fusion knob ranges (CONFIG §§1-4).
+    if (cfg.confidence_blend < 0.0 || cfg.confidence_blend > 1.0)
+        return Status::OutOfRange;                       // blend factor in [0, 1]
+    if (cfg.weiszfeld_tol <= 0.0 || cfg.weiszfeld_tol >= 1.0)
+        return Status::OutOfRange;                       // tol in (0, 1)
+    if (cfg.weiszfeld_eps <= 0.0 || cfg.weiszfeld_eps >= 1.0)
+        return Status::OutOfRange;                       // eps in (0, 1)
+    if (cfg.fusion_delay_s < 0.0 || cfg.fusion_delay_s > 2.0)
+        return Status::OutOfRange;                       // delay in [0, 2] s
+    if (cfg.weight_floor <= 0.0 || cfg.weight_floor >= 1.0)
+        return Status::OutOfRange;                       // floor in (0, 1)
+    if (cfg.weight_cap < 1.0)
+        return Status::OutOfRange;                       // cap >= 1
+    if (cfg.tip_cov_inflation < 1.0)
+        return Status::OutOfRange;                       // inflation >= 1
+    if (cfg.q_scale <= 0.0)
+        return Status::OutOfRange;                       // q_scale > 0
+    for (int i = 0; i < 6; ++i) {
+        if (cfg.q_floor[i] < 0.0) return Status::OutOfRange;   // each q_floor[i] >= 0
+    }
+
     // TODO: per-sensor + histogram range checks.
     return Status::Ok;
 }
