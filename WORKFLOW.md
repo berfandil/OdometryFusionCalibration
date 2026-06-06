@@ -54,6 +54,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Sim rig (the calibration oracle) — trajectory + synthetic sources + rig driver (green: 98 cases / 4259 assertions). Exposed + fixed a Slice-2 gap (estimator now applies `prior_scale`).
 - [x] Slice 5 — Time-sync (‖ω‖ xcorr → offset histogram, commit N_min + hysteresis) (green: 115 cases / 4370 assertions).
 - [x] Slice 6 — Phase-1 calibration: straight-gated yaw/pitch (3-ch so(3) @ prior) + per-source scale; observability self-test (green: 124 cases / 4565 assertions).
+- [x] Slice 7 — Phase-2 calibration: turn-gated roll (S¹) + xyz lever-arm (hand-eye LS), both strategies, vote_weight honored, observability self-test (green: 138 cases / 5031 assertions).
 - (remaining slices per `ISSUES.md`).
 
 ## Sub-agent task-brief template

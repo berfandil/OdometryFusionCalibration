@@ -62,7 +62,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: planted yaw/pitch/scale recovered in sim; **observability self-test**: values stay at prior unless straight motion is present.
 **Deps**: Slices 4, 2.
 
-## Slice 7 — Calibration Phase 2 (roll + xyz)  `[ ]`
+## Slice 7 — Calibration Phase 2 (roll + xyz)  `[x]`
 **Goal**: turn-regime recovery via hand-eye.
 - Turn gate; strategy A (`vs_fused_base`): roll 1-D residual + xyz linear-LS.
 - Then strategy B (`pairwise_pinned_ref`); compare empirically.
