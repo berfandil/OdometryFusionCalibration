@@ -32,6 +32,7 @@ add_library(ofc_core STATIC
     src/core/median.cpp
     src/core/eskf.cpp
     src/core/estimator.cpp
+    src/core/histogram.cpp
 )
 target_include_directories(ofc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ofc_core PUBLIC Eigen3::Eigen)
