@@ -51,7 +51,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Slice 1 — Source buffers & uniform delta query (green: 31 cases / 287 assertions).
 - [x] Slice 2 — Median fusion + ESKF integrator (first tracer bullet) (green: 56 cases / 491 assertions).
 - [x] Slice 4 — Histogram primitive (green: 76 cases / 2651 assertions).
-- [ ] Sim rig (the calibration oracle) — required before Slices 6–8 run autonomously.
+- [x] Sim rig (the calibration oracle) — trajectory + synthetic sources + rig driver (green: 98 cases / 4259 assertions). Exposed + fixed a Slice-2 gap (estimator now applies `prior_scale`).
 - (remaining slices per `ISSUES.md`).
 
 ## Sub-agent task-brief template

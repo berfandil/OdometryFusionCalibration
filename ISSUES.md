@@ -106,7 +106,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: each adapter builds against the core public API; ROS node round-trips on a recorded bag.
 **Deps**: Slices 2, 12.
 
-## Slice 14 — Validation harness  `[ ]`
+## Slice 14 — Validation harness  `[~]` (sim rig built; observability self-tests + NEES/NIS + golden remain)
 **Goal**: the trust apparatus (D24).
 - Sim rig (parameterized GT trajectory + sources), observability self-tests (per regime), NEES/NIS Monte-Carlo, recorded-data golden regression.
 **Done when**: CI runs unit + observability + consistency + golden; tuned defaults replace the "tuned" placeholders in `CONFIG.md`.

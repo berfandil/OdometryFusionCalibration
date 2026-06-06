@@ -105,7 +105,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `id` | int | — | [0, max_sources) | Source index. |
 | `prior_extrinsic` | SE3 | identity | — | Mount prior (also the histogram basepoint for Phase 1). |
 | `prior_scale` | double | 1.0 | (0, ∞) | Translation-scale prior. |
-| `prior_time_offset_s` | double | 0.0 | [−max_lag, max_lag] | Clock-offset prior. |
+| `prior_time_offset_s` | double | 0.0 | [−max_lag, max_lag] | Clock-offset prior. Sign: **positive ⇒ source clock ahead of base** (its `[t0,t1]` maps to true `[t0+off, t1+off]`). |
 | `weight_prior` | double | 1.0 | (0, ∞) | Initial trust weight. |
 | `native_confidence` | bool | true | — | Use the provider's reported Σ if present. |
 | `modeled_noise_per_m` | double | tuned | ≥0 | Synthetic translation noise (per metre). |

@@ -28,7 +28,7 @@ per-source ring buffers (fixed capacity, preallocated)
         → per-source offset histogram → mode
   → FUSION  (causal frontier = now − delay_fast)
         integrate each source over window W → SE(3) delta
-        frame-align (apply current extrinsics) + scale-correct each delta
+        scale-correct (B.t / prior_scale) then frame-align (A = X∘B∘X⁻¹)
         weighted geometric median (Weiszfeld, split SO(3)/ℝ³ metric, bounded iters) → u_k
         ESKF: predict on u_k; Q from inter-source spread;
               correct ONLY on optional absolute-ref plugins (Mahalanobis-gated)
