@@ -71,6 +71,7 @@ struct Config {
     Scalar      weight_floor  = 0.05;
     Scalar      weight_cap    = 10.0;
     ConfCombine conf_combine  = ConfCombine::Sum;
+    Scalar      confidence_blend = 0.5;   // blend factor when conf_combine == Weighted (CONFIG §4)
 
     // Time-sync
     bool         timesync_enabled = true;
