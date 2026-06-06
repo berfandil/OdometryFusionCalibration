@@ -94,7 +94,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `circular` | bool | false | — | Wrap-around bins (true for roll/yaw-like). |
 | `aging_mode` | enum | `decay` | {`decay`, `sliding_k`} | Vote-aging strategy. |
 | `decay_gamma` | double | 0.999 | (0, 1) | Per-vote bin decay (when `aging_mode = decay`). |
-| `sliding_k` | int | 1000 | [1, ∞) | Window size (when `aging_mode = sliding_k`). |
+| `sliding_k` | int | 1000 | [1, 4096] | Window size (when `aging_mode = sliding_k`). Upper bound = the fixed-capacity ring (`Histogram1D::kMaxSlidingK`). |
 | `vote_split` | bool | true | — | Linear-split a vote between the two nearest bins. |
 | `subbin` | bool | true | — | Parabolic sub-bin peak interpolation. |
 

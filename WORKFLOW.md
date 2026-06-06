@@ -50,7 +50,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Slice 0 — Lie ops, build, doctest harness (green: 14 cases / 25 assertions).
 - [x] Slice 1 — Source buffers & uniform delta query (green: 31 cases / 287 assertions).
 - [x] Slice 2 — Median fusion + ESKF integrator (first tracer bullet) (green: 56 cases / 491 assertions).
-- [ ] Slice 4 — Histogram primitive.
+- [x] Slice 4 — Histogram primitive (green: 76 cases / 2651 assertions).
 - [ ] Sim rig (the calibration oracle) — required before Slices 6–8 run autonomously.
 - (remaining slices per `ISSUES.md`).
 

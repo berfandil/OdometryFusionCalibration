@@ -40,7 +40,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: lifecycle transitions unit-tested; output appears as early as the reference source allows.
 **Deps**: Slice 2.
 
-## Slice 4 — Histogram primitive  `[ ]`
+## Slice 4 — Histogram primitive  `[x]`
 **Goal**: the shared robustness estimator (reused by every calibrated quantity).
 - Fixed bins, linear-split voting, parabolic sub-bin, peak-concentration confidence.
 - Aging: `decay` and `sliding_k` (config). Circular variant (for roll).
