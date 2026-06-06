@@ -9,12 +9,24 @@ namespace ofc {
 enum class Phase { Init, Warmup, Degraded, Nominal };
 
 // Calibration snapshot for one source (relative to the pinned reference).
+//
+// Per-DOF confidences are reported SEPARATELY because each calibrated quantity is
+// observable in a different motion regime and converges independently (DESIGN §3):
+//   * confidence            — the TIME-OFFSET confidence (Slice 5; histogram concentration
+//                             of the ‖ω‖-xcorr offset vote). Kept as the primary field for
+//                             backward compatibility.
+//   * extrinsic_confidence  — the yaw/pitch (so(3) direction) confidence (Slice 6 Phase 1).
+//   * scale_confidence      — the per-source scale confidence (Slice 6 Phase 1).
+// All are peak concentrations in [0, 1]. `committed` currently reflects the time-offset
+// commit gate (Slice 5); per-DOF commit flags arrive with the feedback loop (Slice 8).
 struct CalibSnapshot {
     SourceId id            = 0;
-    SE3      extrinsic;                 // estimated mount
+    SE3      extrinsic;                 // estimated mount (yaw/pitch in Slice 6; roll Slice 7)
     Scalar   scale         = 1.0;
     Scalar   time_offset_s = 0.0;
-    Scalar   confidence    = 0.0;       // peak concentration in [0,1]
+    Scalar   confidence    = 0.0;       // TIME-OFFSET peak concentration in [0,1]
+    Scalar   extrinsic_confidence = 0.0; // yaw/pitch (so(3)) concentration in [0,1]
+    Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
     bool     committed     = false;
 };
 

@@ -42,6 +42,7 @@
 #include "ofc/core/estimator.hpp"
 
 #include "ofc/core/buffer.hpp"
+#include "ofc/core/calibration.hpp"
 #include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
@@ -116,6 +117,17 @@ struct Estimator::Impl {
     TimeSync timesync;
     bool     timesync_active = false;
     int      ticks_since_sync = 0;
+
+    // Phase-1 calibration (Slice 6, D5/D11/D20). Driven from the straight-regime calib
+    // stage each fused step: per source the DE-SCALED reported delta B_corr + the fused
+    // consensus twist/translation -> 3-channel so(3) histogram @ prior basepoint (yaw,
+    // pitch) + magnitude-ratio scale histogram. Slice 6 only ESTIMATES + exposes into
+    // CalibSnapshot.{extrinsic, scale, confidence}; feeding it back into fusion is Slice 8
+    // (NOT wired). Heap-resident inside Impl (allocated once in init()).
+    Phase1Calibrator calib1;
+    // Per-step scratch for the calibration observe() (no heap in step()).
+    SourceId calib_ids[kMaxSourcesCap];
+    SE3      calib_reported[kMaxSourcesCap];
 
     // Per-source time-offset commit state (DESIGN §2/§6). A source's offset is COMMITTED
     // (driving fusion) once its histogram concentration clears commit_concentration AND
@@ -214,6 +226,14 @@ Status Estimator::init(const Config& cfg) {
         impl_->timesync_active = true;
     }
 
+    // Phase-1 calibration: configure once at init (preallocates its per-source histograms).
+    // Per-source priors are bound in add_source(). Always active (it self-gates on the
+    // straight regime); it never feeds back into fusion in Slice 6.
+    {
+        const Status cs = impl_->calib1.configure(cfg, cfg.reference_sensor_id);
+        if (!ok(cs)) return cs;
+    }
+
     impl_->inited = true;
     return Status::Ok;
 }
@@ -238,6 +258,12 @@ Status Estimator::add_source(const ISource* src) {
     impl_->prior_scale[slot] = (ps > Scalar(0)) ? ps : Scalar(1);
     impl_->prior_time_offset[slot] =
         (sc != nullptr) ? sc->prior_time_offset_s : Scalar(0);
+    // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
+    {
+        const SE3  Xp = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
+        const bool sccal = (sc != nullptr) ? sc->scale_calib : true;
+        impl_->calib1.set_prior(src->id(), Xp, sccal);
+    }
     ++impl_->source_count;
     return Status::Ok;
 }
@@ -350,6 +376,11 @@ Status Estimator::step(Timestamp now) {
 
         s.aligned[n] = A;
         s.weights[n] = w;
+        // Capture the de-scaled reported sensor-frame delta for the Phase-1 calibrator
+        // (direction -> yaw/pitch + magnitude ratio -> scale; D11/D20). The magnitude
+        // ratio off the DE-SCALED B recovers the RESIDUAL scale vs the prior.
+        s.calib_ids[n]      = src->id();
+        s.calib_reported[n] = B_corr;
         h.weight     = w;
         ++n;
     }
@@ -380,20 +411,44 @@ Status Estimator::step(Timestamp now) {
         ++k;
     }
 
+    // ---- Phase-1 calibration stage (Slice 6, D5/D11/D20) -------------------------
+    // Drive the straight-gated calibrator with the fused consensus twist + per-source
+    // de-scaled reported deltas. The fused body angular speed is log(med.R)/dt; the fused
+    // translation over the step is med.t. The calibrator self-gates on the straight regime
+    // (||omega||<straight_omega_max AND ||t||>straight_trans_min) and votes the 3-channel
+    // so(3) direction + the magnitude-ratio scale. It runs at the SAME frontier as fusion
+    // for now (the deeper fixed-lag frontier is a later refinement). NO feedback into
+    // fusion in Slice 6 — it only populates CalibSnapshot below.
+    const Vec3 fused_omega = so3::log(med.value.R) / dt;
+    const Vec3 fused_trans = med.value.t;
+    s.calib1.observe(n, s.calib_ids, s.calib_reported, fused_omega, fused_trans);
+
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
     // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED
     // to its query (committed time-sync value, else the prior) plus the time-sync
     // histogram confidence. `committed` marks that the estimate cleared the N_min +
     // hysteresis commit gate (so it is actually driving fusion rather than the prior) —
     // it is the latched per-source state advanced in update_commit_state() above.
+    // Phase-1 calibration (Slice 6) now fills the extrinsic yaw/pitch + scale DOF. The
+    // reported extrinsic is the prior with the recovered yaw/pitch correction (roll +
+    // translation stay at the prior — Slice 7). `scale` is the residual scale vs the prior
+    // (calib1.scale ~ 1 until a straight regime is observed) multiplied back by the prior
+    // (the calibrator votes the ratio off the DE-SCALED B, so the absolute scale =
+    // prior_scale * residual). `confidence` is the so(3) direction concentration (yaw/pitch
+    // reliability). The time-offset DOF + its commit flag are unchanged (Slice 5). Slice 6
+    // does NOT feed any of this back into fusion (Slice 8).
     for (int i = 0; i < s.source_count; ++i) {
         const SourceId id = s.sources[i]->id();
         CalibSnapshot& cs = s.result.calib[i];
         cs.id            = id;
-        cs.extrinsic     = s.prior_extrinsic[i];
-        cs.scale         = s.prior_scale[i];
+        cs.extrinsic     = s.calib1.extrinsic(id);
+        cs.scale         = s.prior_scale[i] * s.calib1.scale(id);
         cs.time_offset_s = s.effective_offset(i);
+        // confidence stays the TIME-OFFSET confidence (Slice 5); Phase-1 confidences are
+        // reported in their own fields (per-DOF, since each converges independently).
         cs.confidence    = s.timesync_active ? s.timesync.confidence(id) : Scalar(0);
+        cs.extrinsic_confidence = s.calib1.extrinsic_confidence(id);
+        cs.scale_confidence     = s.calib1.scale_confidence(id);
         cs.committed     = s.offset_committed[i];
     }
 
