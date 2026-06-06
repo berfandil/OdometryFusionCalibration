@@ -1,0 +1,26 @@
+# Build
+/build/
+/out/
+*.o
+*.a
+*.so
+*.obj
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude local settings
+.claude/settings.local.json
+
+# Persistence snapshots (runtime artifacts)
+*.ofc-state
