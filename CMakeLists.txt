@@ -52,7 +52,9 @@ endif()
 if (OFC_BUILD_ADAPTERS)
     add_subdirectory(adapters)
 endif()
-if (OFC_BUILD_SIM)
+# The sim rig is the validation backbone (D24): the tests link it, so build it
+# whenever tests are on, even if OFC_BUILD_SIM was not requested explicitly.
+if (OFC_BUILD_SIM OR OFC_BUILD_TESTS)
     add_subdirectory(sim)
 endif()
 if (OFC_BUILD_TESTS)
