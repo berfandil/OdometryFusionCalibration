@@ -182,5 +182,189 @@ private:
     int         source_count_ = 0;
 };
 
+// ===========================================================================
+// PHASE 2 — TURN-REGIME roll (about forward) + xyz lever-arm via HAND-EYE
+// (DESIGN §3/§6, DECISIONS D5/D10/D21). The two extrinsic DOF Phase 1 cannot see:
+// roll about the forward axis and the xyz lever arm are observable ONLY under
+// rotation. A sensor offset by a lever arm `r` sees `ω×r`, which is zero in pure
+// translation — so the translation hand-eye is SINGULAR at R_A=I, which re-derives
+// the turn gate. Phase 1 has already fixed yaw,pitch; Phase 2 adds the remaining roll
+// + translation on top.
+//
+// THE HAND-EYE EQUATION (the oracle pins it, sim/synthetic_source.cpp). A rigid sensor
+// and base obey  A·X = X·B,  A = base motion, B = sensor motion, X = sensor->base. The
+// sim reports  B = X^{-1} A X  (then B.t *= scale), so  A X = X B  exactly. Splitting:
+//   rotation:     R_A R_X = R_X R_B
+//   translation:  (R_A − I) t_X = R_X t_B − t_A
+//
+// ROLL (1 nonlinear DOF). With yaw,pitch fixed by Phase 1 as R_yp (the roll-free
+// rotation R_X with roll=0 — exactly Phase1Calibrator::extrinsic's rotation), the full
+// extrinsic rotation is  R_X(roll) = R_yp · Rx(roll),  Rx = rotation about the LOCAL
+// forward axis (sensor x; Phase 1 has aligned it to base-forward). Recover roll per
+// accepted window by a BOUNDED 1-D search minimizing the rotation hand-eye residual
+//   res(roll) = ‖ log( R_X(roll) R_B R_X(roll)^T R_A^T ) ‖
+// over roll ∈ (−π, π] (coarse grid, then a parabolic refine of the grid minimizer; the
+// search is bounded — fixed grid count). At the true roll, R_A R_X = R_X R_B ⇒ res = 0;
+// under turning the residual is sensitive to roll (it is flat only when R_A = I, i.e.
+// no rotation — the same singularity that gates Phase 2). The minimizer is voted into a
+// CIRCULAR S¹ Histogram1D (cfg.roll_hist); estimate = its mode.
+//
+// xyz (3 linear DOF given rotation). Stack the translation row-block over accepted
+// (turning) windows and solve LEAST-SQUARES for t_X:
+//      Stack  (R_A − I) t_X = (R_X t_B − t_A)  =>  normal equations  AᵀA t_X = Aᵀb,
+// accumulated INCREMENTALLY into a fixed 3×3 (AᵀA) + 3×1 (Aᵀb) — no growing matrix
+// (strict core). Solve via Eigen LDLT (symmetric-PSD). NEAR-SINGULAR GUARD: pure yaw
+// turning leaves t_X.z unobservable (the null space of R_A−I for a z-axis rotation IS
+// the z-axis), so AᵀA is rank-deficient; readout is gated on a conditioning floor
+// (smallest eigenvalue of AᵀA ≥ cond_min · largest). Per-window a low-rotation row
+// (‖log R_A‖ below a floor) is REJECTED before accumulation (the ω×r → 0 regime). Each
+// solved component is voted into the 3×1-D cfg.xyz_hist; estimate = per-channel mode.
+//
+// STRATEGY (cfg.phase2_strategy, both implemented + compared — D10). The per-source
+// hand-eye is identical; only the base motion A differs:
+//   * VsFusedBase       : A = the fused CONSENSUS base motion (med over sources). R_yp
+//                         for source i comes from Phase 1's extrinsic(i).
+//   * PairwisePinnedRef : A = X_ref ∘ B_ref ∘ X_ref^{-1}, the base motion IMPLIED by the
+//                         pinned reference (its extrinsic held at the prior — the gauge).
+//                         Solving the same hand-eye then yields the source's X relative
+//                         to the reference. Reference-paired (sufficient; not all-pairs).
+// Both recover the planted roll + lever arm in the oracle.
+//
+// CONFIDENCE. extrinsic_confidence reuses the roll histogram concentration (the roll
+// reliability); translation_confidence (a non-breaking new readout) is the MIN over the
+// 3 xyz channels' concentrations (the weakest axis bounds the joint t_X reliability — an
+// unobservable axis, e.g. z under pure yaw, never concentrates, so its confidence stays
+// low and flags the under-determined component).
+//
+// Slice 7 ESTIMATES + EXPOSES only — NO feedback into fusion (that is Slice 8). It is
+// driven from the estimator's turn-gated calibration slice; fusion behavior is unchanged.
+//
+// STRICT CORE: no heap after configure(); fixed per-source roll (1) + xyz (3)
+// histograms + a fixed-size 3×3 normal-equation accumulator per source; bounded loops
+// (the roll grid, the per-source scan); Status returns; no exceptions; double math.
+class Phase2Calibrator {
+public:
+    static constexpr int kMaxSources = 32;
+    // Bounded 1-D roll search resolution (strict core: fixed iteration count).
+    static constexpr int kRollGrid   = 180;     // grid samples over (−π, π]
+
+    Phase2Calibrator() = default;
+
+    // Bind the active configuration + the pinned reference source id. Sizes the
+    // per-source roll (cfg.roll_hist, circular) + 3 xyz (cfg.xyz_hist) histograms,
+    // captures the turn gate / strategy, and clears all state. Validates:
+    //   reference_id < kMaxSources                -> else OutOfRange
+    //   roll_hist / xyz_hist pass Histogram1D::configure -> propagated
+    // No heap occurs here nor in any later call.
+    Status configure(const Config& cfg, SourceId reference_id);
+
+    // Drop all votes + reset the LS accumulators (keeps the configuration).
+    void reset();
+
+    // Register the per-source PRIOR extrinsic (sensor->base) — used by
+    // PairwisePinnedRef as the pinned-reference gauge, and as the translation fallback
+    // for an unvoted source. Call once per source after configure(). Returns OutOfRange
+    // if id is out of range, CapacityExceeded at cap.
+    Status set_prior(SourceId id, const SE3& prior_extrinsic);
+
+    // Provide the Phase-1-recovered yaw/pitch rotation R_yp for each source (the roll
+    // basepoint: R_X(roll) = R_yp · Rx(roll)). Call whenever Phase 1 updates (cheap; the
+    // calibrator just stores the latest). A source with no R_yp set uses its prior
+    // rotation. Returns OutOfRange / CapacityExceeded as set_prior.
+    Status set_yaw_pitch(SourceId id, const Mat3& R_yp);
+
+    // Consume one FUSED step (the turn-regime calibration slice). `fused_motion` is the
+    // consensus base motion A over the step (SE3; used by VsFusedBase and for the gate).
+    // `fused_omega` is the consensus body angular RATE (rad/s, ÷dt) — the turn gate's
+    // operand. Per registered source i in [0, n): ids[i] is its id, reported[i] is its
+    // DE-SCALED reported sensor-frame delta B_corr (same convention Phase 1 uses). The
+    // reference source must be present among `ids` for PairwisePinnedRef to vote.
+    //
+    // GATE (D5): votes are deposited ONLY when the fused motion is TURNING —
+    //   ‖fused_omega‖ > turn_omega_min.
+    // Off-gate steps are a no-op (NotReady, not an error). Per-source, a window whose
+    // base-motion rotation magnitude ‖log R_A‖ is below a small floor is additionally
+    // skipped (the ω×r→0 near-singular row — it would add a near-zero, ill-conditioned
+    // row to the LS). Returns Ok when at least one source voted, NotReady when gated out,
+    // NotInitialized if unconfigured, NoData on bad args.
+    Status observe(int n, const SourceId* ids, const SE3* reported,
+                   const SE3& fused_motion, const Vec3& fused_omega);
+
+    // --- Per-source readouts (committed = histogram mode / LS solve) ---------
+    // Recovered roll about the forward axis [rad], the roll-histogram mode. 0 (prior)
+    // for an unvoted / unknown source.
+    Scalar roll(SourceId id) const;
+    // Recovered lever-arm translation t_X (sensor->base), per-channel xyz-histogram mode.
+    // The prior translation for an unvoted source / an unobservable (ill-conditioned)
+    // axis. (The histogram mode is the robust estimate; the raw LS solve is available via
+    // solve_lever_arm() for diagnostics.)
+    Vec3 lever_arm(SourceId id) const;
+    // Full recovered extrinsic: rotation = R_yp · Rx(roll_mode) (yaw/pitch from Phase 1 ∘
+    // recovered roll), translation = lever_arm(). The prior for an unvoted source.
+    SE3  extrinsic(SourceId id) const;
+
+    // Roll-histogram concentration in [0,1] — the roll (extrinsic) confidence. 0 unvoted.
+    Scalar extrinsic_confidence(SourceId id) const;
+    // Translation confidence: MIN of the 3 xyz-channel concentrations in [0,1]. The
+    // weakest (e.g. an unobservable z under pure yaw) bounds the joint t_X reliability.
+    // 0 for an unvoted / unknown source.
+    Scalar translation_confidence(SourceId id) const;
+
+    bool     configured() const { return configured_; }
+    SourceId reference()  const { return reference_id_; }
+    Scalar   roll_vote_count(SourceId id) const;     // roll-histogram total mass
+    Scalar   xyz_vote_count(SourceId id) const;      // accumulated LS row count
+    bool     gated_turning() const { return last_gate_turning_; }   // last observe()
+
+    // Direct LS solve of t_X from the accumulated normal equations (AᵀA t_X = Aᵀb), with
+    // the conditioning guard. Returns the prior translation if ill-conditioned / no rows.
+    // `observable` (out) flags whether the solve was well-conditioned. Diagnostics path
+    // (the histogram mode is the committed estimate); also used by lever_arm()'s seeding.
+    Vec3 solve_lever_arm(SourceId id, bool* observable = nullptr) const;
+
+private:
+    int slot_for(SourceId id) const;
+    int ensure_slot(SourceId id);
+
+    // Rotation about the local forward axis (sensor x) by `roll` (Rodrigues, closed form).
+    static Mat3 roll_about_forward(Scalar roll);
+    // Ridge-regularized solve of the lever-arm normal equations CENTERED on the prior:
+    //   (AᵀA + ridge·I)(t − t_prior) = Aᵀb − AᵀA·t_prior  =>  t.
+    // An unobservable axis (≈zero information in AᵀA) is pinned near t_prior by the ridge;
+    // observable axes resolve. `obs[c]` (out) flags whether axis c carries enough
+    // information (AᵀA(c,c) ≥ kAxisInfoMin × max diagonal). Heap-free.
+    static Vec3 solve_ridge(const Mat3& AtA, const Vec3& Atb, const Vec3& t_prior,
+                            Scalar ridge, bool obs[3]);
+    // The rotation hand-eye residual norm for a candidate roll (see header math).
+    static Scalar rot_residual(const Mat3& R_yp, Scalar roll,
+                               const Mat3& R_A, const Mat3& R_B);
+    // Bounded 1-D minimizer of rot_residual over (−π, π] (grid + parabolic refine).
+    static Scalar best_roll(const Mat3& R_yp, const Mat3& R_A, const Mat3& R_B);
+
+    bool     configured_        = false;
+    SourceId reference_id_       = 0;
+    Scalar   turn_omega_min_     = Scalar(0.20);
+    Phase2Strat strategy_        = Phase2Strat::VsFusedBase;
+    bool     last_gate_turning_  = false;
+    HistogramConfig roll_cfg_{};
+    HistogramConfig xyz_cfg_{};
+
+    // Per-source state. roll_[slot] is the circular roll histogram; xyz_[3*slot + c] is
+    // channel c (0=x,1=y,2=z) of the lever-arm histogram. prior_[slot] is the full SE3
+    // prior extrinsic; ryp_[slot] is the Phase-1 yaw/pitch rotation (roll basepoint).
+    // ata_[slot] / atb_[slot] are the incremental 3×3 / 3×1 normal-equation accumulators
+    // for the lever-arm LS; rows_[slot] counts accumulated rows.
+    Histogram1D roll_[kMaxSources];
+    Histogram1D xyz_[3 * kMaxSources];
+    SE3         prior_[kMaxSources];
+    Mat3        ryp_[kMaxSources];
+    Mat3        ata_[kMaxSources];
+    Vec3        atb_[kMaxSources];
+    Scalar      rows_[kMaxSources] = {};
+    bool        ryp_set_[kMaxSources] = {};
+    SourceId    ids_[kMaxSources] = {};
+    int         source_count_ = 0;
+};
+
 } // namespace ofc
 #endif // OFC_CORE_CALIBRATION_HPP

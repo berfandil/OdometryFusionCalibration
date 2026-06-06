@@ -15,18 +15,29 @@ enum class Phase { Init, Warmup, Degraded, Nominal };
 //   * confidence            — the TIME-OFFSET confidence (Slice 5; histogram concentration
 //                             of the ‖ω‖-xcorr offset vote). Kept as the primary field for
 //                             backward compatibility.
-//   * extrinsic_confidence  — the yaw/pitch (so(3) direction) confidence (Slice 6 Phase 1).
+//   * extrinsic_confidence  — the EXTRINSIC ROTATION confidence: yaw/pitch (so(3)
+//                             direction, Slice 6 Phase 1) AND, once Phase 2 has votes,
+//                             the roll (S¹) concentration. Combined as the MIN of the
+//                             two (the weakest rotational DOF bounds the joint rotation
+//                             reliability); falls back to the Phase-1 value alone before
+//                             Phase 2 has any roll votes.
 //   * scale_confidence      — the per-source scale confidence (Slice 6 Phase 1).
+//   * translation_confidence— the xyz LEVER-ARM confidence (Slice 7 Phase 2): the MIN
+//                             over the 3 xyz-channel histogram concentrations. An
+//                             unobservable axis (e.g. z under pure-yaw turning) never
+//                             concentrates, so this stays low until the lever arm is
+//                             fully observable.
 // All are peak concentrations in [0, 1]. `committed` currently reflects the time-offset
 // commit gate (Slice 5); per-DOF commit flags arrive with the feedback loop (Slice 8).
 struct CalibSnapshot {
     SourceId id            = 0;
-    SE3      extrinsic;                 // estimated mount (yaw/pitch in Slice 6; roll Slice 7)
+    SE3      extrinsic;                 // estimated mount (yaw/pitch Slice 6; + roll/t Slice 7)
     Scalar   scale         = 1.0;
     Scalar   time_offset_s = 0.0;
     Scalar   confidence    = 0.0;       // TIME-OFFSET peak concentration in [0,1]
-    Scalar   extrinsic_confidence = 0.0; // yaw/pitch (so(3)) concentration in [0,1]
+    Scalar   extrinsic_confidence = 0.0; // rotation (yaw/pitch ∧ roll) concentration in [0,1]
     Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
+    Scalar   translation_confidence = 0.0; // xyz lever-arm concentration in [0,1] (Slice 7)
     bool     committed     = false;
 };
 

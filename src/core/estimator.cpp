@@ -125,6 +125,13 @@ struct Estimator::Impl {
     // CalibSnapshot.{extrinsic, scale, confidence}; feeding it back into fusion is Slice 8
     // (NOT wired). Heap-resident inside Impl (allocated once in init()).
     Phase1Calibrator calib1;
+    // Phase-2 calibration (Slice 7, D5/D10/D21). Driven from the TURN-regime calib stage:
+    // per source, hand-eye A·X = X·B recovers the roll (about forward, 1-D rotation
+    // residual -> circular S¹) + the xyz lever arm (linear normal-equation LS), on top of
+    // Phase 1's yaw/pitch. Slice 7 only ESTIMATES + exposes into CalibSnapshot.{extrinsic
+    // (full rotation + translation), extrinsic_confidence, translation_confidence}; no
+    // feedback into fusion (Slice 8). Heap-resident inside Impl (allocated once in init()).
+    Phase2Calibrator calib2;
     // Per-step scratch for the calibration observe() (no heap in step()).
     SourceId calib_ids[kMaxSourcesCap];
     SE3      calib_reported[kMaxSourcesCap];
@@ -233,6 +240,13 @@ Status Estimator::init(const Config& cfg) {
         const Status cs = impl_->calib1.configure(cfg, cfg.reference_sensor_id);
         if (!ok(cs)) return cs;
     }
+    // Phase-2 calibration: configure once at init (preallocates its roll + xyz histograms
+    // and per-source LS accumulators). Self-gates on the turn regime; never feeds back into
+    // fusion in Slice 7 (Slice 8).
+    {
+        const Status cs = impl_->calib2.configure(cfg, cfg.reference_sensor_id);
+        if (!ok(cs)) return cs;
+    }
 
     impl_->inited = true;
     return Status::Ok;
@@ -263,6 +277,9 @@ Status Estimator::add_source(const ISource* src) {
         const SE3  Xp = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
         const bool sccal = (sc != nullptr) ? sc->scale_calib : true;
         impl_->calib1.set_prior(src->id(), Xp, sccal);
+        // Phase-2 prior (pinned-ref gauge + translation fallback). yaw/pitch is fed each
+        // step from the live Phase-1 estimate; roll/t start from the prior.
+        impl_->calib2.set_prior(src->id(), Xp);
     }
     ++impl_->source_count;
     return Status::Ok;
@@ -427,6 +444,19 @@ Status Estimator::step(Timestamp now) {
     const Vec3 fused_trans = med.value.t;
     s.calib1.observe(n, s.calib_ids, s.calib_reported, fused_omega, fused_trans);
 
+    // ---- Phase-2 calibration stage (Slice 7, D5/D10/D21) -------------------------
+    // Drive the TURN-gated hand-eye calibrator (A·X = X·B) with the fused consensus motion
+    // (A = the median SE3 delta) + per-source de-scaled reported deltas (B). First push the
+    // live Phase-1 yaw/pitch rotation into Phase 2 (the roll basepoint: R_X(roll) = R_yp ·
+    // Rx(roll)); then observe(). It self-gates on the turn regime (‖fused_omega‖ >
+    // turn_omega_min) and votes the roll (S¹) + the xyz lever-arm LS. Runs at the SAME
+    // frontier as fusion for now. NO feedback into fusion in Slice 7 — it only populates the
+    // CalibSnapshot extrinsic (roll + translation) + the rotation/translation confidences.
+    for (int i = 0; i < n; ++i) {
+        s.calib2.set_yaw_pitch(s.calib_ids[i], s.calib1.extrinsic(s.calib_ids[i]).R);
+    }
+    s.calib2.observe(n, s.calib_ids, s.calib_reported, med.value, fused_omega);
+
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
     // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED
     // to its query (committed time-sync value, else the prior) plus the time-sync
@@ -445,14 +475,26 @@ Status Estimator::step(Timestamp now) {
         const SourceId id = s.sources[i]->id();
         CalibSnapshot& cs = s.result.calib[i];
         cs.id            = id;
-        cs.extrinsic     = s.calib1.extrinsic(id);
+        // Full extrinsic: Phase-1 yaw/pitch ∘ Phase-2 roll (rotation) + Phase-2 lever arm
+        // (translation). calib2.extrinsic() composes the yaw/pitch rotation fed in above
+        // with the recovered roll, and uses the LS-mode lever arm (the prior until a turn
+        // regime is observed — so before any turning this equals the Phase-1 extrinsic).
+        cs.extrinsic     = s.calib2.extrinsic(id);
         cs.scale         = s.prior_scale[i] * s.calib1.scale(id);
         cs.time_offset_s = s.effective_offset(i);
-        // confidence stays the TIME-OFFSET confidence (Slice 5); Phase-1 confidences are
-        // reported in their own fields (per-DOF, since each converges independently).
+        // confidence stays the TIME-OFFSET confidence (Slice 5); per-DOF confidences are
+        // reported in their own fields (each DOF converges in its own regime).
         cs.confidence    = s.timesync_active ? s.timesync.confidence(id) : Scalar(0);
-        cs.extrinsic_confidence = s.calib1.extrinsic_confidence(id);
-        cs.scale_confidence     = s.calib1.scale_confidence(id);
+        // Rotation confidence: Phase-1 yaw/pitch (so(3)) AND, once Phase 2 has roll votes,
+        // the roll (S¹) concentration — combined as the MIN (the weakest rotational DOF
+        // bounds the joint reliability). Before any roll votes, fall back to Phase 1 alone.
+        const Scalar yp_conf   = s.calib1.extrinsic_confidence(id);
+        const Scalar roll_conf = s.calib2.extrinsic_confidence(id);
+        cs.extrinsic_confidence = (s.calib2.roll_vote_count(id) > Scalar(0))
+                                      ? std::min(yp_conf, roll_conf)
+                                      : yp_conf;
+        cs.scale_confidence       = s.calib1.scale_confidence(id);
+        cs.translation_confidence = s.calib2.translation_confidence(id);
         cs.committed     = s.offset_committed[i];
     }
 

@@ -9,6 +9,9 @@
 
 #include "ofc/core/lie.hpp"
 
+#include <Eigen/Cholesky>     // LDLT (lever-arm normal-equation solve)
+#include <Eigen/Eigenvalues>  // SelfAdjointEigenSolver (conditioning guard)
+
 #include <algorithm>
 #include <cmath>
 
@@ -305,6 +308,364 @@ Scalar Phase1Calibrator::vote_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return so3_[3 * s + 0].total();
+}
+
+// ===========================================================================
+// Phase2Calibrator — turn-regime roll + xyz lever-arm via hand-eye. See
+// calibration.hpp for the full derivation; this is the bounded, no-heap impl.
+// ===========================================================================
+
+namespace {
+// Per-window guard: skip a row whose base-motion rotation magnitude ‖log R_A‖ is below
+// this floor (the ω×r → 0 near-singular regime — adds an ill-conditioned ~zero row).
+constexpr Scalar kRotRowMin = Scalar(1e-3);   // rad over the step
+// Readout conditioning floor for the lever-arm LS: accept the FULL solve only when the
+// smallest eigenvalue of AᵀA is ≥ kCondMin × the largest (else an axis is unobservable —
+// e.g. z under pure yaw, whose AᵀA null space IS the z-axis).
+constexpr Scalar kCondMin = Scalar(1e-3);
+// Per-axis information floor for VOTING a channel: axis c is votable when its normal-
+// matrix diagonal AᵀA(c,c) is ≥ kAxisInfoMin × the largest diagonal. An unobservable
+// axis (near-zero diagonal) is below the floor and is NOT voted (its histogram stays
+// empty -> low translation_confidence, the under-determined flag).
+constexpr Scalar kAxisInfoMin = Scalar(1e-2);
+// Ridge for the per-window voting solve (relative to the largest AᵀA diagonal). Small
+// enough not to bias observable axes; large enough to pin an unobservable axis at prior.
+constexpr Scalar kVoteRidgeRel = Scalar(1e-3);
+}  // namespace
+
+Mat3 Phase2Calibrator::roll_about_forward(Scalar roll) {
+    // Rotation about the LOCAL forward axis (sensor x). Closed-form Rx(roll).
+    const Scalar c = std::cos(roll), s = std::sin(roll);
+    Mat3 R;
+    R << Scalar(1), Scalar(0), Scalar(0),
+         Scalar(0), c,        -s,
+         Scalar(0), s,         c;
+    return R;
+}
+
+Scalar Phase2Calibrator::rot_residual(const Mat3& R_yp, Scalar roll,
+                                      const Mat3& R_A, const Mat3& R_B) {
+    // R_X(roll) = R_yp · Rx(roll); residual = ‖log( R_X R_B R_X^T R_A^T )‖. At the true
+    // roll this is the identity (R_A R_X = R_X R_B) ⇒ 0.
+    const Mat3 R_X = R_yp * roll_about_forward(roll);
+    const Mat3 E   = R_X * R_B * R_X.transpose() * R_A.transpose();
+    return so3::log(E).norm();
+}
+
+Scalar Phase2Calibrator::best_roll(const Mat3& R_yp, const Mat3& R_A, const Mat3& R_B) {
+    // Bounded 1-D minimizer over (−π, π]: a fixed-count grid scan, then a parabolic
+    // refine of the grid minimizer using its two neighbours (wrap-aware). No heap, no
+    // unbounded iteration.
+    const Scalar step = (Scalar(2) * kPi) / static_cast<Scalar>(kRollGrid);
+    int    best_k = 0;
+    Scalar best_r = -kPi + step;       // grid covers (−π, π]
+    Scalar best_v = rot_residual(R_yp, best_r, R_A, R_B);
+    for (int k = 1; k < kRollGrid; ++k) {
+        const Scalar r = -kPi + step * static_cast<Scalar>(k + 1);
+        const Scalar v = rot_residual(R_yp, r, R_A, R_B);
+        if (v < best_v) { best_v = v; best_r = r; best_k = k; }
+    }
+    // Parabolic refine using the residual at the minimizer's neighbours (period 2π).
+    const Scalar rm = -kPi + step * static_cast<Scalar>(best_k);          // k-1 sample
+    const Scalar rp = -kPi + step * static_cast<Scalar>(best_k + 2);      // k+1 sample
+    const Scalar vm = rot_residual(R_yp, rm, R_A, R_B);
+    const Scalar v0 = best_v;
+    const Scalar vp = rot_residual(R_yp, rp, R_A, R_B);
+    const Scalar denom = vm - Scalar(2) * v0 + vp;
+    Scalar r = best_r;
+    if (std::abs(denom) > Scalar(1e-12)) {
+        Scalar off = Scalar(0.5) * (vm - vp) / denom;     // in (−0.5, 0.5) for a clean min
+        if (off >  Scalar(0.5)) off =  Scalar(0.5);
+        if (off < -Scalar(0.5)) off = -Scalar(0.5);
+        r = best_r + off * step;
+    }
+    // Wrap into (−π, π].
+    while (r <= -kPi) r += Scalar(2) * kPi;
+    while (r >   kPi) r -= Scalar(2) * kPi;
+    return r;
+}
+
+Vec3 Phase2Calibrator::solve_ridge(const Mat3& AtA, const Vec3& Atb,
+                                   const Vec3& t_prior, Scalar ridge, bool obs[3]) {
+    // Largest diagonal (the information scale). Pure PSD normal matrix -> diagonals >= 0.
+    Scalar max_diag = Scalar(0);
+    for (int c = 0; c < 3; ++c) max_diag = std::max(max_diag, AtA(c, c));
+    for (int c = 0; c < 3; ++c) {
+        obs[c] = (max_diag > Scalar(0)) && (AtA(c, c) >= kAxisInfoMin * max_diag);
+    }
+    if (!(max_diag > Scalar(0))) return t_prior;     // no information at all
+
+    // Ridge centered on the prior: (AtA + r I)(t - t_prior) = Atb - AtA t_prior.
+    const Mat3 M = AtA + (ridge * max_diag) * Mat3::Identity();
+    const Vec3 rhs = Atb - AtA * t_prior;
+    const Vec3 dt  = M.ldlt().solve(rhs);
+    Vec3 t = t_prior + dt;
+    if (!t.allFinite()) return t_prior;
+    return t;
+}
+
+Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
+    if (static_cast<int>(reference_id) >= kMaxSources) return Status::OutOfRange;
+
+    roll_cfg_ = cfg.roll_hist;
+    xyz_cfg_  = cfg.xyz_hist;
+
+    for (int i = 0; i < kMaxSources; ++i) {
+        const Status hs = roll_[i].configure(roll_cfg_);
+        if (!ok(hs)) return hs;
+    }
+    for (int i = 0; i < 3 * kMaxSources; ++i) {
+        const Status hs = xyz_[i].configure(xyz_cfg_);
+        if (!ok(hs)) return hs;
+    }
+
+    reference_id_   = reference_id;
+    turn_omega_min_ = std::max(Scalar(0), cfg.turn_omega_min);
+    strategy_       = cfg.phase2_strategy;
+    last_gate_turning_ = false;
+
+    configured_ = true;
+    reset();
+    return Status::Ok;
+}
+
+void Phase2Calibrator::reset() {
+    for (int i = 0; i < kMaxSources; ++i) {
+        roll_[i].reset();
+        prior_[i]   = SE3{};
+        ryp_[i]     = Mat3::Identity();
+        ata_[i]     = Mat3::Zero();
+        atb_[i]     = Vec3::Zero();
+        rows_[i]    = Scalar(0);
+        ryp_set_[i] = false;
+        ids_[i]     = 0;
+    }
+    for (int i = 0; i < 3 * kMaxSources; ++i) xyz_[i].reset();
+    source_count_      = 0;
+    last_gate_turning_ = false;
+}
+
+int Phase2Calibrator::slot_for(SourceId id) const {
+    for (int i = 0; i < source_count_; ++i) {
+        if (ids_[i] == id) return i;
+    }
+    return -1;
+}
+
+int Phase2Calibrator::ensure_slot(SourceId id) {
+    const int s = slot_for(id);
+    if (s >= 0) return s;
+    if (source_count_ >= kMaxSources) return -1;
+    const int slot = source_count_++;
+    ids_[slot]     = id;
+    prior_[slot]   = SE3{};
+    ryp_[slot]     = Mat3::Identity();
+    ata_[slot]     = Mat3::Zero();
+    atb_[slot]     = Vec3::Zero();
+    rows_[slot]    = Scalar(0);
+    ryp_set_[slot] = false;
+    return slot;
+}
+
+Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic) {
+    if (!configured_)                        return Status::NotInitialized;
+    if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
+    const int slot = ensure_slot(id);
+    if (slot < 0)                            return Status::CapacityExceeded;
+    prior_[slot] = prior_extrinsic;
+    return Status::Ok;
+}
+
+Status Phase2Calibrator::set_yaw_pitch(SourceId id, const Mat3& R_yp) {
+    if (!configured_)                        return Status::NotInitialized;
+    if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
+    const int slot = ensure_slot(id);
+    if (slot < 0)                            return Status::CapacityExceeded;
+    ryp_[slot]     = R_yp;
+    ryp_set_[slot] = true;
+    return Status::Ok;
+}
+
+Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported,
+                                 const SE3& fused_motion, const Vec3& fused_omega) {
+    if (!configured_)                                    return Status::NotInitialized;
+    if (n <= 0 || ids == nullptr || reported == nullptr) return Status::NoData;
+
+    // --- Turn gate (the observability spine, D5) ---------------------------------
+    // Roll + lever arm are observable ONLY under rotation. Accept only sufficiently
+    // turning fused motion. Gated-out steps are a no-op (not an error).
+    const bool turning = (fused_omega.norm() > turn_omega_min_);
+    last_gate_turning_ = turning;
+    if (!turning) return Status::NotReady;
+
+    // Base motion A per strategy.
+    //   VsFusedBase       : A = the fused consensus motion (passed in).
+    //   PairwisePinnedRef : A = X_ref ∘ B_ref ∘ X_ref^{-1}, the motion implied by the
+    //                       pinned reference (extrinsic held at the prior — the gauge).
+    //                       Solving the same hand-eye then yields each source's X relative
+    //                       to the reference. If the reference is absent this step, we
+    //                       cannot form A_impl -> no votes (NotReady).
+    SE3 A_base = fused_motion;
+    if (strategy_ == Phase2Strat::PairwisePinnedRef) {
+        int ref_idx = -1;
+        for (int i = 0; i < n; ++i) {
+            if (ids[i] == reference_id_) { ref_idx = i; break; }
+        }
+        if (ref_idx < 0) return Status::NotReady;
+        const int rs = slot_for(reference_id_);
+        const SE3 Xref = (rs >= 0) ? prior_[rs] : SE3{};
+        // A_impl = Xref o B_ref o Xref^{-1}.
+        A_base = se3::compose(se3::compose(Xref, reported[ref_idx]), se3::inverse(Xref));
+    }
+
+    const Mat3& R_A = A_base.R;
+    const Vec3& t_A = A_base.t;
+    const Scalar rotA = so3::log(R_A).norm();
+    // Per-window near-singular guard: a low-rotation A is the ω×r→0 regime — its
+    // translation row is near-zero and ill-conditioned. Skip the whole window's votes.
+    if (rotA < kRotRowMin) return Status::NotReady;
+    const Mat3 RA_minus_I = R_A - Mat3::Identity();
+
+    bool any = false;
+    for (int i = 0; i < n; ++i) {
+        const SourceId id = ids[i];
+        // In PairwisePinnedRef the reference solves to identity-relative (Y = I); its
+        // own hand-eye against A_impl is degenerate (B_ref maps to A_impl exactly), so
+        // skip voting the reference. In VsFusedBase the reference is voted too (its X
+        // should stay near its prior).
+        if (strategy_ == Phase2Strat::PairwisePinnedRef && id == reference_id_) continue;
+
+        const int slot = ensure_slot(id);
+        if (slot < 0) continue;                       // at capacity
+
+        const Mat3& R_B = reported[i].R;
+        const Vec3& t_B = reported[i].t;
+
+        // Roll basepoint R_yp: the Phase-1 yaw/pitch rotation if provided, else the
+        // prior rotation (uncalibrated bootstrap).
+        const Mat3 R_yp = ryp_set_[slot] ? ryp_[slot] : prior_[slot].R;
+
+        // --- Roll: 1-D rotation hand-eye residual minimizer, voted into S¹ -------
+        const Scalar roll = best_roll(R_yp, R_A, R_B);
+        roll_[slot].add(roll, Scalar(1));
+
+        // --- xyz: accumulate the LS row (R_A − I) t_X = R_X t_B − t_A ------------
+        // Use the full R_X at the just-recovered roll for the translation row (the row
+        // depends on the rotation; using the per-window roll keeps it consistent).
+        const Mat3 R_X = R_yp * roll_about_forward(roll);
+        const Vec3 b   = R_X * t_B - t_A;
+        // Incremental normal equations (fixed 3×3 + 3×1; no growing matrix).
+        ata_[slot].noalias() += RA_minus_I.transpose() * RA_minus_I;
+        atb_[slot]           += RA_minus_I.transpose() * b;
+        rows_[slot]          += Scalar(1);
+
+        // Vote the RUNNING ridge-regularized solution into the per-channel histograms.
+        // The running solve converges as rows accumulate; the histogram mode then gives a
+        // robust (outlier-window-resistant) committed estimate on top of the LS. Only an
+        // OBSERVABLE axis (enough information in AᵀA) is voted — an unobservable axis (e.g.
+        // z under pure yaw) stays empty -> low translation_confidence (the spine: the
+        // lever arm needs rotation, per-axis).
+        bool obs[3];
+        const Vec3 tx_run = solve_ridge(ata_[slot], atb_[slot], prior_[slot].t,
+                                        kVoteRidgeRel, obs);
+        if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), Scalar(1));
+        if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), Scalar(1));
+        if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), Scalar(1));
+
+        any = true;
+    }
+
+    return any ? Status::Ok : Status::NotReady;
+}
+
+// --- Readouts --------------------------------------------------------------
+
+Vec3 Phase2Calibrator::solve_lever_arm(SourceId id, bool* observable) const {
+    if (observable) *observable = false;
+    if (!configured_) return Vec3::Zero();
+    const int s = slot_for(id);
+    if (s < 0) return Vec3::Zero();
+    const SE3 prior = prior_[s];
+    if (rows_[s] < Scalar(1)) return prior.t;        // no rows -> prior
+
+    const Mat3& AtA = ata_[s];
+    // Conditioning guard via the symmetric eigenvalues (AtA is symmetric PSD). If the
+    // smallest is below kCondMin × the largest, an axis is unobservable (e.g. z under
+    // pure yaw) -> report the prior rather than a blown-up solve.
+    Eigen::SelfAdjointEigenSolver<Mat3> es(AtA);
+    if (es.info() != Eigen::Success) return prior.t;
+    const Vec3 ev = es.eigenvalues();                // ascending
+    const Scalar lo = ev(0), hi = ev(2);
+    if (!(hi > Scalar(0)) || lo < kCondMin * hi) {
+        return prior.t;                              // ill-conditioned / rank-deficient
+    }
+    const Vec3 tx = AtA.ldlt().solve(atb_[s]);
+    if (!tx.allFinite()) return prior.t;
+    if (observable) *observable = true;
+    return tx;
+}
+
+Scalar Phase2Calibrator::roll(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0 || roll_[s].empty()) return Scalar(0);    // prior roll = 0
+    return roll_[s].mode();
+}
+
+Vec3 Phase2Calibrator::lever_arm(SourceId id) const {
+    if (!configured_) return Vec3::Zero();
+    const int s = slot_for(id);
+    if (s < 0) return Vec3::Zero();
+    const SE3 prior = prior_[s];
+    // Per-channel histogram mode is the robust committed estimate; an empty channel
+    // (unobservable / unvoted axis) falls back to the prior component.
+    Vec3 t = prior.t;
+    if (!xyz_[3 * s + 0].empty()) t.x() = xyz_[3 * s + 0].mode();
+    if (!xyz_[3 * s + 1].empty()) t.y() = xyz_[3 * s + 1].mode();
+    if (!xyz_[3 * s + 2].empty()) t.z() = xyz_[3 * s + 2].mode();
+    return t;
+}
+
+SE3 Phase2Calibrator::extrinsic(SourceId id) const {
+    if (!configured_) return SE3{};
+    const int s = slot_for(id);
+    if (s < 0) return SE3{};
+    SE3 X = prior_[s];
+    const Mat3 R_yp = ryp_set_[s] ? ryp_[s] : prior_[s].R;
+    X.R = R_yp * roll_about_forward(roll(id));    // yaw/pitch ∘ recovered roll
+    X.t = lever_arm(id);
+    return X;
+}
+
+Scalar Phase2Calibrator::extrinsic_confidence(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return roll_[s].confidence();
+}
+
+Scalar Phase2Calibrator::translation_confidence(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    const Scalar cx = xyz_[3 * s + 0].confidence();
+    const Scalar cy = xyz_[3 * s + 1].confidence();
+    const Scalar cz = xyz_[3 * s + 2].confidence();
+    return std::min(cx, std::min(cy, cz));
+}
+
+Scalar Phase2Calibrator::roll_vote_count(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return roll_[s].total();
+}
+
+Scalar Phase2Calibrator::xyz_vote_count(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return rows_[s];
 }
 
 } // namespace ofc
