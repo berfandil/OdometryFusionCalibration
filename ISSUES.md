@@ -54,7 +54,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: planted offset recovered in sim (within sub-sample tol); flat-‖ω‖ correctly skips.
 **Deps**: Slices 1, 4.
 
-## Slice 6 — Calibration Phase 1 (yaw/pitch + scale)  `[ ]`
+## Slice 6 — Calibration Phase 1 (yaw/pitch + scale)  `[x]`
 **Goal**: straight-regime recovery.
 - Straight gate (+ reverse-fold, optional ref cross-check).
 - 3-channel **so(3) histogram @ per-sensor prior** → mode → exp → yaw,pitch.

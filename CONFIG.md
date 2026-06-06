@@ -64,7 +64,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
 | `straight_omega_max` | double (rad/s) | 0.05 | ≥0 | Phase-1 straight gate: `‖ω‖ < ε_ω`. |
-| `straight_trans_min` | double (m) | 0.05 | ≥0 | Phase-1 motion gate: `‖t‖ > δ_v`. |
+| `straight_trans_min` | double (m) | 0.05 | ≥0 | Phase-1 motion gate: `‖t‖ > δ_v`. Per-step **displacement** (not a speed) → cadence-dependent; tune per tick rate. |
 | `turn_omega_min` | double (rad/s) | 0.2 | ≥0 | Phase-2 turn gate: `‖ω‖ > θ_ω` (distinct from straight gate). |
 | `reverse_fold` | bool | true | — | Fold reverse motion into the consensus hemisphere before voting. |
 | `ref_cross_check` | bool | false | — | Require the reference sensor to also read "straight fwd/back" (ice-slide / drone niche). |
