@@ -1,45 +1,46 @@
 cmake_minimum_required(VERSION 3.16)
 project(OdometryFusionCalibration LANGUAGES CXX VERSION 0.0.1)
 
+include(FetchContent)
+
 # ---- Options ---------------------------------------------------------------
 option(OFC_BUILD_ADAPTERS "Build middleware adapters (relaxed edge)" OFF)
 option(OFC_BUILD_SIM      "Build the simulation rig (relaxed edge)"  OFF)
-option(OFC_BUILD_TESTS    "Build unit/observability/consistency tests" OFF)
-option(OFC_STRICT_CORE    "Compile the core to the AUTOSAR-leaning strict profile" ON)
+option(OFC_BUILD_TESTS    "Build unit/observability/consistency tests" ON)
+option(OFC_STRICT_CORE    "Compile the core with strict warning flags" ON)
+
+# ---- Eigen (header-only) ---------------------------------------------------
+# SO(3)/SE(3) ops are in-house (no Sophus). Use system Eigen if present, else fetch.
+find_package(Eigen3 3.3 QUIET)
+if (NOT Eigen3_FOUND)
+    message(STATUS "Eigen3 not found — fetching 3.4.0")
+    FetchContent_Declare(eigen
+        URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz)
+    set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING   OFF CACHE BOOL "" FORCE)
+    set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(eigen)
+endif()
 
 # ---- Core library (STRICT) -------------------------------------------------
-# C++14 by constraint (AUTOSAR). The core must build without exceptions/RTTI and
-# must not allocate after init(). Strict warning flags applied below.
+# C++14 by constraint (AUTOSAR). Strict warning flags below. True no-exceptions/
+# no-RTTI enforcement is the cross-compile target's job; this dev build keeps
+# exceptions on for Eigen/MSVC ergonomics (strict core, relaxed dev toolchain).
 add_library(ofc_core STATIC
+    src/core/lie.cpp
     src/core/estimator.cpp
-    # src/core/buffer.cpp        # Slice 1
-    # src/core/median.cpp        # Slice 2
-    # src/core/eskf.cpp          # Slice 2
-    # src/core/histogram.cpp     # Slice 4
-    # src/core/timesync.cpp      # Slice 5
-    # src/core/calibration.cpp   # Slices 6-8
-    # src/core/lifecycle.cpp     # Slice 3
 )
 target_include_directories(ofc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(ofc_core PUBLIC Eigen3::Eigen)
 
 target_compile_features(ofc_core PUBLIC cxx_std_14)
 set_target_properties(ofc_core PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-
-# Eigen (header-only) — linear algebra. SO(3)/SE(3) ops are in-house (no Sophus).
-find_package(Eigen3 QUIET)
-if (Eigen3_FOUND)
-    target_link_libraries(ofc_core PUBLIC Eigen3::Eigen)
-else()
-    message(WARNING "Eigen3 not found — ofc_core will not build until it is available.")
-endif()
 
 if (OFC_STRICT_CORE)
     if (MSVC)
         target_compile_options(ofc_core PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(ofc_core PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-            -fno-exceptions -fno-rtti)
+        target_compile_options(ofc_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
 endif()
 
