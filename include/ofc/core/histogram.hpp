@@ -72,6 +72,11 @@ public:
     int    bins() const { return nbins_; }
     bool   configured() const { return configured_; }
 
+    // Raw mass of bin `i` (0 for an out-of-range index). Read-only inspection of
+    // the internal histogram, used by tests to assert invariants (no bin ever
+    // negative; total() == sum of bin masses). No heap; bounds-checked.
+    Scalar bin_mass(int i) const;
+
 private:
     // One recorded vote, kept only in SlidingK mode so its exact bin contributions
     // can be subtracted when it is evicted. Stores up to two bin deposits (the
@@ -88,8 +93,10 @@ private:
     Scalar bin_center(int i) const {
         return range_min_ + (static_cast<Scalar>(i) + Scalar(0.5)) * width();
     }
-    // Wrap a value into [range_min, range_max) (circular) or clamp to the range
-    // (non-circular). Returns the in-range value.
+    // Wrap a value into the half-open [range_min, range_max) (circular) or clamp
+    // to that half-open range (non-circular: below -> range_min; at or above
+    // range_max -> just below range_max, i.e. into the last bin). Returns the
+    // in-range value.
     Scalar fold(Scalar value) const;
     // Wrap-or-clamp a bin index to the active range.
     int    wrap_bin(int i) const;
@@ -101,6 +108,10 @@ private:
     // the deposit fractions. Used by both add() and SlidingK eviction bookkeeping.
     void   plan_vote(Scalar value, Scalar weight, Vote& out) const;
     void   apply_vote(const Vote& v, Scalar sign);   // sign = +1 deposit, -1 evict
+    // SlidingK numerical hygiene after an eviction-subtract: clamp each tiny
+    // negative bin residual to 0 and rebuild total_ = sum(bins_) so the running
+    // total never drifts from the bin sum. O(nbins_), heap-free.
+    void   scrub_after_evict();
 
     // Active configuration.
     int    nbins_      = 0;

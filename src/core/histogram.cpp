@@ -5,7 +5,8 @@
 // bin count or the sliding-window size. No exceptions; status-code returns; double.
 //
 // Layout & math (mirrors the header + the PLAN):
-//   * Bins: `nbins_` uniform bins over [range_min, range_max]. width = span/nbins.
+//   * Bins: `nbins_` uniform bins over the half-open [range_min, range_max).
+//     width = span/nbins. A value exactly == range_max folds into the last bin.
 //     bin_center(i) = range_min + (i + 0.5) * width. The fractional bin coordinate
 //     of a value is f = (value - range_min)/width - 0.5, so f == i at bin i's
 //     center; round(f) is the nearest bin, floor(f)..floor(f)+1 the split pair.
@@ -84,9 +85,16 @@ Scalar Histogram1D::fold(Scalar value) const {
         if (x < Scalar(0)) x += span;     // fmod can be negative
         return range_min_ + x;
     }
-    // Clamp into [range_min, range_max].
+    // Non-circular binning convention: the range is HALF-OPEN [range_min,
+    // range_max). The bottom edge range_min lands in bin 0; a value exactly
+    // == range_max would otherwise map to f = nbins-0.5 (the top edge of the last
+    // bin). To keep the two edges symmetric under the half-open rule we clamp the
+    // top to the largest value strictly below range_max, so range_max lands in the
+    // last bin (nbins-1) just like any value just under it. Out-of-range values
+    // clamp to the nearer edge.
     if (value < range_min_) return range_min_;
-    if (value > range_max_) return range_max_;
+    const Scalar top = std::nextafter(range_max_, range_min_);  // < range_max
+    if (value > top) return top;
     return value;
 }
 
@@ -157,6 +165,23 @@ void Histogram1D::apply_vote(const Vote& v, Scalar sign) {
     }
 }
 
+void Histogram1D::scrub_after_evict() {
+    // After subtracting an evicted vote's stored deposits, non-associative float
+    // addition can leave (a) a tiny negative residual in an emptied bin and (b)
+    // a running total_ that has drifted from the true bin sum. Clamp the bins and
+    // rebuild total_ from them in a single O(nbins_) pass so we guarantee:
+    //   * every bins_[i] >= 0, and
+    //   * total_ == sum(bins_) (to round-off, not accumulated drift).
+    Scalar sum = Scalar(0);
+    for (int i = 0; i < nbins_; ++i) {
+        if (bins_[i] < kEmptyEps) bins_[i] = Scalar(0);  // scrub tiny-negative noise
+        sum += bins_[i];
+    }
+    // Scrub the whole total to 0 once the live mass is negligible so empty() and
+    // total() stay exact even after a fully-drained window.
+    total_ = (sum <= kEmptyEps) ? Scalar(0) : sum;
+}
+
 void Histogram1D::add(Scalar value, Scalar weight) {
     if (!configured_)          return;
     if (!(weight > Scalar(0))) return;   // ignore zero/negative weight votes
@@ -177,21 +202,22 @@ void Histogram1D::add(Scalar value, Scalar weight) {
     plan_vote(value, weight, v);
 
     if (ring_count_ == sliding_k_) {
-        // Subtract the oldest vote's exact contributions, then overwrite its slot.
+        // Subtract the oldest vote's exact contributions, then overwrite its slot
+        // and deposit the new vote.
         apply_vote(ring_[ring_head_], Scalar(-1));
         ring_[ring_head_] = v;
         ring_head_ = (ring_head_ + 1) % sliding_k_;
+        apply_vote(v, Scalar(1));
+        // The subtract introduces non-associative float residual: clamp negative
+        // bins and rebuild total_ = sum(bins_) so neither drifts over many evicts.
+        scrub_after_evict();
     } else {
+        // Window still filling: pure deposits, no subtraction, so no drift.
         const int slot = (ring_head_ + ring_count_) % sliding_k_;
         ring_[slot] = v;
         ++ring_count_;
+        apply_vote(v, Scalar(1));
     }
-    apply_vote(v, Scalar(1));
-
-    // Numerical hygiene: repeated +/- of equal masses can leave a tiny negative
-    // residual in an emptied bin. Clamp the running total's float noise away when
-    // the window is empty so empty() stays exact.
-    if (ring_count_ == 0) total_ = Scalar(0);
 }
 
 bool Histogram1D::empty() const {
@@ -200,6 +226,11 @@ bool Histogram1D::empty() const {
 
 Scalar Histogram1D::total() const {
     return total_ > Scalar(0) ? total_ : Scalar(0);
+}
+
+Scalar Histogram1D::bin_mass(int i) const {
+    if (i < 0 || i >= nbins_) return Scalar(0);
+    return bins_[i];
 }
 
 int Histogram1D::peak_bin() const {

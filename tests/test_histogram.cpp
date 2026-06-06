@@ -251,6 +251,67 @@ TEST_CASE("sliding-K window saturates total and forgets the oldest votes") {
     CHECK(h.confidence() > 0.9);   // window is pure B now
 }
 
+// ---------------------------------------------------------------------------
+// SlidingK float drift: over many evictions, subtracting stored deposits must
+// not let any bin settle negative, and total() must stay equal to the sum of
+// bin masses. Runs >> 10*K mixed-value adds to exercise the +/- residual path.
+// (Fails before the per-evict clamp/rebuild fix: a bin drifts slightly negative
+// and total_ desyncs from sum(bins_).)
+// ---------------------------------------------------------------------------
+TEST_CASE("sliding-K stays non-negative and total tracks sum(bins) over many evictions") {
+    const int K = 17;
+    HistogramConfig c = linear(64, -3.0, 3.0, /*split=*/true);
+    c.aging = Aging::SlidingK;
+    c.sliding_k = K;
+    Histogram1D h;
+    h.configure(c);
+
+    // >> 10*K mixed-value adds with non-representable split fractions and large
+    // weights, so the same bin sees a long, constantly-changing interleave of
+    // +deposit / -deposit of *different* fractional masses. Non-associative float
+    // addition then accumulates a residual in the running total_: it desyncs from
+    // sum(bins_) (here by ~1e-9 over ~850k evictions) unless every eviction
+    // rebuilds total_ = sum(bins_) and clamps tiny-negative bin residuals to 0.
+    const int N = 50000 * K;   // 850000 adds, ~849983 evictions
+    for (int k = 0; k < N; ++k) {
+        // Irrational-ish walk over the range so values never repeat exactly and
+        // the linear split lands on non-binary fractions. Large weight magnifies
+        // the absolute float residual well above the round-off floor.
+        const Scalar t = std::fmod(static_cast<Scalar>(k) * 0.61803398875, 1.0);
+        const Scalar v = -3.0 + 6.0 * t;
+        const Scalar w = (1.0 / 3.0 + (static_cast<Scalar>(k % 7) + 1.0) * 0.07) * 1e6;
+        h.add(v, w);
+    }
+
+    // Invariant 1: no bin reports negative. The clamp drives any tiny-negative
+    // residual to exactly 0, so every bin mass is >= 0.
+    Scalar sum = 0.0;
+    for (int i = 0; i < h.bins(); ++i) {
+        const Scalar m = h.bin_mass(i);
+        CHECK(m >= 0.0);
+        sum += m;
+    }
+
+    // Invariant 2 (the load-bearing one): total() is EXACTLY the sum of bin
+    // masses. The per-evict rebuild recomputes total_ = sum(bins_) the same way,
+    // so the delta is 0. Without the rebuild, the running total_ has drifted
+    // ~1e-9 from sum(bins_): this absolute-tolerance check fails before the fix.
+    CHECK(std::abs(h.total() - sum) < 1e-12);
+
+    // Invariant 3: total() still equals the exact analytic mass of the last K
+    // live votes (window holds exactly K). The rebuild keeps total_ drift-free.
+    Scalar exact_total = 0.0;
+    for (int k = N - K; k < N; ++k) {
+        exact_total += (1.0 / 3.0 + (static_cast<Scalar>(k % 7) + 1.0) * 0.07) * 1e6;
+    }
+    CHECK(h.total() == doctest::Approx(exact_total).epsilon(1e-9));
+
+    // Confidence remains a valid probability throughout.
+    const Scalar conf = h.confidence();
+    CHECK(conf >= 0.0);
+    CHECK(conf <= 1.0);
+}
+
 TEST_CASE("sliding-K with weighted votes saturates at K entries (not K mass)") {
     HistogramConfig c = linear(50, 0.0, 5.0, /*split=*/false);
     c.aging = Aging::SlidingK;
@@ -316,6 +377,89 @@ TEST_CASE("circular neighbor wrap: peak in bin 0 counts the last bin as a neighb
 }
 
 // ---------------------------------------------------------------------------
+// Circular wrap-seam, ANALYTIC: pin the exact wrap-aware split fractions of a
+// vote straddling the seam, and the exact parabolic sub-bin offset of a peak
+// whose left neighbour is the wrapped last bin. (Strengthens the "near the
+// seam" cluster test with planted masses and closed-form expected values.)
+// ---------------------------------------------------------------------------
+TEST_CASE("circular wrap-seam: exact split fractions and exact parabolic offset") {
+    // 8 bins over [0, 8), circular. width 1, centers k+0.5. Seam between bin 7
+    // (center 7.5) and bin 0 (center 0.5, i.e. wrapped center 8.5).
+
+    // --- Part A: wrap-aware linear-split fractions straddling the seam. --------
+    // A value v = 7.75 lies 0.25 of the way from center 7.5 (bin 7) toward the
+    // wrapped center 8.5 (bin 0): f = v - 0.5 = 7.25, floor = 7, frac = 0.25.
+    //   -> w_lo = w*(1-frac) = 0.75*w into bin 7
+    //   -> w_hi = w*frac     = 0.25*w into bin 0 (hi = 8 wraps to 0)
+    {
+        Histogram1D h;
+        h.configure(circular(8, 0.0, 8.0, /*split=*/true, /*sub=*/false));
+        const Scalar w = 4.0;
+        h.add(7.75, w);                       // straddles the seam
+        CHECK(h.total() == doctest::Approx(w));          // mass conserved across seam
+        CHECK(h.bin_mass(7) == doctest::Approx(0.75 * w)); // 3.0
+        CHECK(h.bin_mass(0) == doctest::Approx(0.25 * w)); // 1.0
+        CHECK(h.peak_bin() == 7);             // larger fraction stays in bin 7
+        // Confidence = (peak 7 + neighbours 6 and 0)/total = (3 + 0 + 1)/4 = 1.0.
+        CHECK(h.confidence() == doctest::Approx(1.0));
+    }
+
+    // --- Part B: parabolic sub-bin offset using the WRAPPED neighbour. ---------
+    // Peak in bin 0; its left neighbour is bin 7 (wrapped). Plant masses directly
+    // (split off, sub on) so the parabola is exact:
+    //   hm = mass(bin 7) = 8, h0 = mass(bin 0) = 10, hp = mass(bin 1) = 2.
+    //   offset = 0.5*(hm - hp)/(hm - 2*h0 + hp)
+    //          = 0.5*(8 - 2)/(8 - 20 + 2) = 0.5*6/(-10) = -0.3
+    //   mode = center(0) + offset*width = 0.5 + (-0.3)*1 = 0.2  (toward the seam)
+    {
+        Histogram1D h;
+        HistogramConfig c = circular(8, 0.0, 8.0, /*split=*/false, /*sub=*/true);
+        c.aging = Aging::SlidingK;
+        c.sliding_k = 100;                    // exact accumulation, no decay
+        h.configure(c);
+        for (int k = 0; k < 8;  ++k) h.add(7.5);   // bin 7 (wrapped left neighbour)
+        for (int k = 0; k < 10; ++k) h.add(0.5);   // bin 0 (the peak)
+        for (int k = 0; k < 2;  ++k) h.add(1.5);   // bin 1 (right neighbour)
+
+        CHECK(h.peak_bin() == 0);
+        CHECK(h.bin_mass(7) == doctest::Approx(8.0));
+        CHECK(h.bin_mass(0) == doctest::Approx(10.0));
+        CHECK(h.bin_mass(1) == doctest::Approx(2.0));
+
+        const Scalar hm = 8.0, h0 = 10.0, hp = 2.0;
+        const Scalar expected_offset = 0.5 * (hm - hp) / (hm - 2.0 * h0 + hp);
+        CHECK(expected_offset == doctest::Approx(-0.3));
+        const Scalar expected_mode = 0.5 + expected_offset * 1.0;   // 0.2
+        CHECK(h.mode() == doctest::Approx(expected_mode));
+        CHECK(h.mode() == doctest::Approx(0.2));
+    }
+
+    // --- Part C: mirror case, peak in the LAST bin with a wrapped RIGHT
+    // neighbour (bin 0). Pins the seam neighbour read from the other side.
+    //   hm = mass(bin 6) = 2, h0 = mass(bin 7) = 10, hp = mass(bin 0) = 8.
+    //   offset = 0.5*(2 - 8)/(2 - 20 + 8) = 0.5*(-6)/(-10) = 0.3
+    //   mode = center(7) + 0.3 = 7.5 + 0.3 = 7.8  (toward the seam, stays in range)
+    {
+        Histogram1D h;
+        HistogramConfig c = circular(8, 0.0, 8.0, /*split=*/false, /*sub=*/true);
+        c.aging = Aging::SlidingK;
+        c.sliding_k = 100;
+        h.configure(c);
+        for (int k = 0; k < 2;  ++k) h.add(6.5);   // bin 6 (left neighbour)
+        for (int k = 0; k < 10; ++k) h.add(7.5);   // bin 7 (the peak)
+        for (int k = 0; k < 8;  ++k) h.add(0.5);   // bin 0 (wrapped right neighbour)
+        CHECK(h.peak_bin() == 7);
+        CHECK(h.bin_mass(6) == doctest::Approx(2.0));
+        CHECK(h.bin_mass(7) == doctest::Approx(10.0));
+        CHECK(h.bin_mass(0) == doctest::Approx(8.0));   // wrapped right neighbour
+        const Scalar hm = 2.0, h0 = 10.0, hp = 8.0;
+        const Scalar expected_offset = 0.5 * (hm - hp) / (hm - 2.0 * h0 + hp);
+        CHECK(expected_offset == doctest::Approx(0.3));
+        CHECK(h.mode() == doctest::Approx(7.5 + 0.3 * 1.0));   // 7.8
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Non-circular boundary bin: clamps out-of-range, peak at the edge, no wrap.
 // ---------------------------------------------------------------------------
 TEST_CASE("non-circular clamps out-of-range values to the boundary bin") {
@@ -356,6 +500,23 @@ TEST_CASE("confidence stays within [0,1] and reset clears state") {
         CHECK(c <= 1.0 + 1e-12);
     }
     CHECK_FALSE(h.empty());
+
+    // Same mixed stress under a SlidingK config, run well past the window size so
+    // confidence is exercised over many evictions (the drift path), not just the
+    // default Decay aging.
+    Histogram1D hk;
+    HistogramConfig ck = linear(64, -3.0, 3.0);
+    ck.aging = Aging::SlidingK;
+    ck.sliding_k = 25;
+    hk.configure(ck);
+    for (int k = 0; k < 500; ++k) {           // 20x the window -> many evictions
+        const Scalar v = -3.0 + 6.0 * (static_cast<Scalar>((k * 37) % 100) / 100.0);
+        hk.add(v, 0.5 + 0.5 * static_cast<Scalar>(k % 3));
+        const Scalar c = hk.confidence();
+        CHECK(c >= 0.0);
+        CHECK(c <= 1.0 + 1e-12);
+    }
+    CHECK_FALSE(hk.empty());
 
     h.reset();
     CHECK(h.empty());
