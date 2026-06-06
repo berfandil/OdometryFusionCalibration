@@ -286,6 +286,13 @@ struct Estimator::Impl {
                 continue;
             }
 
+            // NOTE on commit_min_votes (Slice-8 review MINOR): the gate compares it against
+            // vote_count()/roll_vote_count()/etc., which are histogram TOTALS = vote MASS, not
+            // a count, under any non-`One` vote_weight (Confidence/Rotation/Combo scale each
+            // vote by the Σ-confidence and/or ‖ω‖). So commit_min_votes is a MASS threshold
+            // that must be RE-TUNED per vote_weight; it is a literal vote COUNT only when
+            // vote_weight == One (which the feedback tests force — set_hists()). See config.hpp.
+
             // --- yaw/pitch (so(3) direction) -----------------------------------------
             const bool was_ext = ext_committed[i];
             ext_committed[i] = commit_gate_reanchor(
@@ -311,33 +318,57 @@ struct Estimator::Impl {
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
 
             // === ROTATION + LEVER feedback (yaw/pitch ∘ roll, xyz) ===================
-            // KEY (this codebase): the calibrators carry their OWN fixed basepoint (set once
-            // in add_source) that is DECOUPLED from the fusion prior. calib1 recovers the
-            // forward AXIS as a residual δR @ that basepoint, calib2 recovers roll @ the fed
-            // R_yp and the lever arm as an ABSOLUTE linear-LS solve — none of these read the
-            // FUSION prior. So swapping a committed extrinsic into the fusion prior does NOT
-            // make their votes stale; the feedback is purely "publish the recovered value into
-            // the value FUSION frame-aligns with", so the consensus improves. We swap WITHOUT
-            // re-anchoring/resetting the so(3)/roll/lever histograms: with this calibrator's
-            // FIXED-basepoint design re-anchoring to its own extrinsic() output is NOT a
-            // contractive map (it can walk the estimate away), so the recovered value is most
-            // accurate at the design's intended SMALL-DEVIATION regime (prior near the truth) —
-            // which is also a stable fixed point under feedback. Convergence of the EXTRINSIC
-            // from a LARGE (≫ small-deviation) prior error needs a contractive re-anchor that
-            // is an open design item (see the re-anchor API set_basepoint/reset_*, which IS
-            // exercised for scale below). The scale DOF re-anchors cleanly because it votes a
-            // ratio off the de-scaled B, which DOES read the fusion prior_scale.
+            // CONTRACTIVE EXTRINSIC RE-ANCHOR (Slice 8). calib1 recovers the forward AXIS as
+            // the INVERSE minimal rotation δRᵀ @ its own basepoint, so the recovered extrinsic
+            // satisfies  X.R·dir_B = e_x  exactly (calibration.cpp extrinsic()). Folding that
+            // recovered yaw/pitch back into calib1's basepoint and resetting the so(3) votes is
+            // therefore a CONTRACTIVE map: from a LARGE prior error the next round's g_obs lands
+            // on e_x, δR→I, and the estimate converges to the planted forward axis (the genuine
+            // two-rate iterate — same shape as the scale re-anchor below). calib2 recovers roll
+            // @ the fed R_yp and the lever arm as an ABSOLUTE linear-LS solve; neither reads the
+            // FUSION prior, so the lever swap is a value publish (no stale votes).
+            //
+            // Two parts, mirroring the scale DOF:
+            //  (1) EVERY committed step — PUBLISH the latest committed value into the fusion
+            //      prior so fusion frame-aligns with the refined estimate.
+            //  (2) RISING EDGE of the yaw/pitch commit — fold the recovered yaw/pitch into
+            //      calib1's basepoint + reset its so(3) histogram, so the residual re-votes
+            //      ≈ 0 around the new (corrected) basepoint. Rising-edge only: re-anchoring
+            //      every step would never let the histogram re-concentrate (collapsing
+            //      confidence -> hysteresis re-open thrash).
             if (ext_committed[i] || roll_committed[i]) {
-                // calib1.extrinsic().R is the YAW/PITCH (roll about forward leaves the axis
-                // fixed). calib2.extrinsic().R = R_yp · Rx(roll) folds the recovered roll on
-                // top (R_yp fed from calib1 every step), so it already carries both DOF.
+                // calib1.extrinsic().R is the recovered yaw/pitch (the contractive minimal
+                // rotation — roll about forward leaves the forward axis fixed, so Phase 1 never
+                // carries roll). Once yaw/pitch has committed AND been re-anchored,
+                // calib1.extrinsic().R tracks the CORRECTED yaw/pitch, so a roll commit on top
+                // composes on the corrected basepoint, not a stale one (the MINOR is resolved by
+                // the contractive re-anchor). Before yaw/pitch commits, hold the fusion prior R.
                 const Mat3 R_yp_committed = ext_committed[i] ? calib1.extrinsic(id).R
                                                              : prior_extrinsic[i].R;
+                // calib2.extrinsic().R = R_yp · Rx(roll) folds the recovered roll on top of the
+                // R_yp fed to Phase 2 every step (the same calib1 rotation), so it carries both.
                 prior_extrinsic[i].R = roll_committed[i] ? calib2.extrinsic(id).R
                                                          : R_yp_committed;
             }
             if (lever_committed[i]) {
                 prior_extrinsic[i].t = calib2.lever_arm(id);
+            }
+            // (2) Yaw/pitch RE-ANCHOR (rising edge of the yaw/pitch commit): move calib1's
+            // so(3) basepoint to the recovered MINIMAL rotation (extrinsic().R — the gauge that
+            // satisfies X.R·dir_B = e_x, so this composition is CONTRACTIVE) and drop the
+            // now-stale residual votes (cast @ the OLD basepoint). The post-reset so3() falls
+            // back to the basepoint until new votes land, so the residual re-concentrates ≈ 0
+            // around the new (corrected) basepoint and calib1 tracks the planted forward axis
+            // from a large initial error. Rising-edge only: re-anchoring every step would never
+            // let the histogram re-concentrate (collapsing confidence -> hysteresis re-open
+            // thrash) — the same shape as the scale re-anchor below. One contraction lands the
+            // forward axis on truth (to the run's mode/segment-dynamics floor); the every-step
+            // publish then keeps refining the residual around the fixed basepoint.
+            if (ext_committed[i] && !was_ext) {
+                SE3 bp = prior_extrinsic[i];
+                bp.R = calib1.extrinsic(id).R;   // MINIMAL rotation (contractive basepoint)
+                calib1.set_basepoint(id, bp);
+                calib1.reset_so3(id);
             }
             // Keep calib2's prior (lever-arm fallback for an unobservable axis + the
             // PairwisePinnedRef gauge) tracking the committed extrinsic — value sync only,
@@ -644,6 +675,9 @@ Status Estimator::step(Timestamp now) {
     // turn_omega_min) and votes the roll (S¹) + the xyz lever-arm LS. Runs at the SAME
     // frontier as fusion for now. NO feedback into fusion in Slice 7 — it only populates the
     // CalibSnapshot extrinsic (roll + translation) + the rotation/translation confidences.
+    // R_yp is calib1.extrinsic().R, the recovered yaw/pitch (contractive minimal rotation —
+    // the same gauge the so(3) basepoint re-anchors in, so the roll composes on the corrected
+    // yaw/pitch after a re-anchor from a wrong prior).
     for (int i = 0; i < nc; ++i) {
         s.calib2.set_yaw_pitch(s.calib_ids[i], s.calib1.extrinsic(s.calib_ids[i]).R);
     }

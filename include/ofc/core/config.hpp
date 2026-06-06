@@ -91,6 +91,12 @@ struct Config {
     // Calibration
     Phase2Strat phase2_strategy   = Phase2Strat::VsFusedBase;
     Scalar      commit_concentration = 0.6;
+    // commit_min_votes is compared against the histogram TOTAL (vote_count), which is a vote
+    // MASS, not a count, under any non-`One` vote_weight: with Confidence/Rotation/Combo each
+    // vote's mass is scaled by the per-source Σ-confidence and/or ‖ω‖, so the same int gates
+    // a wildly different EFFECTIVE vote count across sources. It is a true COUNT only when
+    // vote_weight == One. RE-TUNE this threshold whenever vote_weight changes (the default
+    // Combo can explode the mass on a high-confidence source). [Slice-8 review MINOR.]
     int         commit_min_votes  = 200;
     Scalar      commit_drop       = 0.4;
     VoteWeight  vote_weight       = VoteWeight::Combo;

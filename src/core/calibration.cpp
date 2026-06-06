@@ -333,8 +333,18 @@ SE3 Phase1Calibrator::extrinsic(SourceId id) const {
     Vec3 phi;
     phi << so3_[3 * s + 0].mode(), so3_[3 * s + 1].mode(), so3_[3 * s + 2].mode();
     const Mat3 dR = so3::exp(phi);
-    // Corrected rotation = δR * R_Xprior (yaw/pitch corrected; roll + translation = prior).
-    X.R = dR * X.R;
+    // CONTRACTIVE recovery (Slice-8 re-anchor). The votes record δR = rotation_between(e_x,
+    // g_obs) so δR·e_x = g_obs (= R_Xprior·dir_B); forward_axis()/yaw()/pitch() read that
+    // axis directly (δR·e_x). For the EXTRINSIC we want the INVERSE minimal rotation so the
+    // recovered map satisfies  X.R·dir_B = e_x  EXACTLY (not only at the fixed point):
+    //     X.R = δRᵀ · R_Xprior  ⇒  X.R·dir_B = δRᵀ·R_Xprior·dir_B = δRᵀ·g_obs = e_x.
+    // This makes re-anchoring (basepoint ← recovered extrinsic) a CONTRACTIVE map: from a
+    // large basepoint error the next round's g_obs lands on e_x, so δR→I and the estimate
+    // converges to the planted forward axis (vs the old X.R = δR·R_Xprior, which composed
+    // the correction in the WRONG direction and walked the estimate AWAY from truth). At the
+    // fixed point (prior == truth) g_obs = e_x ⇒ δR = I ⇒ X.R = R_Xprior, unchanged. Roll +
+    // translation stay at the prior (Slice 7 fills them).
+    X.R = dR.transpose() * X.R;
     return X;
 }
 

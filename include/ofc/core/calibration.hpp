@@ -32,9 +32,16 @@
 // the basepoint, no pole/antipode, isotropic resolution; per D11 store all 3 channels,
 // φ_x is ~0 only up to noise). Estimate = per-channel mode -> φ_mode -> δR = exp(φ_mode)
 // -> recovered forward axis f = δR * e_x -> yaw = atan2(f_y, f_x),
-// pitch = atan2(-f_z, hypot(f_x, f_y)). The reported extrinsic rotation is
-// R = δR * R_Xprior (corrects the prior so the forward axis aligns); roll and the
-// translation are kept at the prior (roll is Slice 7, xyz lever-arm is Slice 7).
+// pitch = atan2(-f_z, hypot(f_x, f_y)).
+// CONTRACTIVE EXTRINSIC (Slice-8 re-anchor). δR records the forward minimal rotation
+// (δR·e_x = g_obs), so the forward axis / yaw / pitch read δR·e_x directly. The reported
+// extrinsic rotation, however, is the INVERSE composition  R = δRᵀ · R_Xprior  — chosen so
+// the recovered map satisfies  R·dir_B = δRᵀ·g_obs = e_x  EXACTLY (not just at the fixed
+// point). That makes re-anchoring the basepoint to a freshly committed extrinsic a
+// CONTRACTIVE iterate: from a LARGE prior error the next round's g_obs lands on e_x, δR→I,
+// and the estimate converges to the planted forward axis. At the fixed point (prior ==
+// truth) g_obs = e_x ⇒ δR = I ⇒ R = R_Xprior. Roll and the translation are kept at the
+// prior (roll is Slice 7, xyz lever-arm is Slice 7).
 //
 // SCALE (D20). With both the source and the reference seeing the same base
 // translation magnitude over the window, ||B_i.t|| / ||B_ref.t|| = scale_i / scale_ref.
@@ -96,7 +103,8 @@ public:
     // STALE. Calling set_basepoint(id, X) moves the basepoint to X.R so subsequent votes
     // refine the RESIDUAL direction around the new basepoint (φ ≈ 0). The caller should
     // also reset_so3(id) so the stale votes do not pin the now-residual mode. Heap-free;
-    // OutOfRange / CapacityExceeded as set_prior. extrinsic() = δR_mode * X.R thereafter.
+    // OutOfRange / CapacityExceeded as set_prior. extrinsic() = δR_modeᵀ * X.R thereafter
+    // (the inverse minimal rotation — the contractive composition; see THE MAPPING above).
     Status set_basepoint(SourceId id, const SE3& basepoint);
     // Drop only the so(3) (yaw/pitch) histogram votes for `id` (keeps scale + basepoint).
     // The post-reset estimate falls back to the basepoint until new votes land. Used on a
@@ -159,9 +167,12 @@ public:
     Vec3   forward_axis(SourceId id) const;
     Scalar yaw(SourceId id)   const;        // atan2(f_y, f_x)   [rad]
     Scalar pitch(SourceId id) const;        // atan2(-f_z, hypot(f_x,f_y))  [rad]
-    // Recovered extrinsic: rotation = δR_mode * R_Xprior (yaw/pitch corrected; ROLL and
-    // the TRANSLATION kept at the prior — Slice 7 fills roll + xyz). Returns the prior
-    // for an unvoted / unknown source.
+    // Recovered extrinsic: rotation = δR_modeᵀ * R_Xprior (the INVERSE minimal rotation, so
+    // R·dir_B = e_x exactly and re-anchoring the so(3) BASEPOINT to it is CONTRACTIVE — the
+    // estimator folds this back into calib1's basepoint on an extrinsic commit, converging the
+    // recovered forward axis to truth from a large prior error. See THE MAPPING above; ROLL
+    // and the TRANSLATION kept at the prior — Slice 7 fills roll + xyz). Returns the prior for
+    // an unvoted / unknown source.
     SE3    extrinsic(SourceId id) const;
     // Per-source scale estimate (magnitude ratio vs the reference, mode). Returns 1.0 for
     // the reference / a scale_calib==false source / an unvoted source.

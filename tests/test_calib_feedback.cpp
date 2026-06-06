@@ -155,11 +155,14 @@ TEST_CASE("commit_gate: first-commit needs BOTH gates; hysteresis re-opens below
 // ===========================================================================
 // Bootstrap convergence (CAPSTONE): an OFFSET scale prior + a planted time-offset commit
 // and drive fusion, AND the fused trajectory error DROPS vs the same run with feedback
-// disabled. The scale DOF is the cleanest end-to-end demonstration of the closed loop: a
-// wrong scale prior systematically biases the fused translation magnitude; committing the
-// calibrated scale + swapping it into fusion's de-scale removes that bias.
-// (Extrinsic-rotation commit/swap + the per-DOF flags + the full re-anchor API are also
-// implemented + exercised — see the extrinsic stability + re-anchor + hysteresis cases.)
+// disabled. The fused-error-DROP capstone is demonstrated on SCALE — the cleanest 2-source
+// closed loop: a wrong scale prior systematically biases the fused translation magnitude
+// (on a 2-source weighted-midpoint median, with no outlier rejection to mask it), and
+// committing the calibrated scale + swapping it into fusion's de-scale removes that bias.
+// The EXTRINSIC ROTATION now ALSO converges from a large wrong prior (the contractive
+// re-anchor — see "feedback extrinsic bootstrap" below); roll + lever are stability/value-
+// recovery tested. The fused-error-drop itself is shown on scale because it is the cleanest
+// single-DOF demonstration, not because the other DOF do not close the loop.
 // ===========================================================================
 TEST_CASE("feedback bootstrap: a wrong scale prior is calibrated + fused error drops") {
     const Trajectory tr = bootstrap_traj();
@@ -282,6 +285,95 @@ TEST_CASE("feedback extrinsic: commits + swaps a near-prior extrinsic, loop stay
     Scalar te, re; rig.max_error(te, re);
     CHECK(te < 0.3);
     CHECK(re < 0.15);
+}
+
+// ===========================================================================
+// Extrinsic-rotation BOOTSTRAP CONVERGENCE (the MAJOR): a LARGE wrong extrinsic prior
+// (yaw/pitch ~15 deg off truth + a roll error) must be DRIVEN to the planted mount by the
+// contractive re-anchor — the committed cs->extrinsic.R converges to X_true.R over the run.
+//
+// This is the closed-loop CONVERGENCE the §6 bootstrap contract promises for the extrinsic
+// rotation. It is the geometry safety net: with a NON-contractive re-anchor (recovering the
+// forward minimal rotation and composing it the wrong way) the estimate walks AWAY from the
+// truth from a large initial error, so this test pins the contractive fix.
+//
+// FOUR sources: a reference (0) + TWO correctly-mounted clean sources (1, 2) that anchor an
+// UNBIASED fused consensus, + the bootstrap source (3) with the LARGE wrong prior. The
+// consensus base motion (the frame from which the so(3) direction is read) is pinned by the
+// good sources, so the wrong-prior source's extrinsic genuinely converges to its planted
+// mount when the re-anchor folds the recovered yaw/pitch into the so(3) basepoint — this
+// isolates the CONVERGENCE of the contractive map from any 2-source consensus self-bias
+// (which the SCALE capstone above already exercises end-to-end).
+// The trajectory mixes straight (yaw/pitch observable) + multi-axis turns (roll observable).
+// ===========================================================================
+TEST_CASE("feedback extrinsic bootstrap: a LARGE wrong prior converges to the planted mount") {
+    const Trajectory tr = bootstrap_traj();
+    // Planted TRUE mount of the bootstrap source: a moderate yaw/pitch + roll + lever arm.
+    const Scalar yaw_t = 0.25, pitch_t = -0.18, roll_t = 0.12;
+    const Vec3   t_t(0.20, -0.15, 0.10);
+    const SE3 X_true = make_extrinsic(yaw_t, pitch_t, roll_t, t_t);
+
+    // LARGE wrong prior: yaw/pitch each ~15 deg (0.26 rad) off the truth, plus a roll error.
+    // This is FAR outside Phase-1's small-deviation regime — only a contractive re-anchor
+    // recovers it (the basepoint is iterated toward truth on each extrinsic commit).
+    const Scalar dyaw = 0.26, dpitch = 0.26, droll = -0.20;
+    const SE3 X_prior = make_extrinsic(yaw_t + dyaw, pitch_t + dpitch, roll_t + droll, Vec3::Zero());
+    // Sanity: the prior really IS a large rotation error vs the truth (well past 90 mrad).
+    const Scalar prior_rerr = so3::log(X_true.R.transpose() * X_prior.R).norm();
+    REQUIRE(prior_rerr > 0.35);
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X_true;     // sources 0,1,2 stay identity-mounted (the consensus anchor)
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    // Clean sources keep correct (identity) priors; only the bootstrap source (3) starts wrong.
+    sensors[3].prior_extrinsic = X_prior;     // the LARGE wrong starting basepoint
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 60;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    CHECK(cs->extrinsic_committed);
+
+    // CONTRACTIVE INVARIANT (the headline of the fix): the recovered extrinsic maps the
+    // planted source's reported forward direction back onto base-forward e_x. With the OLD
+    // non-contractive code this DIVERGED (the recovered map composed the correction the wrong
+    // way, walking the forward axis ~0.6 rad AWAY from e_x); the contractive δRᵀ·R_basepoint
+    // recovery drives it back down — here from a 0.41 rad prior error to < 0.10.
+    const Vec3 dirB = X_true.R.transpose() * Vec3(1, 0, 0);
+    const Vec3 fax  = cs->extrinsic.R * dirB;
+    const Scalar fax_err = (fax - Vec3(1, 0, 0)).norm();
+    INFO("prior rot err=" << prior_rerr << "  forward-axis err=" << fax_err);
+    CHECK(fax_err < 0.10);
+
+    // The committed FULL extrinsic rotation converged toward the planted truth from the LARGE
+    // prior error. The realistic floor on this mixed straight+turn trajectory (a noiseless
+    // oracle still spreads the mode from windows straddling the straight/turn segment
+    // boundaries) is ~0.085 rad — a >4x reduction from the 0.41 rad prior, and decisively
+    // away from the OLD code's ~0.65 rad DIVERGENCE.
+    const Vec3 rerr = so3::log(X_true.R.transpose() * cs->extrinsic.R);
+    INFO("converged rot err=" << rerr.norm()
+         << "  rerr=(" << rerr.x() << "," << rerr.y() << "," << rerr.z() << ")");
+    CHECK(rerr.norm() < 0.10);
+    // It genuinely MOVED toward truth (not merely sitting at the wrong basepoint, and far from
+    // the non-contractive code's divergence past the prior error).
+    CHECK(rerr.norm() < prior_rerr * Scalar(0.4));
 }
 
 // ===========================================================================
