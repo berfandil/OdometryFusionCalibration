@@ -23,7 +23,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: integration/interpolation/Σ-combine unit tests pass against planted streams.
 **Deps**: Slice 0.
 
-## Slice 2 — Median fusion (FIRST tracer bullet)  `[ ]`
+## Slice 2 — Median fusion (FIRST tracer bullet)  `[x]`
 **Goal**: end-to-end fused output from N sources, no calibration yet.
 - Weiszfeld split-metric geometric median (bounded iters, ε-reg).
 - ESKF predict on median delta; **adaptive Q** from spread; pose+twist state, SO(3)×ℝ³ error, dense 12×12.

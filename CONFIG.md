@@ -12,7 +12,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 |---|---|---|---|---|
 | `tick_rate_hz` | double | 50.0 | (0, 1000] | Fusion step cadence (caller is expected to pump at ~this rate). |
 | `fusion_delay_s` | double | 0.05 | [0, 2] | Causal frontier offset `now − delay`; must cover the slowest source latency. |
-| `window_s` | double | 0.1 | (0, 5] | Integration window `W` per source per step. |
+| `window_s` | double | 0.1 | (0, 5] | Bootstrap/lookback interval for the first fuse (and max lookback). Steady-state predict integrates `[last_frontier, frontier]`, so tick cadence need not equal this. |
 | `calib_lag_s` | double | 0.2 | [0, 10] | Extra lag `L` for the calibration frontier (`now − delay − L`); enables two-sided smoothing. |
 | `late_sample_policy` | enum | `drop` | {`drop`, `reintegrate`} | Handling of samples arriving behind the frontier. |
 | `max_sources` | int | 8 | [1, 32] | **[strict]** Sizes per-source buffers/structures. |
