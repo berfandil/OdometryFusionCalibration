@@ -88,6 +88,25 @@ public:
     // = true defaults. Returns OutOfRange if id is out of range, CapacityExceeded at cap.
     Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true);
 
+    // --- Re-anchor API (Slice 8 feedback loop) -------------------------------
+    // RE-ANCHOR the so(3) basepoint to a NEW committed extrinsic (sensor->base). The
+    // direction votes are cast as the so(3) log of the minimal rotation e_x -> g_obs,
+    // where g_obs = R_basepoint * dir_B; so when fusion swaps a freshly-committed
+    // extrinsic into the source's prior, the OLD votes (cast @ the old basepoint) are
+    // STALE. Calling set_basepoint(id, X) moves the basepoint to X.R so subsequent votes
+    // refine the RESIDUAL direction around the new basepoint (φ ≈ 0). The caller should
+    // also reset_so3(id) so the stale votes do not pin the now-residual mode. Heap-free;
+    // OutOfRange / CapacityExceeded as set_prior. extrinsic() = δR_mode * X.R thereafter.
+    Status set_basepoint(SourceId id, const SE3& basepoint);
+    // Drop only the so(3) (yaw/pitch) histogram votes for `id` (keeps scale + basepoint).
+    // The post-reset estimate falls back to the basepoint until new votes land. Used on a
+    // yaw/pitch commit+re-anchor so the histogram re-concentrates on the residual.
+    void reset_so3(SourceId id);
+    // Drop only the scale histogram votes for `id` (keeps so(3) + basepoint). Used on a
+    // scale commit+re-anchor (after fusion's prior_scale absorbs the committed scale, the
+    // residual ratio re-votes ≈ 1). The post-reset scale() falls back to 1 until new votes.
+    void reset_scale(SourceId id);
+
     // Consume one FUSED step. `fused_omega` is the consensus body angular RATE over the
     // step (rad/s, ÷dt) used by the straight gate's rotation test. `fused_trans` is the
     // consensus translation DISPLACEMENT over the step (m, NOT a rate) — it is both the
@@ -290,6 +309,26 @@ public:
     // for an unvoted source. Call once per source after configure(). Returns OutOfRange
     // if id is out of range, CapacityExceeded at cap.
     Status set_prior(SourceId id, const SE3& prior_extrinsic);
+
+    // --- Re-anchor API (Slice 8 feedback loop) -------------------------------
+    // RE-ANCHOR the lever-arm prior + the PairwisePinnedRef gauge to a NEW committed
+    // extrinsic (sensor->base). The xyz LS is centred on prior_.t (the ridge pins an
+    // unobservable axis there) and the histogram falls back to prior_.t per channel, so a
+    // freshly-committed extrinsic must replace the prior. Roll is voted ABSOLUTE about the
+    // forward axis (basepoint R_yp fed via set_yaw_pitch each step), so the roll histogram
+    // is re-anchored implicitly when R_yp moves — but the caller should reset_lever(id) so
+    // the LS re-accumulates around the new basepoint (the row b = R_X t_B − t_A and the
+    // ridge centre both change). Heap-free; OutOfRange / CapacityExceeded as set_prior.
+    Status set_basepoint(SourceId id, const SE3& basepoint);
+    // Drop only the roll histogram votes for `id` (keeps the lever-arm LS + prior). Used
+    // when the roll basepoint R_yp moves (a yaw/pitch re-anchor) so the residual roll
+    // re-concentrates. The post-reset roll() falls back to 0 until new votes land.
+    void reset_roll(SourceId id);
+    // Reset the lever-arm LS (AᵀA, Aᵀb, row count) AND the 3 xyz histograms for `id`
+    // (keeps roll + prior). Used on a lever-arm / extrinsic commit+re-anchor: the LS rows
+    // were accumulated against the OLD base/extrinsic frame, so they are stale — drop them
+    // and re-accumulate around the new basepoint. lever_arm() falls back to prior_.t.
+    void reset_lever(SourceId id);
 
     // Provide the Phase-1-recovered yaw/pitch rotation R_yp for each source (the roll
     // basepoint: R_X(roll) = R_yp · Rx(roll)). Call whenever Phase 1 updates (cheap; the

@@ -85,6 +85,28 @@ Scalar omega_norm_from_delta(const SE3& motion, Scalar dt) {
     if (!(dt > Scalar(0))) return Scalar(0);
     return so3::log(motion.R).norm() / dt;
 }
+
+// Commit gate for an EXTRINSIC/SCALE DOF that gets RE-ANCHORED on commit (Slice 8). Same
+// τ_commit ∧ N_min first-commit + τ_drop hysteresis as commit_gate(), but the re-open
+// (committed -> uncommitted) additionally requires the histogram to be RE-POPULATED
+// (votes >= N_min). Without this guard, the re-anchor's histogram RESET drops vote mass to
+// ~0, which momentarily reads confidence 0 < τ_drop and would falsely re-open — then re-fill
+// and re-commit, RE-ANCHOR-ing again every few steps (commit thrash). Requiring a full
+// histogram before honoring a confidence drop makes the re-open mean a GENUINE drift (a full,
+// low-concentration histogram), not the post-reset transient. The reference / offset DOF keep
+// using the plain commit_gate().
+bool commit_gate_reanchor(bool prev_committed, Scalar confidence, Scalar votes,
+                          Scalar commit_concentration, int commit_min_votes,
+                          Scalar commit_drop) {
+    if (prev_committed) {
+        // Stay committed through a sparse (just-reset / still-refilling) histogram; only
+        // re-open on a FULL histogram that has genuinely lost concentration.
+        if (votes < static_cast<Scalar>(commit_min_votes)) return true;
+        return confidence >= commit_drop;
+    }
+    return confidence >= commit_concentration &&
+           votes >= static_cast<Scalar>(commit_min_votes);
+}
 } // namespace
 
 // All working memory lives here and is sized from Config at init().
@@ -149,9 +171,29 @@ struct Estimator::Impl {
     // registered-source slot. Always false for the reference / when time-sync is off.
     bool     offset_committed[kMaxSourcesCap] = {};
 
+    // Per-source, per-DOF EXTRINSIC/SCALE commit state (Slice 8 feedback loop, DESIGN §6).
+    // Same N_min + hysteresis gate (reuse commit_gate) on each DOF's own confidence + vote
+    // count. On the RISING EDGE of a commit the freshly-committed value is swapped into the
+    // fusion prior (prior_extrinsic / prior_scale) AND the calibrator is RE-ANCHORED to that
+    // value with the DOF's histogram RESET (so the stale votes — cast @ the old basepoint —
+    // do not pin the now-residual mode; subsequent votes refine the residual around the new
+    // basepoint — the two-rate iterate, DESIGN §6). Once committed, every step keeps the
+    // fusion prior tracking the calibrator's latest committed estimate (basepoint ∘ small
+    // residual). Indexed by the registered-source slot. Reference never commits its extrinsic
+    // (it is the pinned gauge). Advanced once per step() in apply_calib_feedback() AFTER the
+    // result is published — so a step() never sees a half-updated prior (atomic swap).
+    bool     ext_committed[kMaxSourcesCap]   = {};   // yaw/pitch (so(3) direction)
+    bool     roll_committed[kMaxSourcesCap]  = {};   // roll about forward
+    bool     lever_committed[kMaxSourcesCap] = {};   // xyz lever arm
+    bool     scale_committed[kMaxSourcesCap] = {};   // per-source scale
+
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
     Scalar weights[kMaxSourcesCap];
+    // Maps median entry k -> registered source slot (cold-start may exclude sources from
+    // the median, so the median index no longer matches the covered order). Used by the
+    // per-source residual diagnostics to attribute the consensus distance correctly.
+    int    med_slot[kMaxSourcesCap];
 
     Eskf   eskf;
     bool   eskf_started = false;
@@ -202,6 +244,128 @@ struct Estimator::Impl {
         }
         return prior_time_offset[i];
     }
+
+    // Whether a source participates in the fusion median this step (COLD-START switch, D6).
+    //   * MedianFromStart : every covered source participates from the first tick (the
+    //                       Slice-2 behaviour — used as the bootstrap-loop default since the
+    //                       median needs ≥3 sources to reject an outlier and to give the
+    //                       calibrators a consensus to vote against).
+    //   * ReferenceOnly   : before a source's extrinsic is confident, only the reference
+    //                       (the pinned gauge — extrinsic = prior by construction) drives the
+    //                       output (reference-only dead-reckon); a non-reference source joins
+    //                       the median once its extrinsic has COMMITTED (its prior is now
+    //                       trustworthy). The reference always participates.
+    // Slot `i` indexes the registered-source arrays. (Full lifecycle is Slice 3; this is the
+    // minimal cold-start interplay the brief asks for — it must not regress Slice-2 when
+    // cold_start == MedianFromStart.)
+    bool participates(int i) const {
+        if (cfg.cold_start == ColdStart::MedianFromStart) return true;
+        const SourceId id = sources[i]->id();
+        if (id == cfg.reference_sensor_id) return true;
+        return ext_committed[i];   // ReferenceOnly: join once the extrinsic is committed
+    }
+
+    // Apply the calibration->fusion feedback (Slice 8) for one step, AFTER the result is
+    // published — the atomic between-step swap (a step() never sees a half-updated prior).
+    // Per source + DOF: advance the commit gate (commit_gate_reanchor — N_min + hysteresis,
+    // with a re-fill guard so a post-reset sparse histogram does not falsely re-open). Once
+    // committed, swap the latest committed value into the fusion prior every step (extrinsic
+    // rotation, lever arm) so fusion tracks the refined estimate; the SCALE DOF additionally
+    // re-anchors on its rising edge (folds the residual into prior_scale + resets its
+    // histogram — the one DOF whose votes read the fusion prior). The reference's
+    // extrinsic/scale are the pinned gauge — never committed. Bounded by source_count; no heap.
+    void apply_calib_feedback() {
+        for (int i = 0; i < source_count; ++i) {
+            if (sources[i] == nullptr) continue;
+            const SourceId id = sources[i]->id();
+            // The reference is the gauge: its extrinsic + scale stay at the prior, never
+            // commit, never re-anchor.
+            if (id == cfg.reference_sensor_id) {
+                ext_committed[i] = roll_committed[i] = false;
+                lever_committed[i] = scale_committed[i] = false;
+                continue;
+            }
+
+            // --- yaw/pitch (so(3) direction) -----------------------------------------
+            const bool was_ext = ext_committed[i];
+            ext_committed[i] = commit_gate_reanchor(
+                was_ext, calib1.extrinsic_confidence(id), calib1.vote_count(id),
+                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+
+            // --- roll ----------------------------------------------------------------
+            const bool was_roll = roll_committed[i];
+            roll_committed[i] = commit_gate_reanchor(
+                was_roll, calib2.extrinsic_confidence(id), calib2.roll_vote_count(id),
+                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+
+            // --- xyz lever arm -------------------------------------------------------
+            const bool was_lever = lever_committed[i];
+            lever_committed[i] = commit_gate_reanchor(
+                was_lever, calib2.translation_confidence(id), calib2.xyz_vote_count(id),
+                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+
+            // --- scale ---------------------------------------------------------------
+            const bool was_scale = scale_committed[i];
+            scale_committed[i] = commit_gate_reanchor(
+                was_scale, calib1.scale_confidence(id), calib1.vote_count(id),
+                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+
+            // === ROTATION + LEVER feedback (yaw/pitch ∘ roll, xyz) ===================
+            // KEY (this codebase): the calibrators carry their OWN fixed basepoint (set once
+            // in add_source) that is DECOUPLED from the fusion prior. calib1 recovers the
+            // forward AXIS as a residual δR @ that basepoint, calib2 recovers roll @ the fed
+            // R_yp and the lever arm as an ABSOLUTE linear-LS solve — none of these read the
+            // FUSION prior. So swapping a committed extrinsic into the fusion prior does NOT
+            // make their votes stale; the feedback is purely "publish the recovered value into
+            // the value FUSION frame-aligns with", so the consensus improves. We swap WITHOUT
+            // re-anchoring/resetting the so(3)/roll/lever histograms: with this calibrator's
+            // FIXED-basepoint design re-anchoring to its own extrinsic() output is NOT a
+            // contractive map (it can walk the estimate away), so the recovered value is most
+            // accurate at the design's intended SMALL-DEVIATION regime (prior near the truth) —
+            // which is also a stable fixed point under feedback. Convergence of the EXTRINSIC
+            // from a LARGE (≫ small-deviation) prior error needs a contractive re-anchor that
+            // is an open design item (see the re-anchor API set_basepoint/reset_*, which IS
+            // exercised for scale below). The scale DOF re-anchors cleanly because it votes a
+            // ratio off the de-scaled B, which DOES read the fusion prior_scale.
+            if (ext_committed[i] || roll_committed[i]) {
+                // calib1.extrinsic().R is the YAW/PITCH (roll about forward leaves the axis
+                // fixed). calib2.extrinsic().R = R_yp · Rx(roll) folds the recovered roll on
+                // top (R_yp fed from calib1 every step), so it already carries both DOF.
+                const Mat3 R_yp_committed = ext_committed[i] ? calib1.extrinsic(id).R
+                                                             : prior_extrinsic[i].R;
+                prior_extrinsic[i].R = roll_committed[i] ? calib2.extrinsic(id).R
+                                                         : R_yp_committed;
+            }
+            if (lever_committed[i]) {
+                prior_extrinsic[i].t = calib2.lever_arm(id);
+            }
+            // Keep calib2's prior (lever-arm fallback for an unobservable axis + the
+            // PairwisePinnedRef gauge) tracking the committed extrinsic — value sync only,
+            // NOT a histogram reset.
+            if (ext_committed[i] || roll_committed[i] || lever_committed[i]) {
+                calib2.set_basepoint(id, prior_extrinsic[i]);
+            }
+
+            // === SCALE feedback (the one DOF that DOES re-anchor) =====================
+            // calib1 votes the magnitude ratio off the DE-SCALED B (B.t / prior_scale), so
+            // its scale() is the RESIDUAL scale vs the CURRENT fusion prior_scale — the only
+            // calibrated quantity that reads the fusion prior. The committed absolute scale =
+            // prior_scale * residual. On the RISING EDGE, fold the residual into prior_scale
+            // and RESET the scale histogram so it re-votes the (now ≈ 1) residual around the
+            // new prior (the two-rate iterate — and the old ratios, taken vs the old
+            // prior_scale, are genuinely stale). Rising-edge only: resetting every step would
+            // never let the histogram re-concentrate (collapsing confidence -> hysteresis
+            // re-open thrash).
+            if (scale_committed[i] && !was_scale) {
+                const Scalar residual = calib1.scale(id);
+                if (residual > Scalar(0)) {
+                    prior_scale[i] *= residual;
+                    if (!(prior_scale[i] > Scalar(0))) prior_scale[i] = Scalar(1);
+                    calib1.reset_scale(id);
+                }
+            }
+        }
+    }
 };
 
 Estimator::Estimator() : impl_(nullptr) {}
@@ -227,6 +391,11 @@ Status Estimator::init(const Config& cfg) {
         impl_->weight_prior[i]      = Scalar(1);
         impl_->prior_time_offset[i] = Scalar(0);
         impl_->offset_committed[i]  = false;
+        impl_->ext_committed[i]     = false;
+        impl_->roll_committed[i]    = false;
+        impl_->lever_committed[i]   = false;
+        impl_->scale_committed[i]   = false;
+        impl_->med_slot[i]          = -1;
     }
 
     // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
@@ -358,8 +527,16 @@ Status Estimator::step(Timestamp now) {
     // the latched flags. No-op (all false) when time-sync is off / for the reference.
     s.update_commit_state();
 
-    // Collect each covered source's frame-aligned delta + weight.
-    int n = 0;
+    // Collect each covered source's frame-aligned delta + weight. The CALIBRATION arrays
+    // (calib_*) take EVERY covered source — calibration must see all sources to vote the
+    // consensus disagreement (Slice 6/7). The FUSION median arrays (aligned/weights) take
+    // only the sources that PARTICIPATE this step per the cold-start switch (D6):
+    // MedianFromStart = all (Slice-2 behaviour); ReferenceOnly = the reference + any source
+    // whose extrinsic has COMMITTED (a trustworthy prior). `n` indexes the median set;
+    // `nc` indexes the calibration set. `med_slot[k]` maps a median entry back to its
+    // registered slot for the residual diagnostics.
+    int n  = 0;     // participating sources (fusion median)
+    int nc = 0;     // covered sources (calibration)
     for (int i = 0; i < s.source_count; ++i) {
         const ISource* src = s.sources[i];
         if (src == nullptr) continue;
@@ -397,23 +574,29 @@ Status Estimator::step(Timestamp now) {
         Scalar w = s.weight_prior[i] * sigma_conf;
         w = std::max(cfg.weight_floor, std::min(cfg.weight_cap, w));
 
-        s.aligned[n] = A;
-        s.weights[n] = w;
-        // Capture the de-scaled reported sensor-frame delta for the Phase-1 calibrator
-        // (direction -> yaw/pitch + magnitude ratio -> scale; D11/D20). The magnitude
-        // ratio off the DE-SCALED B recovers the RESIDUAL scale vs the prior. Also carry
-        // the raw Σ-confidence (D5 vote_weight Confidence/Combo) aligned by slot.
-        s.calib_ids[n]      = src->id();
-        s.calib_reported[n] = B_corr;
-        s.calib_conf[n]     = sigma_conf;
-        h.weight     = w;
-        ++n;
+        // Capture the de-scaled reported sensor-frame delta for the calibrators
+        // (direction -> yaw/pitch + magnitude ratio -> scale; D11/D20). EVERY covered
+        // source feeds calibration. Also carry the raw Σ-confidence (D5 vote_weight).
+        s.calib_ids[nc]      = src->id();
+        s.calib_reported[nc] = B_corr;
+        s.calib_conf[nc]     = sigma_conf;
+        ++nc;
+
+        // Fusion median: only participating sources (cold-start switch, D6).
+        if (s.participates(i)) {
+            s.aligned[n]  = A;
+            s.weights[n]  = w;
+            s.med_slot[n] = i;
+            h.weight      = w;
+            ++n;
+        }
     }
 
     s.result.source_count = s.source_count;
 
-    // Phase: need the window fully covered by at least one source. (Full lifecycle —
-    // INIT/WARMUP/DEGRADED/NOMINAL — is Slice 3; keep this minimal but correct.)
+    // Phase: need at least one PARTICIPATING source covering the window. (Full lifecycle —
+    // INIT/WARMUP/DEGRADED/NOMINAL — is Slice 3; keep this minimal but correct.) Under
+    // ReferenceOnly cold-start before any commit this is the reference alone (dead-reckon).
     if (n == 0) {
         s.result.phase     = Phase::Warmup;
         s.result.tip_valid = false;
@@ -428,12 +611,12 @@ Status Estimator::step(Timestamp now) {
     mp.lambda    = cfg.metric_lambda;
     const median::Result med = median::solve(s.aligned, s.weights, n, mp);
 
-    // Per-source residual to the consensus (diagnostics).
-    for (int i = 0, k = 0; i < s.source_count; ++i) {
-        if (!s.result.health[i].in_window) continue;
-        s.result.health[i].residual =
-            se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
-        ++k;
+    // Per-source residual to the consensus (diagnostics). Indexed by the median set via
+    // med_slot (cold-start may exclude covered-but-non-participating sources from the
+    // median); a covered source not in the median keeps its residual at 0.
+    for (int k = 0; k < n; ++k) {
+        SourceHealth& h = s.result.health[s.med_slot[k]];
+        h.residual = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
     }
 
     // ---- Phase-1 calibration stage (Slice 6, D5/D11/D20) -------------------------
@@ -450,7 +633,7 @@ Status Estimator::step(Timestamp now) {
     // fusion in Slice 6 — it only populates CalibSnapshot below.
     const Vec3 fused_omega = so3::log(med.value.R) / dt;
     const Vec3 fused_trans = med.value.t;
-    s.calib1.observe(n, s.calib_ids, s.calib_reported, fused_omega, fused_trans,
+    s.calib1.observe(nc, s.calib_ids, s.calib_reported, fused_omega, fused_trans,
                      s.calib_conf);
 
     // ---- Phase-2 calibration stage (Slice 7, D5/D10/D21) -------------------------
@@ -461,10 +644,10 @@ Status Estimator::step(Timestamp now) {
     // turn_omega_min) and votes the roll (S¹) + the xyz lever-arm LS. Runs at the SAME
     // frontier as fusion for now. NO feedback into fusion in Slice 7 — it only populates the
     // CalibSnapshot extrinsic (roll + translation) + the rotation/translation confidences.
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < nc; ++i) {
         s.calib2.set_yaw_pitch(s.calib_ids[i], s.calib1.extrinsic(s.calib_ids[i]).R);
     }
-    s.calib2.observe(n, s.calib_ids, s.calib_reported, med.value, fused_omega,
+    s.calib2.observe(nc, s.calib_ids, s.calib_reported, med.value, fused_omega,
                      s.calib_conf);
 
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
@@ -505,7 +688,19 @@ Status Estimator::step(Timestamp now) {
                                       : yp_conf;
         cs.scale_confidence       = s.calib1.scale_confidence(id);
         cs.translation_confidence = s.calib2.translation_confidence(id);
-        cs.committed     = s.offset_committed[i];
+        // Per-DOF commit flags (Slice 8): the latched state from the PREVIOUS step's
+        // apply_calib_feedback() — i.e. which DOF is currently DRIVING this step's fusion
+        // prior. Each underlying per-DOF latch is monotone (commit then hysteresis-hold), so
+        // each flag is non-thrashing. `committed` is the time-offset commit (Slice 5);
+        // `extrinsic_committed` is the yaw/pitch (so(3) rotation) commit; the roll commit is
+        // a separate refinement on top (it does not gate this flag — combining them would
+        // make the flag oscillate during the window where roll is observed but not yet
+        // committed). `translation_committed` is the xyz lever-arm commit; `scale_committed`
+        // the per-source scale commit.
+        cs.committed             = s.offset_committed[i];
+        cs.extrinsic_committed   = s.ext_committed[i];
+        cs.scale_committed       = s.scale_committed[i];
+        cs.translation_committed = s.lever_committed[i];
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).
@@ -546,6 +741,15 @@ Status Estimator::step(Timestamp now) {
     } else {
         s.result.tip_valid = false;
     }
+
+    // ---- Calibration -> fusion feedback (Slice 8, DESIGN §6) --------------------
+    // ATOMIC between-step swap: run AFTER the result is published so this step saw a
+    // consistent prior set; the per-DOF commit + value swap (+ the scale re-anchor) take
+    // effect on the NEXT step's fuse. This closes the calibration->fusion loop — a committed
+    // scale / time-offset / extrinsic is swapped into the value fusion frame-aligns/de-scales
+    // with, improving the fused trajectory. No-op while no DOF has cleared the commit gate (so
+    // calibration-off / unconfident == the prior-driven Slice-6/7 behaviour).
+    s.apply_calib_feedback();
 
     return Status::Ok;
 }
@@ -611,3 +815,4 @@ Status validate(const Config& cfg) {
 }
 
 } // namespace ofc
+

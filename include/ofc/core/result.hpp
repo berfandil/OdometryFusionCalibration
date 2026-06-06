@@ -27,8 +27,18 @@ enum class Phase { Init, Warmup, Degraded, Nominal };
 //                             unobservable axis (e.g. z under pure-yaw turning) never
 //                             concentrates, so this stays low until the lever arm is
 //                             fully observable.
-// All are peak concentrations in [0, 1]. `committed` currently reflects the time-offset
-// commit gate (Slice 5); per-DOF commit flags arrive with the feedback loop (Slice 8).
+// All are peak concentrations in [0, 1]. Per-DOF commit flags (Slice 8 feedback loop)
+// mark which DOF has cleared the commit gate (τ_commit ∧ N_min, hysteresis) and is now
+// DRIVING fusion (swapped into the source's effective prior) rather than the config prior:
+//   * committed              — the TIME-OFFSET commit (Slice 5; kept as the primary flag
+//                              for backward compatibility).
+//   * extrinsic_committed    — the yaw/pitch (so(3) direction) ROTATION commit. The roll is
+//                              a separate refinement that does NOT gate this flag (combining
+//                              them would make the flag oscillate during the window where
+//                              roll is observed but not yet committed). Once set, the
+//                              recovered rotation feeds back into fusion's prior_extrinsic.R.
+//   * scale_committed        — the per-source scale commit (feeds fusion's prior_scale).
+//   * translation_committed  — the xyz lever-arm commit (feeds prior_extrinsic.t).
 struct CalibSnapshot {
     SourceId id            = 0;
     SE3      extrinsic;                 // estimated mount (yaw/pitch Slice 6; + roll/t Slice 7)
@@ -38,7 +48,10 @@ struct CalibSnapshot {
     Scalar   extrinsic_confidence = 0.0; // rotation (yaw/pitch ∧ roll) concentration in [0,1]
     Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
     Scalar   translation_confidence = 0.0; // xyz lever-arm concentration in [0,1] (Slice 7)
-    bool     committed     = false;
+    bool     committed     = false;     // TIME-OFFSET commit (Slice 5)
+    bool     extrinsic_committed     = false; // yaw/pitch ∘ roll commit (Slice 8)
+    bool     scale_committed         = false; // scale commit (Slice 8)
+    bool     translation_committed   = false; // xyz lever-arm commit (Slice 8)
 };
 
 // Per-source diagnostics (populated when Config::emit_diagnostics).

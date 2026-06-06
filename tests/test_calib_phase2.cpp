@@ -607,6 +607,11 @@ TEST_CASE("phase2 wiring: rig run fills CalibSnapshot roll + lever arm") {
     cfg.fusion_delay_s = 0.05;
     cfg.window_s       = 0.10;
     cfg.timesync_enabled = false;       // isolate the calibration path
+    cfg.cold_start     = ColdStart::MedianFromStart;  // all sources drive the median
+    // Slice 7 is ESTIMATE-ONLY: keep the Slice-8 commit/feedback loop OFF here (N_min above
+    // the achievable vote count) so this test validates the raw Phase-2 estimate path. The
+    // feedback loop is validated in test_calib_feedback.
+    cfg.commit_min_votes = 1000000;
     cfg.sensors        = sensors.data();
     cfg.sensor_count   = 4;
 
@@ -679,6 +684,10 @@ TEST_CASE("phase2 wiring roll-free prior: recovers a planted roll through the fu
     cfg.fusion_delay_s = 0.05;
     cfg.window_s       = 0.10;
     cfg.timesync_enabled = false;
+    cfg.cold_start     = ColdStart::MedianFromStart;  // all sources drive the median
+    // ESTIMATE-ONLY (Slice 7): commit/feedback OFF (N_min above the achievable vote count)
+    // so the Phase-1->Phase-2 seam is validated without the Slice-8 feedback loop.
+    cfg.commit_min_votes = 1000000;
     cfg.sensors        = sensors.data();
     cfg.sensor_count   = 4;
 

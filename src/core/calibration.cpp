@@ -143,6 +143,33 @@ Status Phase1Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
     return Status::Ok;
 }
 
+Status Phase1Calibrator::set_basepoint(SourceId id, const SE3& basepoint) {
+    // Re-anchor the so(3) basepoint to a committed extrinsic (Slice 8). Same validation /
+    // slot semantics as set_prior; only the prior SE3 is replaced (scale_calib kept).
+    if (!configured_)                        return Status::NotInitialized;
+    if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
+    const int slot = ensure_slot(id);
+    if (slot < 0)                            return Status::CapacityExceeded;
+    prior_[slot] = basepoint;
+    return Status::Ok;
+}
+
+void Phase1Calibrator::reset_so3(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    so3_[3 * s + 0].reset();
+    so3_[3 * s + 1].reset();
+    so3_[3 * s + 2].reset();
+}
+
+void Phase1Calibrator::reset_scale(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    scale_[s].reset();
+}
+
 Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported,
                                  const Vec3& fused_omega, const Vec3& fused_trans,
                                  const Scalar* confidences) {
@@ -550,6 +577,36 @@ Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic) {
     if (slot < 0)                            return Status::CapacityExceeded;
     prior_[slot] = prior_extrinsic;
     return Status::Ok;
+}
+
+Status Phase2Calibrator::set_basepoint(SourceId id, const SE3& basepoint) {
+    // Re-anchor the lever-arm prior + the pinned-ref gauge to a committed extrinsic
+    // (Slice 8). Same validation / slot semantics as set_prior.
+    if (!configured_)                        return Status::NotInitialized;
+    if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
+    const int slot = ensure_slot(id);
+    if (slot < 0)                            return Status::CapacityExceeded;
+    prior_[slot] = basepoint;
+    return Status::Ok;
+}
+
+void Phase2Calibrator::reset_roll(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    roll_[s].reset();
+}
+
+void Phase2Calibrator::reset_lever(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    ata_[s]  = Mat3::Zero();
+    atb_[s]  = Vec3::Zero();
+    rows_[s] = Scalar(0);
+    xyz_[3 * s + 0].reset();
+    xyz_[3 * s + 1].reset();
+    xyz_[3 * s + 2].reset();
 }
 
 Status Phase2Calibrator::set_yaw_pitch(SourceId id, const Mat3& R_yp) {

@@ -437,6 +437,10 @@ Config make_rig_config(const std::vector<SourceParams>& planted,
     c.window_s       = 0.10;
     c.sensors        = sensors_out.data();
     c.sensor_count   = static_cast<int>(sensors_out.size());
+    // Priors == planted here (no calibration needed), so every source drives the median
+    // from the start (the Slice-2 semantics). ReferenceOnly cold-start is exercised in
+    // test_calib_feedback.
+    c.cold_start     = ColdStart::MedianFromStart;
     return c;
 }
 } // namespace

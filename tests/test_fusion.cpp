@@ -90,6 +90,10 @@ Config base_config(int max_sources) {
     c.window_s       = 0.10;
     c.tip_cov_inflation = 1.5;
     c.emit_predicted_tip = true;
+    // Slice-2 fusion semantics: every source drives the median from the first tick (the
+    // outlier is rejected by the Weiszfeld 1/d reweight, NOT excluded by cold-start). The
+    // ReferenceOnly cold-start (Slice 8) is exercised separately in test_calib_feedback.
+    c.cold_start     = ColdStart::MedianFromStart;
     return c;
 }
 } // namespace
