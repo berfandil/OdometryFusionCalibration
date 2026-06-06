@@ -462,6 +462,107 @@ TEST_CASE("phase2 determinism: identical input -> identical estimate") {
 }
 
 // ===========================================================================
+// Vote weight (D5): the configured mode actually changes the effective vote mass.
+// Under `Rotation`, high-omega samples dominate the mode vs `One`.
+// ===========================================================================
+TEST_CASE("phase2 vote_weight: Rotation lets high-omega samples dominate the roll mode") {
+    // Plant a known roll into R_B via R_B = Rx(-roll) R_A Rx(roll) (with R_yp = I,
+    // best_roll then recovers exactly `roll`). Feed TWO interleaved roll regimes:
+    //   - roll rA at a LOW turn rate, with MANY windows (more raw COUNT), and
+    //   - roll rB at a HIGH turn rate, with FEWER windows (more ROTATION mass).
+    // The turn-gate / Rotation factor read `fused_omega` (passed independently of R_A's
+    // own rotation), so the two regimes differ only in their ω magnitude + repetition.
+    //   * One:      every vote weighs 1 -> the more-numerous rA wins the mode.
+    //   * Rotation: each vote weighs ‖ω‖ -> the high-ω rB carries more mass and wins,
+    //               despite fewer windows. The mode flips — proving the weight is honored.
+    const Scalar rA = -0.30, rB = 0.40;     // distinct rolls, distinct bins
+    // A real (small) base rotation so the per-window ‖log R_A‖ floor passes.
+    const Mat3 R_A = so3::exp(Vec3(0.0, 0.05, 0.10));
+    // Return Mat3 (NOT auto) — an Eigen product expression would dangle on the Rx()
+    // temporaries. best_roll(I, R_A, R_B=Rx(-roll)·R_A·Rx(roll)) recovers exactly `roll`.
+    auto planted_RB = [&](Scalar roll) -> Mat3 {
+        return Rx(-roll) * R_A * Rx(roll);
+    };
+
+    auto run = [&](VoteWeight mode) {
+        auto calp = make_calib();
+        Config c = make_cfg();
+        c.vote_weight = mode;
+        REQUIRE(calp->configure(c, 0) == Status::Ok);
+        REQUIRE(calp->set_prior(1, SE3{}) == Status::Ok);
+        REQUIRE(calp->set_yaw_pitch(1, Mat3::Identity()) == Status::Ok);  // R_yp = I
+
+        SourceId ids[1] = {1};
+        SE3 rep[1];
+        rep[0].t = Vec3(0.0, 0, 0);          // translation irrelevant to the roll vote here
+        // rA regime: low omega (just above the 0.20 gate), MANY windows.
+        rep[0].R = planted_RB(rA);
+        SE3 A; A.R = R_A; A.t = Vec3(0.1, 0, 0);
+        for (int k = 0; k < 60; ++k)
+            REQUIRE(calp->observe(1, ids, rep, A, Vec3(0, 0, 0.25)) == Status::Ok);
+        // rB regime: HIGH omega, FEWER windows.
+        rep[0].R = planted_RB(rB);
+        for (int k = 0; k < 20; ++k)
+            REQUIRE(calp->observe(1, ids, rep, A, Vec3(0, 0, 3.0)) == Status::Ok);
+        return calp->roll(1);
+    };
+
+    const Scalar roll_one = run(VoteWeight::One);
+    const Scalar roll_rot = run(VoteWeight::Rotation);
+
+    // One: the more-numerous rA wins (60 vs 20 votes, all weight 1).
+    CHECK(near_abs(roll_one, rA, 2e-2));
+    // Rotation: rB's high-omega mass dominates (20 * 3.0 = 60 vs 60 * 0.25 = 15) -> mode rB.
+    CHECK(near_abs(roll_rot, rB, 2e-2));
+    // The two modes are genuinely different -> the weight changed the effective vote mass.
+    CHECK(std::abs(roll_rot - roll_one) > 0.5);
+}
+
+// ===========================================================================
+// Committed lever_arm() ridge bias (MINOR): the COMMITTED histogram-mode lever_arm()
+// uses a prior-centred ridge solve (kVoteRidgeRel). Pin it with a NONZERO prior to
+// bound the prior-pull bias — a larger ridge regression would be caught here.
+// ===========================================================================
+TEST_CASE("phase2 committed lever_arm ridge bias is bounded with a nonzero prior") {
+    const Trajectory traj = multiaxis_turn();
+    const Scalar yaw_p = 0.20, pitch_p = -0.12, roll_p = 0.35;
+    const Vec3 t_true(0.40, -0.30, 0.15);
+    const SE3 X_planted = make_extrinsic(yaw_p, pitch_p, roll_p, t_true);
+
+    SourceParams pr; pr.id = 0; pr.X = SE3{};      pr.scale = 1.0;
+    SourceParams pp; pp.id = 1; pp.X = X_planted;  pp.scale = 1.0;
+    SyntheticSource ref(traj, pr);
+    SyntheticSource planted(traj, pp);
+
+    auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+    Config c = make_cfg(); c.phase2_strategy = Phase2Strat::VsFusedBase;
+    REQUIRE(cal.configure(c, 0) == Status::Ok);
+    REQUIRE(cal.set_prior(0, SE3{}) == Status::Ok);
+    // NONZERO prior translation, deliberately OFFSET from the truth by ~0.1 m/axis, so the
+    // prior-centred ridge would pull the committed estimate toward this wrong prior. The
+    // committed lever_arm() must still land near the TRUE t_X (ridge pull << observable
+    // resolution); a materially larger ridge would drag it toward t_prior and fail.
+    SE3 prior1; prior1.t = t_true + Vec3(0.10, -0.10, 0.10);
+    REQUIRE(cal.set_prior(1, prior1) == Status::Ok);
+    REQUIRE(cal.set_yaw_pitch(1, yaw_pitch_R(yaw_p, pitch_p)) == Status::Ok);
+
+    const DriveResult dr = drive(cal, traj, ref, planted, 1.0, 0.05, 5.95, 50.0);
+    REQUIRE(dr.voted > 100);
+
+    // The COMMITTED (histogram-mode) lever arm — the path exercised by the estimator — is
+    // bounded near the TRUE value despite the offset prior (the ~0.1% ridge pull on a
+    // ~0.1 m offset is ~1e-4 m, far inside this tolerance; a large ridge would not be).
+    const Vec3 la = cal.lever_arm(1);
+    CHECK(near_abs(la.x(), t_true.x(), 3e-2));
+    CHECK(near_abs(la.y(), t_true.y(), 3e-2));
+    CHECK(near_abs(la.z(), t_true.z(), 3e-2));
+    // It is NOT sitting at the (wrong) prior — the observable axes resolved off the data.
+    CHECK(std::abs(la.x() - prior1.t.x()) > 5e-2);
+    CHECK(std::abs(la.y() - prior1.t.y()) > 5e-2);
+    CHECK(std::abs(la.z() - prior1.t.z()) > 5e-2);
+}
+
+// ===========================================================================
 // End-to-end wiring: the full Estimator/Rig populates the Phase-2 extrinsic.
 // ===========================================================================
 TEST_CASE("phase2 wiring: rig run fills CalibSnapshot roll + lever arm") {
@@ -534,4 +635,77 @@ TEST_CASE("phase2 wiring: rig run fills CalibSnapshot roll + lever arm") {
     // The Phase-2 confidences are exposed and rose.
     CHECK(cs->extrinsic_confidence   > 0.2);
     CHECK(cs->translation_confidence > 0.1);
+}
+
+// ===========================================================================
+// End-to-end wiring (ROLL-FREE PRIOR): the prior carries the correct yaw/pitch but
+// ROLL = 0, while the planted mount has a NONZERO roll. The full Estimator path must
+// recover the planted roll through the Phase-1 -> Phase-2 seam — so a broken roll seam
+// (e.g. roll left at the prior 0) cannot pass this e2e (the original wiring baked the
+// true roll into the prior, making roll recovery vacuous).
+// ===========================================================================
+TEST_CASE("phase2 wiring roll-free prior: recovers a planted roll through the full seam") {
+    Trajectory tr;
+    Vec6 straight; straight << 2.0, 0, 0, 0, 0, 0;
+    Vec6 turnA;    turnA    << 2.0, 0, 0, 0, 0.3,  0.6;
+    Vec6 turnB;    turnB    << 2.0, 0, 0, 0, -0.3, 0.6;
+    tr.add_segment(straight, 2.0);
+    tr.add_segment(turnA,    2.5);
+    tr.add_segment(straight, 1.5);
+    tr.add_segment(turnB,    2.5);
+    tr.add_segment(straight, 1.5);
+
+    const Scalar yaw_p = 0.12, pitch_p = -0.08, roll_p = 0.30;
+    const Vec3 t_p(0.35, -0.25, 0.18);
+    const SE3 X_planted = make_extrinsic(yaw_p, pitch_p, roll_p, t_p);
+    const Mat3 R_yp_only = yaw_pitch_R(yaw_p, pitch_p);     // the ROLL-FREE prior rotation
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X_planted;
+
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    // PRIOR carries the correct yaw/pitch but ZERO roll (and zero translation). Roll about
+    // the forward axis leaves the forward axis fixed, so Phase-1 (forward-axis only) still
+    // recovers this yaw/pitch and feeds Phase-2 a roll-free R_yp basepoint — the planted
+    // roll must come entirely from the Phase-2 hand-eye residual.
+    sensors[3].prior_extrinsic.R = R_yp_only;
+    Config cfg = make_cfg();
+    cfg.max_sources    = 4;
+    cfg.fusion_delay_s = 0.05;
+    cfg.window_s       = 0.10;
+    cfg.timesync_enabled = false;
+    cfg.sensors        = sensors.data();
+    cfg.sensor_count   = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& s : srcs) REQUIRE(rig.add_source(s.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 50);
+
+    const Result& res = rig.estimator().latest();
+    const CalibSnapshot* cs = nullptr;
+    for (int i = 0; i < res.source_count; ++i) {
+        if (res.calib[i].id == 3) { cs = &res.calib[i]; break; }
+    }
+    REQUIRE(cs != nullptr);
+
+    // The recovered FULL rotation matches the planted (yaw/pitch ∘ planted roll).
+    const Vec3 rerr = so3::log(X_planted.R.transpose() * cs->extrinsic.R);
+    CHECK(rerr.norm() < 6e-2);
+
+    // NON-VACUOUS roll check: extract the recovered roll about the forward axis (the
+    // residual rotation R_yp^T · R_recovered is a roll-about-x), and assert it matches the
+    // PLANTED roll — not 0 (which a broken seam leaving roll at the prior would give).
+    const Vec3 roll_vec = so3::log(R_yp_only.transpose() * cs->extrinsic.R);
+    CHECK(near_abs(roll_vec.x(), roll_p, 6e-2));     // recovered roll ≈ planted
+    CHECK(std::abs(roll_vec.x()) > 0.15);            // and is genuinely nonzero (not vacuous)
+    CHECK(std::abs(roll_vec.y()) < 5e-2);            // residual is a pure roll-about-forward
+    CHECK(std::abs(roll_vec.z()) < 5e-2);
 }

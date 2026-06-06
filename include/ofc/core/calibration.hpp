@@ -117,10 +117,22 @@ public:
     // reverse samples are NOT folded; staying backward they hit that same ≥90° guard and are
     // dropped (fold-OFF discards the reverse half — no edge-clamped boundary-bin second peak).
     //
+    // VOTE WEIGHT (cfg.vote_weight, D5 "votes weighted by ‖ω‖"). Each histogram vote's
+    // mass is scaled by a per-source factor (see vote_weight_factor()): One -> 1;
+    // Confidence -> the source's Σ-confidence (the same inverse-covariance scalar fusion
+    // weights with, supplied per source in `confidences[i]`); Rotation -> the turn
+    // magnitude ‖fused_omega‖ (floored to a small positive so straight-regime Phase-1
+    // votes — where ‖ω‖≈0 by gate — still land); Combo -> the product of the Rotation and
+    // Confidence factors. `confidences` is OPTIONAL (nullptr -> unit confidence, so
+    // Confidence/Combo collapse to the Rotation factor); when supplied it must have n
+    // entries aligned with `ids`. So(3) (3 channels) and scale share the same per-source
+    // factor.
+    //
     // Returns Ok when the step was voted, NotReady when gated out (not an error),
     // NotInitialized if unconfigured.
     Status observe(int n, const SourceId* ids, const SE3* reported,
-                   const Vec3& fused_omega, const Vec3& fused_trans);
+                   const Vec3& fused_omega, const Vec3& fused_trans,
+                   const Scalar* confidences = nullptr);
 
     // --- Per-source readouts (committed = histogram mode) --------------------
     // Recovered forward axis in the BASE frame (unit vector). Returns the prior forward
@@ -159,6 +171,13 @@ private:
     // axis. Both inputs assumed unit-norm.
     static Mat3 rotation_between(const Vec3& a, const Vec3& b);
 
+    // Per-vote weight factor honoring vote_weight_ (D5). `omega_norm` is ‖fused_omega‖ for
+    // the step; `confidence` is the source's Σ-confidence (1 if not supplied). One -> 1;
+    // Confidence -> confidence; Rotation -> max(omega_norm, kRotFloor) (floored so the
+    // straight-regime ‖ω‖≈0 still produces a positive vote); Combo -> Rotation × Confidence.
+    // Always strictly positive (add() ignores non-positive weights).
+    Scalar vote_weight_factor(Scalar omega_norm, Scalar confidence) const;
+
     // Active configuration (configure() is the sole initializer; readers short-circuit on
     // !configured_).
     bool     configured_       = false;
@@ -167,6 +186,7 @@ private:
     Scalar   straight_trans_min_ = Scalar(0.05);
     bool     reverse_fold_      = true;
     bool     ref_cross_check_   = false;
+    VoteWeight vote_weight_     = VoteWeight::Combo;
     bool     last_gate_straight_ = false;
     HistogramConfig so3_cfg_{};
     HistogramConfig scale_cfg_{};
@@ -245,7 +265,11 @@ private:
 class Phase2Calibrator {
 public:
     static constexpr int kMaxSources = 32;
-    // Bounded 1-D roll search resolution (strict core: fixed iteration count).
+    // Bounded 1-D roll search resolution (strict core: fixed iteration count). FIXED
+    // (not config) observability threshold the slice is judged on. The 180-sample grid is
+    // ~2° over (−π, π] — a PRE-REFINE grid that ASSUMES a single-well rot_residual (smooth,
+    // one minimum); a residual minimum narrower than ~2° between samples (e.g. extreme
+    // yaw+roll coupling) could let the grid pick the wrong neighbourhood before the parabola.
     static constexpr int kRollGrid   = 180;     // grid samples over (−π, π]
 
     Phase2Calibrator() = default;
@@ -287,8 +311,17 @@ public:
     // skipped (the ω×r→0 near-singular row — it would add a near-zero, ill-conditioned
     // row to the LS). Returns Ok when at least one source voted, NotReady when gated out,
     // NotInitialized if unconfigured, NoData on bad args.
+    //
+    // VOTE WEIGHT (cfg.vote_weight, D5 "votes weighted by ‖ω‖"). Each roll + xyz vote's
+    // mass is scaled by vote_weight_factor(): One -> 1; Rotation -> ‖fused_omega‖ (the
+    // lever-arm benefits from more rotation); Confidence -> the source's Σ-confidence
+    // (`confidences[i]`, the same scalar fusion weights with); Combo -> Rotation ×
+    // Confidence. `confidences` is OPTIONAL (nullptr -> unit confidence). The xyz LS rows
+    // are themselves unweighted (the normal equations stay in physical units); the weight
+    // applies to the HISTOGRAM vote of the running solution, matching Phase-1.
     Status observe(int n, const SourceId* ids, const SE3* reported,
-                   const SE3& fused_motion, const Vec3& fused_omega);
+                   const SE3& fused_motion, const Vec3& fused_omega,
+                   const Scalar* confidences = nullptr);
 
     // --- Per-source readouts (committed = histogram mode / LS solve) ---------
     // Recovered roll about the forward axis [rad], the roll-histogram mode. 0 (prior)
@@ -335,6 +368,12 @@ private:
     // information (AᵀA(c,c) ≥ kAxisInfoMin × max diagonal). Heap-free.
     static Vec3 solve_ridge(const Mat3& AtA, const Vec3& Atb, const Vec3& t_prior,
                             Scalar ridge, bool obs[3]);
+    // Per-vote weight factor honoring vote_weight_ (D5). `omega_norm` is ‖fused_omega‖;
+    // `confidence` is the source's Σ-confidence (1 if not supplied). One -> 1; Rotation ->
+    // omega_norm (already > turn_omega_min by the gate, so always positive); Confidence ->
+    // confidence; Combo -> Rotation × Confidence. Always strictly positive.
+    Scalar vote_weight_factor(Scalar omega_norm, Scalar confidence) const;
+
     // The rotation hand-eye residual norm for a candidate roll (see header math).
     static Scalar rot_residual(const Mat3& R_yp, Scalar roll,
                                const Mat3& R_A, const Mat3& R_B);
@@ -345,6 +384,7 @@ private:
     SourceId reference_id_       = 0;
     Scalar   turn_omega_min_     = Scalar(0.20);
     Phase2Strat strategy_        = Phase2Strat::VsFusedBase;
+    VoteWeight vote_weight_      = VoteWeight::Combo;
     bool     last_gate_turning_  = false;
     HistogramConfig roll_cfg_{};
     HistogramConfig xyz_cfg_{};

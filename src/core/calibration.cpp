@@ -21,6 +21,13 @@ namespace {
 constexpr Scalar kUnitEps = Scalar(1e-12);   // guard ||t|| ~ 0 before normalizing
 constexpr Scalar kPi      = Scalar(3.14159265358979323846);
 
+// Floor for the Rotation vote-weight factor in the STRAIGHT regime. Phase-1 gates on
+// ‖ω‖ < straight_omega_max (near zero), so a raw ‖ω‖ Rotation factor would collapse all
+// votes to ~0 mass; floor it to a small positive so every gated-in vote still lands (the
+// straight regime has no rotation excitation to differentiate — Rotation weighting is a
+// no-op signal here by design; the knob is meaningful in Phase-2's turn regime).
+constexpr Scalar kRotFloorP1 = Scalar(1e-3);
+
 // The base forward axis (the gauge convention: in straight motion the base travels
 // along ±e_x of its own frame — DESIGN §3).
 const Vec3 kFwd = (Vec3() << Scalar(1), Scalar(0), Scalar(0)).finished();
@@ -50,6 +57,21 @@ Mat3 Phase1Calibrator::rotation_between(const Vec3& a, const Vec3& b) {
     return Mat3::Identity() + vx + vx * vx * ((Scalar(1) - c) / (s * s));
 }
 
+Scalar Phase1Calibrator::vote_weight_factor(Scalar omega_norm, Scalar confidence) const {
+    // D5 vote weighting. One -> 1; Confidence -> the source Σ-confidence; Rotation ->
+    // ‖ω‖ floored (straight regime ω≈0); Combo -> Rotation × Confidence. Always > 0 so
+    // add() never drops the vote.
+    const Scalar rot  = std::max(kRotFloorP1, omega_norm);
+    const Scalar conf = std::max(Scalar(0), confidence);
+    switch (vote_weight_) {
+        case VoteWeight::One:        return Scalar(1);
+        case VoteWeight::Confidence: return std::max(kUnitEps, conf);
+        case VoteWeight::Rotation:   return rot;
+        case VoteWeight::Combo:      return std::max(kUnitEps, rot * conf);
+    }
+    return Scalar(1);
+}
+
 Status Phase1Calibrator::configure(const Config& cfg, SourceId reference_id) {
     if (static_cast<int>(reference_id) >= kMaxSources) return Status::OutOfRange;
 
@@ -72,6 +94,7 @@ Status Phase1Calibrator::configure(const Config& cfg, SourceId reference_id) {
     straight_trans_min_ = std::max(Scalar(0), cfg.straight_trans_min);
     reverse_fold_       = cfg.reverse_fold;
     ref_cross_check_    = cfg.ref_cross_check;
+    vote_weight_        = cfg.vote_weight;
     last_gate_straight_ = false;
 
     configured_ = true;
@@ -121,9 +144,15 @@ Status Phase1Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
 }
 
 Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported,
-                                 const Vec3& fused_omega, const Vec3& fused_trans) {
+                                 const Vec3& fused_omega, const Vec3& fused_trans,
+                                 const Scalar* confidences) {
     if (!configured_)                       return Status::NotInitialized;
     if (n <= 0 || ids == nullptr || reported == nullptr) return Status::NoData;
+
+    // Rotation factor for vote weighting is the consensus turn magnitude (D5). In the
+    // straight regime this is near-zero (gated < straight_omega_max), so the factor is
+    // floored inside vote_weight_factor(); see that helper + kRotFloorP1.
+    const Scalar omega_norm = fused_omega.norm();
 
     // --- Straight gate (the observability spine, D5) -----------------------------
     // Accept only near-zero rotation AND sizable translation in the FUSED consensus
@@ -220,17 +249,23 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // this guarantees no NaN/clamped-π mass ever enters the histogram.
         if (g_unit.dot(kFwd) < Scalar(0)) continue;
 
+        // Per-source vote weight (D5): scale every channel by the configured factor (the
+        // turn magnitude and/or this source's Σ-confidence). `confidences` is optional —
+        // a null array gives unit confidence (Confidence/Combo collapse to Rotation).
+        const Scalar conf = (confidences != nullptr) ? confidences[i] : Scalar(1);
+        const Scalar w    = vote_weight_factor(omega_norm, conf);
+
         // Candidate rotation δR taking e_x -> g_unit; vote its so(3) log (3 channels).
         // The guard above keeps θ < 90°, well clear of the so3::log singularity at π.
         const Mat3 dR  = rotation_between(kFwd, g_unit);
         const Vec3 phi = so3::log(dR);
-        so3_[3 * slot + 0].add(phi.x(), Scalar(1));
-        so3_[3 * slot + 1].add(phi.y(), Scalar(1));
-        so3_[3 * slot + 2].add(phi.z(), Scalar(1));
+        so3_[3 * slot + 0].add(phi.x(), w);
+        so3_[3 * slot + 1].add(phi.y(), w);
+        so3_[3 * slot + 2].add(phi.z(), w);
 
-        // Scale vote = magnitude ratio vs the reference's reported magnitude.
+        // Scale vote = magnitude ratio vs the reference's reported magnitude (same weight).
         if (have_ref && scale_calib_[slot] && id != reference_id_) {
-            scale_[slot].add(bn / ref_mag, Scalar(1));
+            scale_[slot].add(bn / ref_mag, w);
         }
     }
 
@@ -316,6 +351,9 @@ Scalar Phase1Calibrator::vote_count(SourceId id) const {
 // ===========================================================================
 
 namespace {
+// LOAD-BEARING observability thresholds — all FIXED namespace constants (NOT config knobs;
+// CONFIG lists none). They govern the rank-deficiency behaviour the slice is judged on and
+// are deliberately not surfaced for tuning.
 // Per-window guard: skip a row whose base-motion rotation magnitude ‖log R_A‖ is below
 // this floor (the ω×r → 0 near-singular regime — adds an ill-conditioned ~zero row).
 constexpr Scalar kRotRowMin = Scalar(1e-3);   // rad over the step
@@ -331,7 +369,44 @@ constexpr Scalar kAxisInfoMin = Scalar(1e-2);
 // Ridge for the per-window voting solve (relative to the largest AᵀA diagonal). Small
 // enough not to bias observable axes; large enough to pin an unobservable axis at prior.
 constexpr Scalar kVoteRidgeRel = Scalar(1e-3);
+
+// Strip the roll DOF from a rotation, returning its yaw/pitch part (the minimal rotation
+// taking e_x -> the rotation's forward axis R·e_x). Roll is rotation about the forward
+// axis, which leaves R·e_x fixed, so aligning e_x to that axis drops exactly the roll.
+// Used as the Phase-2 roll basepoint fallback when Phase 1 has not yet supplied R_yp, so
+// a nonzero PRIOR roll is not double-counted into the recovered roll on the bootstrap path.
+Mat3 yaw_pitch_of(const Mat3& R) {
+    const Vec3 f = R * kFwd;
+    const Scalar fn = f.norm();
+    if (fn < kUnitEps) return Mat3::Identity();
+    const Vec3 fu = f / fn;
+    const Vec3 v  = kFwd.cross(fu);
+    const Scalar s = v.norm();             // sin(theta)
+    const Scalar c = kFwd.dot(fu);         // cos(theta)
+    if (s < kUnitEps) {
+        // Forward axis already ±e_x: identity (parallel) — antiparallel is outside the
+        // small-deviation regime (a near-π yaw); return identity defensively.
+        return Mat3::Identity();
+    }
+    const Mat3 vx = so3::hat(v);
+    return Mat3::Identity() + vx + vx * vx * ((Scalar(1) - c) / (s * s));
+}
 }  // namespace
+
+Scalar Phase2Calibrator::vote_weight_factor(Scalar omega_norm, Scalar confidence) const {
+    // D5 vote weighting. One -> 1; Rotation -> ‖ω‖ (> turn_omega_min by the gate, so
+    // positive — the lever-arm benefits from more rotation); Confidence -> the source
+    // Σ-confidence; Combo -> Rotation × Confidence. Always > 0 so add() keeps the vote.
+    const Scalar rot  = std::max(kUnitEps, omega_norm);
+    const Scalar conf = std::max(Scalar(0), confidence);
+    switch (vote_weight_) {
+        case VoteWeight::One:        return Scalar(1);
+        case VoteWeight::Confidence: return std::max(kUnitEps, conf);
+        case VoteWeight::Rotation:   return rot;
+        case VoteWeight::Combo:      return std::max(kUnitEps, rot * conf);
+    }
+    return Scalar(1);
+}
 
 Mat3 Phase2Calibrator::roll_about_forward(Scalar roll) {
     // Rotation about the LOCAL forward axis (sensor x). Closed-form Rx(roll).
@@ -422,6 +497,7 @@ Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
     reference_id_   = reference_id;
     turn_omega_min_ = std::max(Scalar(0), cfg.turn_omega_min);
     strategy_       = cfg.phase2_strategy;
+    vote_weight_    = cfg.vote_weight;
     last_gate_turning_ = false;
 
     configured_ = true;
@@ -487,14 +563,16 @@ Status Phase2Calibrator::set_yaw_pitch(SourceId id, const Mat3& R_yp) {
 }
 
 Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported,
-                                 const SE3& fused_motion, const Vec3& fused_omega) {
+                                 const SE3& fused_motion, const Vec3& fused_omega,
+                                 const Scalar* confidences) {
     if (!configured_)                                    return Status::NotInitialized;
     if (n <= 0 || ids == nullptr || reported == nullptr) return Status::NoData;
 
     // --- Turn gate (the observability spine, D5) ---------------------------------
     // Roll + lever arm are observable ONLY under rotation. Accept only sufficiently
     // turning fused motion. Gated-out steps are a no-op (not an error).
-    const bool turning = (fused_omega.norm() > turn_omega_min_);
+    const Scalar omega_norm = fused_omega.norm();
+    const bool turning = (omega_norm > turn_omega_min_);
     last_gate_turning_ = turning;
     if (!turning) return Status::NotReady;
 
@@ -541,13 +619,25 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         const Mat3& R_B = reported[i].R;
         const Vec3& t_B = reported[i].t;
 
-        // Roll basepoint R_yp: the Phase-1 yaw/pitch rotation if provided, else the
-        // prior rotation (uncalibrated bootstrap).
-        const Mat3 R_yp = ryp_set_[slot] ? ryp_[slot] : prior_[slot].R;
+        // Roll basepoint R_yp: the Phase-1 yaw/pitch rotation if provided. FALLBACK
+        // (bootstrap, before Phase 1 has fed an R_yp — see set_yaw_pitch): the prior's
+        // yaw/pitch ONLY, with its prior roll STRIPPED, so the recovered roll is measured
+        // about the same forward axis and does NOT double-count any prior roll. We strip
+        // roll by taking the prior forward axis f = R_prior·e_x and building the minimal
+        // yaw/pitch rotation that aligns e_x -> f (roll about forward leaves f fixed, so
+        // this drops exactly the roll DOF). In the WIRED estimator R_yp is set every step
+        // (the wired path always sets R_yp), so this fallback only matters on the
+        // bootstrap / Slice-8 path — but it is now roll-safe there too.
+        const Mat3 R_yp = ryp_set_[slot] ? ryp_[slot] : yaw_pitch_of(prior_[slot].R);
+
+        // Per-source vote weight (D5): the turn magnitude and/or this source's
+        // Σ-confidence. `confidences` optional (null -> unit confidence).
+        const Scalar conf = (confidences != nullptr) ? confidences[i] : Scalar(1);
+        const Scalar w    = vote_weight_factor(omega_norm, conf);
 
         // --- Roll: 1-D rotation hand-eye residual minimizer, voted into S¹ -------
         const Scalar roll = best_roll(R_yp, R_A, R_B);
-        roll_[slot].add(roll, Scalar(1));
+        roll_[slot].add(roll, w);
 
         // --- xyz: accumulate the LS row (R_A − I) t_X = R_X t_B − t_A ------------
         // Use the full R_X at the just-recovered roll for the translation row (the row
@@ -568,9 +658,9 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         bool obs[3];
         const Vec3 tx_run = solve_ridge(ata_[slot], atb_[slot], prior_[slot].t,
                                         kVoteRidgeRel, obs);
-        if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), Scalar(1));
-        if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), Scalar(1));
-        if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), Scalar(1));
+        if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
+        if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
+        if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
 
         any = true;
     }
@@ -596,6 +686,9 @@ Vec3 Phase2Calibrator::solve_lever_arm(SourceId id, bool* observable) const {
     if (es.info() != Eigen::Success) return prior.t;
     const Vec3 ev = es.eigenvalues();                // ascending
     const Scalar lo = ev(0), hi = ev(2);
+    // Conditioning floor is INCLUSIVE: an exactly-at-floor smallest eigenvalue
+    // (lo == kCondMin·hi) is accepted as observable. Below the floor -> rank-deficient
+    // (e.g. z under pure yaw) -> report the prior rather than a blown-up solve.
     if (!(hi > Scalar(0)) || lo < kCondMin * hi) {
         return prior.t;                              // ill-conditioned / rank-deficient
     }

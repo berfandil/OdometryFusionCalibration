@@ -135,6 +135,11 @@ struct Estimator::Impl {
     // Per-step scratch for the calibration observe() (no heap in step()).
     SourceId calib_ids[kMaxSourcesCap];
     SE3      calib_reported[kMaxSourcesCap];
+    // Per-source Σ-confidence aligned with calib_ids — the same inverse-covariance scalar
+    // used as the fusion weight (PRE clamp/prior, the raw confidence). Fed into both
+    // calibrators' observe() so the D5 vote_weight Confidence/Combo modes can weight each
+    // vote by how trustworthy the source's window is.
+    Scalar   calib_conf[kMaxSourcesCap];
 
     // Per-source time-offset commit state (DESIGN §2/§6). A source's offset is COMMITTED
     // (driving fusion) once its histogram concentration clears commit_concentration AND
@@ -388,16 +393,19 @@ Status Estimator::step(Timestamp now) {
         const SE3 A  = se3::compose(se3::compose(X, B_corr), se3::inverse(X));
 
         // Weight = prior x Sigma-confidence, clamped to [floor, cap].
-        Scalar w = s.weight_prior[i] * sigma_confidence(d.cov);
+        const Scalar sigma_conf = sigma_confidence(d.cov);
+        Scalar w = s.weight_prior[i] * sigma_conf;
         w = std::max(cfg.weight_floor, std::min(cfg.weight_cap, w));
 
         s.aligned[n] = A;
         s.weights[n] = w;
         // Capture the de-scaled reported sensor-frame delta for the Phase-1 calibrator
         // (direction -> yaw/pitch + magnitude ratio -> scale; D11/D20). The magnitude
-        // ratio off the DE-SCALED B recovers the RESIDUAL scale vs the prior.
+        // ratio off the DE-SCALED B recovers the RESIDUAL scale vs the prior. Also carry
+        // the raw Σ-confidence (D5 vote_weight Confidence/Combo) aligned by slot.
         s.calib_ids[n]      = src->id();
         s.calib_reported[n] = B_corr;
+        s.calib_conf[n]     = sigma_conf;
         h.weight     = w;
         ++n;
     }
@@ -442,7 +450,8 @@ Status Estimator::step(Timestamp now) {
     // fusion in Slice 6 — it only populates CalibSnapshot below.
     const Vec3 fused_omega = so3::log(med.value.R) / dt;
     const Vec3 fused_trans = med.value.t;
-    s.calib1.observe(n, s.calib_ids, s.calib_reported, fused_omega, fused_trans);
+    s.calib1.observe(n, s.calib_ids, s.calib_reported, fused_omega, fused_trans,
+                     s.calib_conf);
 
     // ---- Phase-2 calibration stage (Slice 7, D5/D10/D21) -------------------------
     // Drive the TURN-gated hand-eye calibrator (A·X = X·B) with the fused consensus motion
@@ -455,7 +464,8 @@ Status Estimator::step(Timestamp now) {
     for (int i = 0; i < n; ++i) {
         s.calib2.set_yaw_pitch(s.calib_ids[i], s.calib1.extrinsic(s.calib_ids[i]).R);
     }
-    s.calib2.observe(n, s.calib_ids, s.calib_reported, med.value, fused_omega);
+    s.calib2.observe(n, s.calib_ids, s.calib_reported, med.value, fused_omega,
+                     s.calib_conf);
 
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
     // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED

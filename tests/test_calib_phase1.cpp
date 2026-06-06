@@ -524,3 +524,59 @@ TEST_CASE("phase1 determinism: identical input -> identical estimate") {
     REQUIRE(a.size() == b.size());
     for (std::size_t i = 0; i < a.size(); ++i) CHECK(a[i] == b[i]);
 }
+
+// ===========================================================================
+// Vote weight (D5): the configured mode changes the effective vote mass in Phase 1 too.
+// Under `Confidence`, fewer high-confidence votes outweigh many low-confidence ones.
+// ===========================================================================
+TEST_CASE("phase1 vote_weight: Confidence lets high-confidence votes dominate the mode") {
+    // Drive observe() directly with two competing forward-direction regimes for one source:
+    //   - direction dA (small +y tilt) for MANY steps at LOW confidence, then
+    //   - direction dB (small -y tilt) for FEWER steps at HIGH confidence.
+    // The straight gate passes (omega 0; sizable forward translation). The per-source
+    // confidence array carries the Σ-confidence the D5 Confidence/Combo modes weight by.
+    //   * One:        all votes weigh 1 -> the more-numerous dA wins the recovered axis.
+    //   * Confidence: votes weigh the confidence -> the high-confidence dB wins, despite
+    //                 fewer steps. The recovered forward axis flips -> the weight is honored.
+    Vec3 dA(0.999, 0.045, 0.0); dA.normalize();      // mostly +x, slight +y
+    Vec3 dB(0.999, -0.045, 0.0); dB.normalize();     // mostly +x, slight -y
+
+    auto run = [&](VoteWeight mode) {
+        auto calp = make_calib(); Phase1Calibrator& cal = *calp;
+        Config c = make_cfg();
+        c.vote_weight = mode;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}, true) == Status::Ok);
+
+        SourceId ids[1] = {1};
+        SE3 rep[1];
+        rep[0].R = Mat3::Identity();
+        const Vec3 fused_trans(0.1, 0, 0);
+        const Vec3 fused_omega(0, 0, 0);
+        // dA regime: MANY steps, LOW confidence.
+        Scalar conf_lo[1] = {0.1};
+        for (int k = 0; k < 60; ++k) {
+            rep[0].t = dA * Scalar(0.1);
+            REQUIRE(cal.observe(1, ids, rep, fused_omega, fused_trans, conf_lo)
+                        == Status::Ok);
+        }
+        // dB regime: FEWER steps, HIGH confidence.
+        Scalar conf_hi[1] = {1.0};
+        for (int k = 0; k < 20; ++k) {
+            rep[0].t = dB * Scalar(0.1);
+            REQUIRE(cal.observe(1, ids, rep, fused_omega, fused_trans, conf_hi)
+                        == Status::Ok);
+        }
+        return cal.forward_axis(1).y();      // sign of the recovered y-tilt distinguishes A/B
+    };
+
+    const Scalar y_one  = run(VoteWeight::One);
+    const Scalar y_conf = run(VoteWeight::Confidence);
+
+    // One: the more-numerous dA (+y) wins -> recovered y > 0.
+    CHECK(y_one > 0.01);
+    // Confidence: dB's high-confidence mass (20*1.0=20 vs 60*0.1=6) wins -> recovered y < 0.
+    CHECK(y_conf < -0.01);
+    // The recovered axis genuinely flipped -> the weight changed the effective vote mass.
+    CHECK(y_one * y_conf < 0.0);
+}
