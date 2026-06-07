@@ -215,6 +215,9 @@ struct Estimator::Impl {
             case Phase::Warmup:   result.readiness = Scalar(0.25); break;
             case Phase::Degraded: result.readiness = Scalar(0.6);  break;
             case Phase::Nominal:  result.readiness = Scalar(1.0);  break;
+            // Keep the phase->readiness map TOTAL: a future Phase value falls back to a
+            // safe "not ready" readiness rather than silently keeping the last value.
+            default:              result.readiness = Scalar(0.0);  break;
         }
     }
 

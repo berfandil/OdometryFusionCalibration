@@ -114,7 +114,7 @@ TEST_CASE("lifecycle: INIT exposed right after init (before any step)") {
 // A non-causal/too-early interval (now so small that t1 <= q0, or no buffered
 // data covers the window) keeps the estimator in WARMUP / NotReady.
 // ---------------------------------------------------------------------------
-TEST_CASE("lifecycle: WARMUP before the first fuse (degenerate interval)") {
+TEST_CASE("lifecycle: WARMUP before the first fuse (no covering source)") {
     const int N = 3;
     SensorConfig sensors[3];
     for (int i = 0; i < N; ++i) sensors[i].id = static_cast<SourceId>(i);
@@ -143,31 +143,50 @@ TEST_CASE("lifecycle: WARMUP before the first fuse (degenerate interval)") {
 }
 
 // ---------------------------------------------------------------------------
-// WARMUP via a strictly non-causal interval (t1 <= q0).
-// With window_s very small and a large delay, an early `now` makes t1 <= q0.
+// DEGRADED via the degenerate-interval guard (t1 <= q0) AFTER a fuse.
+// On the FIRST fuse t1 <= q0 is algebraically impossible (q0 = t1 - window_s,
+// window_s > 0), so the guard is only reachable in steady state with a
+// non-advancing / backward clock: fuse once (last_t1 := t1, ever_fused_ latches),
+// then step with the SAME now so the new t1 == the prior frontier last_t1 == q0.
+// That hits the `t1 <= q0` early-return -> NotReady + DEGRADED (ever_fused) +
+// tip invalid. This is the only path that pins the degenerate-interval transition.
 // ---------------------------------------------------------------------------
-TEST_CASE("lifecycle: WARMUP on a non-causal interval (t1 <= q0)") {
-    const int N = 1;
-    SensorConfig sensors[1];
-    sensors[0].id = 0;
-    sensors[0].is_reference = true;
+TEST_CASE("lifecycle: DEGRADED on a non-causal interval (t1 <= q0) after a fuse") {
+    const int N = 3;
+    SensorConfig sensors[3];
+    for (int i = 0; i < N; ++i) sensors[i].id = static_cast<SourceId>(i);
     Config cfg = base_config(N);
-    cfg.reference_sensor_id = 0;
     cfg.sensors = sensors;
     cfg.sensor_count = N;
 
-    std::unique_ptr<BufferSource> src(new BufferSource(0, OdomForm::Twist, 4096));
-    fill_gt(*src, 3.0, 200.0, SE3{});
+    std::vector<std::unique_ptr<BufferSource>> srcs;
+    for (int i = 0; i < N; ++i)
+        srcs.emplace_back(new BufferSource(static_cast<SourceId>(i),
+                                           OdomForm::Twist, 4096));
+    for (auto& s : srcs) fill_gt(*s, 3.0, 200.0, SE3{});
 
     Estimator est;
     REQUIRE(est.init(cfg) == Status::Ok);
-    REQUIRE(est.add_source(src.get()) == Status::Ok);
+    for (auto& s : srcs) REQUIRE(est.add_source(s.get()) == Status::Ok);
 
-    // now - delay = t1; q0 = t1 - window (first fuse, no prior frontier). With
-    // now = 0 the whole interval is negative; the buffer never covers it.
-    const Status st = est.step(secs(0.0));
+    // First fuse: advances last_t1 to t1 and latches ever_fused_.
+    const double now0 = cfg.fusion_delay_s + cfg.window_s;
+    REQUIRE(est.step(secs(now0)) == Status::Ok);
+    REQUIRE(est.latest().phase == Phase::Nominal);   // 3 sources -> NOMINAL
+
+    // Step AGAIN with the SAME now: the new t1 = now0 - delay equals the prior
+    // frontier last_t1 (== q0), so t1 <= q0 -> the degenerate-interval guard fires
+    // BEFORE any source query. ever_fused_ is true -> DEGRADED (not WARMUP).
+    const Status st = est.step(secs(now0));
     CHECK(st == Status::NotReady);
-    CHECK(est.latest().phase == Phase::Warmup);
+    CHECK(est.latest().phase == Phase::Degraded);
+    CHECK(est.latest().readiness == doctest::Approx(0.6));
+    CHECK_FALSE(est.latest().tip_valid);
+
+    // An EARLIER now (backward clock) is equally degenerate: t1 < q0.
+    const Status st_back = est.step(secs(now0 - 0.5 * cfg.window_s));
+    CHECK(st_back == Status::NotReady);
+    CHECK(est.latest().phase == Phase::Degraded);
     CHECK_FALSE(est.latest().tip_valid);
 }
 
@@ -289,22 +308,25 @@ TEST_CASE("lifecycle: graceful downgrade NOMINAL -> DEGRADED on source loss") {
 
     // Phase B: step past the short sources' end-of-data. Once they stop covering
     // the window, only source 0 covers (n == 1 < min_sources_warn) -> downgrade
-    // to DEGRADED, but still Ok with a fresh frontier. Early Phase-B steps may
-    // still have all three covered (Nominal); the downgrade must HAPPEN and once
-    // downgraded every remaining Ok step that fuses fewer sources stays Degraded.
-    // Capture the last good frontier so we can prove it is retained when ALL drop.
+    // to DEGRADED, but still Ok with a fresh frontier. Pin the downgrade TRIGGER:
+    // on every Ok step the phase must be exactly NOMINAL iff the number of covered
+    // sources (health[i].in_window — all participate under MedianFromStart) is
+    // >= min_sources_warn, else DEGRADED. This couples the phase to the moment n
+    // drops below the warn threshold, not merely "Nominal-or-Degraded".
     State last_good_frontier{};
     bool saw_degraded_ok = false;
     while (now_s <= 0.8) {
         const Status st = est.step(secs(now_s));
         if (st == Status::Ok) {
-            // Phase is Nominal while all three still cover, Degraded once the two
-            // short sources fall out of the window. Both are valid Ok states; we
-            // only require that the downgrade to Degraded is reached.
-            const Phase p = est.latest().phase;
-            CHECK((p == Phase::Nominal || p == Phase::Degraded));
-            if (p == Phase::Degraded) saw_degraded_ok = true;
-            last_good_frontier = est.latest().frontier;
+            const Result& r = est.latest();
+            int covered = 0;
+            for (int i = 0; i < r.source_count; ++i)
+                if (r.health[i].in_window) ++covered;
+            const Phase expected = (covered >= cfg.min_sources_warn)
+                                       ? Phase::Nominal : Phase::Degraded;
+            CHECK(r.phase == expected);              // phase tracks n vs warn exactly
+            if (r.phase == Phase::Degraded) saw_degraded_ok = true;
+            last_good_frontier = r.frontier;
         }
         now_s += cfg.window_s;
     }
@@ -345,18 +367,28 @@ TEST_CASE("lifecycle: first fused frontier pose is anchored at identity") {
     REQUIRE(est.init(cfg) == Status::Ok);
     for (auto& s : srcs) REQUIRE(est.add_source(s.get()) == Status::Ok);
 
-    // First fuse: pose starts at identity (predict integrates ONE window's
-    // motion from the identity anchor). Rotation is exactly identity over the
-    // straight segment; translation is the first window's forward displacement.
-    const double now0 = cfg.fusion_delay_s + cfg.window_s;
+    // First fuse: pose starts at identity (predict integrates ONE window's motion
+    // from the identity anchor). On the first fuse q0 = t1 - window_s ALWAYS, so
+    // the integrated interval is EXACTLY one window [t1 - window_s, t1] regardless
+    // of how far past zero t1 sits. Over a 2 m/s straight segment the anchored
+    // displacement is therefore EXACTLY 2.0 * window_s. An integrator pre-integrating
+    // from t=0 would instead accumulate t1's worth of motion (2.0 * t1). We pick a
+    // first tick with t1 distinctly larger than window_s (t1 = 0.40 s vs window_s =
+    // 0.10 s) so the two predictions DIFFER (0.20 m vs 0.80 m): the equality below is
+    // now a genuine discriminator, not a coincidence of t1 == window_s.
+    const double now0 = cfg.fusion_delay_s + 0.40;     // t1 = 0.40 s > window_s
+    const Timestamp t1 = secs(now0) - secs(cfg.fusion_delay_s);
     REQUIRE(est.step(secs(now0)) == Status::Ok);
     const State& f = est.latest().frontier;
     // Anchored at identity: the ROTATION is (near-)identity over the straight
     // bootstrap window (no yaw before t=1.0 s) — proves the eskf.init(SE3{}).
     CHECK(close(f.pose.R, Mat3::Identity(), 1e-6));
-    // The translation is bounded by one window of forward motion (2 m/s * span),
-    // i.e. the pose did NOT start pre-integrated from t=0.
-    CHECK(f.pose.t.norm() < 2.0 * (cfg.window_s + cfg.fusion_delay_s) + 0.05);
+    // The published frontier stamp is the REAL frontier t1 (not now, not 0).
+    CHECK(f.stamp == t1);
+    // The displacement is EXACTLY one window of forward motion (2 m/s * window_s =
+    // 0.20 m), an equality within a tight tol — NOT the 2.0*t1 = 0.80 m a from-zero
+    // integrator would produce. This pins the gauge anchor at the first fused tick.
+    CHECK(f.pose.t.norm() == doctest::Approx(2.0 * cfg.window_s).epsilon(0.02));
 }
 
 // ---------------------------------------------------------------------------
