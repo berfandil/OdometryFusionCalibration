@@ -96,12 +96,23 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: sim with absolute fixes removes pose drift (✓ 0.58→0.20 m tail error); a gross outlier fix is Mahalanobis-rejected (✓ NIS ~3e5).
 **Deps**: Slice 2.
 
-## Slice 11b — Per-source bias states + GPS adapter  `[ ]`
+## Slice 11b — Per-source bias states + GPS adapter  `[ ]` (DEFERRED — design recorded below; revisit after the rest is done)
 **Goal**: classic loosely-coupled GPS/INS drift removal via online bias estimation.
 - Optional per-source bias states (augment the fixed core state; `SensorConfig::bias_states` is a no-op today); absolute-ref updates observe/remove the bias through filter cross-covariance (D22).
 - Concrete GPS adapter (in `adapters/`, Slice 13 territory).
+- Per-DOF Mahalanobis gate: `mahalanobis_chi2` should become a per-`n` χ² quantile when a 6-DOF/mixed `ICorrection` plugin lands (a 6-entry const table indexed by `Measurement::dim`).
 **Done when**: with `bias_states` on, a raw-IMU source's bias is observed and removed in sim.
-**Deps**: Slice 11. **Note**: gate single-scalar `mahalanobis_chi2` should become a per-DOF chi² quantile when a 6-DOF/mixed plugin lands.
+**Deps**: Slice 11.
+
+### DESIGN NOTE (deferred 2026-06-07 — decide A vs B when revisiting)
+**The hard part / why deferred.** D22 motivates bias states by *classic loosely-coupled GPS/INS*: the biased sensor **drives the predict**, so an absolute-ref (GPS) correction of the pose observes the accumulated bias through the **pose↔bias cross-covariance** that the predict builds up. But this architecture's predict is driven by the **geometric median of N frame-aligned source deltas**, not by one sensor — so a single source's bias only reaches the pose through its (robust, nonlinear, weight-dependent) contribution to the median. The cross-covariance that makes the bias observable therefore does **not** form the classic way; how the bias couples into the median-driven predict is the open modeling question. Two candidate approaches were identified (both promising — pick one when revisiting):
+
+- **Option A — clean-regime augmented filter (lower risk).** Augment the ESKF state to `[pose(6); twist(6); bias_i(d_i)...]` with a dense augmented covariance (fixed-size, compile-time cap on total bias DOF). Implement the classic mechanism — predict random-walks each bias and builds the pose↔bias cross-covariance; the absolute-ref `update()` removes it — **only for the regime where it is exact**: a *single driving source* (e.g. `ColdStart::ReferenceOnly` dead-reckon, or a 1–2 source rig), where that source's delta IS the predict so the GPS/INS structure holds. Deliver a sim test (a raw-IMU-like biased source + GPS fixes → bias observed & removed) and **document** that N-source-median bias coupling is deferred. Correct + testable + bounded; marks 11b `[~]`.
+- **Option B — full median-coupled bias (higher risk).** Model the bias→pose coupling through each source's **median weight** in the augmented predict `F` (the Jacobian block from bias_i to the pose-error is ∝ that source's effective weight in the Weiszfeld solution), so the bias is observable with N sources in the median. Most faithful to D22's general case, but the coupling Jacobian through the robust median is subtle and is exactly where an implementation would silently go wrong — needs careful derivation + observability self-tests; not a one-cycle drop-in.
+
+**State sizing.** Augmented dim = `12 + Σ d_i` over sources with `bias_states=true`. Worst case (all 32 sources, 6-DOF IMU bias) = 12+192 = 204 → a fixed `Mat<204>` is large but strict-core-legal (allocate once); realistically `bias_states` is on for ≤1–2 sources, so a compile-time cap on total bias DOF (e.g. `kMaxBiasDof`) sized for the expected use keeps the augmented `P` small. Bias is off by default (core stays bias-free + agnostic).
+
+**Recommendation when revisiting**: land **A** first (the genuine GPS/INS win in the clean regime, low risk), then evaluate whether **B** (the N-source coupling) is worth the modeling effort for the target automotive rigs.
 
 ## Slice 12 — Persistence (warm restart)  `[x]`
 **Goal**: serialize/deserialize calibration state; survive crashes.

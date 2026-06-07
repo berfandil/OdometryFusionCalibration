@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: ctest 2/2 — `unit` 195 cases / 8274 assertions + `adapters` 20 cases / 319 assertions.** 56 commits on `main`, working tree clean. Remote synced through Slice 13; the init-P-fix commits are local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
+- **Gate green: ctest 2/2 — `unit` 195 cases / 8274 assertions + `adapters` 20 cases / 319 assertions.** 57 commits on `main`, working tree clean. Remote synced through the init-P fix (`7c1592c`); the 11b-deferral doc commit is local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
 - **Done (all green):**
 
 | Unit | What |
@@ -106,10 +106,15 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - **Slice-10 smoother scope**: a single shared `TwistSmoother` uses the MAX `kf_process_noise` over enabled sources (not per-source `q`/`r`; `r` fixed 1.0). The refined RTS covariance is computed + exposed but NOT wired into the calibrator vote weight (the deeper path still feeds the raw Σ-confidence) — D18's "refined Σ" is half-wired. Fixed ~7.5 MB footprint (compile-time caps 32×65, paid even when off). The lag `L` is a step count via the nominal tick rate → off-cadence pumping gives an effective time-lag ≠ `calib_lag_s` (rings stay step-aligned regardless). Per-source dropout degrades to a variance loss (no bias) after the push-seq alignment fix.
 - **Slice-12 persistence scope**: histogram BINS are not persisted — restore re-anchors the calibrators to the committed values + holds them via hysteresis (an `offset_restored` latch does the same for the time-offset DOF), so a restored DOF's `committed` flag + value are correct immediately but its confidence reads low until the histogram re-fills. `config_hash` covers rig shape + per-sensor priors/flags + histogram configs + commit/gate thresholds + `phase2_strategy`/`calib_lag_s` (runtime knobs excluded).
 - **Slice-13 adapters scope**: relaxed-edge only (std/heap/exceptions/threads/file IO). The ROS node is a compile-guarded header sketch (not built — no ROS on the dev box) → **13b**. The file-persistence adapter uses `flush`/`close`, NOT `fsync` — an OS-page-cache power-loss window remains even with the crash-safe target selection (durable `fsync` → **13b**). The config loader covers a documented knob SUBSET (not every `Config` field). Adapters are off by default (`OFC_BUILD_ADAPTERS=OFF`); the gate turns them on.
-- Not yet built: per-source bias states + GPS adapter (11b), ROS node + durable fsync (13b). Partial: validation (14) — NEES/NIS/golden done + init-P covariance fix DONE (`70c7d38`); remaining = the CONFIG "tuned"-placeholder sweep + (for strict NEES consistency) a distance-aware covariance model / no-ref correction.
+- Not yet built: per-source bias states + GPS adapter (**11b — deferred, design A/B recorded in ISSUES 11b**), ROS node + durable fsync (13b). Partial: validation (14) — NEES/NIS/golden done + init-P covariance fix DONE (`70c7d38`); remaining = the CONFIG "tuned"-placeholder sweep + (for strict NEES consistency) a distance-aware covariance model / no-ref correction.
 
 ---
 
 ## 7. Resume in one line
 
-All numbered roadmap slices (0–14) are addressed and the init-P covariance fix has landed. Remaining work is the carve-outs + polish: **11b** (per-source bias states + GPS adapter + per-DOF Mahalanobis gate), **13b** (real ROS node + durable fsync), the **Slice-14 CONFIG "tuned"-placeholder sweep**, and — for strict no-ref NEES consistency — a **distance-aware covariance model** (or a no-ref correction) to counter the predict-only translation Ad-inflation. Pick one, author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
+All numbered roadmap slices (0–14) are addressed and the init-P covariance fix has landed. Remaining work is carve-outs + polish:
+- **11b** (per-source bias states + GPS adapter + per-DOF Mahalanobis gate) — **DEFERRED with a design note** (`ISSUES.md` → Slice 11b DESIGN NOTE; DECISIONS D22): the open decision is **A** (clean-regime augmented filter, low risk) vs **B** (full median-coupled bias) — the user wants to revisit + decide after the rest is done (recommendation: A first).
+- **13b** (real ROS node + bag round-trip + durable `fsync`) — env-blocked (no ROS on the dev box).
+- **Slice-14 CONFIG "tuned"-placeholder sweep**.
+- **distance-aware covariance model** (or a no-ref correction) for strict no-ref NEES consistency (counters the predict-only translation Ad-inflation).
+Pick one, author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
