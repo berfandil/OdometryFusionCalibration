@@ -24,6 +24,7 @@ add_executable(ofc_tests
     test_sim.cpp
     test_validation.cpp
     test_correction.cpp
+    test_persistence.cpp
 )
 target_link_libraries(ofc_tests PRIVATE ofc_core ofc_sim doctest::doctest)
 set_target_properties(ofc_tests PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)

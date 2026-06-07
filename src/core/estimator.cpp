@@ -46,6 +46,7 @@
 #include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
+#include "ofc/core/persistence.hpp"
 #include "ofc/core/smoother.hpp"
 #include "ofc/core/timesync.hpp"
 
@@ -120,6 +121,100 @@ bool commit_gate_reanchor(bool prev_committed, Scalar confidence, Scalar votes,
     }
     return confidence >= commit_concentration &&
            votes >= static_cast<Scalar>(commit_min_votes);
+}
+
+// ----- Warm-restart persistence (Slice 12, D23) -------------------------------------------
+// CONFIG-HASH GUARD. A deterministic FNV-1a (64-bit) over the RIG-DEFINING config fields, so
+// the SAME rig yields the SAME hash and ANY rig change yields a different one. The blob stores
+// the hash from the run that wrote it; deserialize recomputes it from the CURRENTLY-bound
+// config and rejects a mismatch (InvalidConfig) — a changed rig (a moved sensor, a new
+// reference, a re-sized buffer, a re-tuned gate/histogram) never restores stale calibration.
+//
+// COVERED (the signature DESIGN §7 / D23 calls for): the global rig shape (max_sources,
+// reference_sensor_id, buffer_capacity), each sensor's full identity + priors + flags (id,
+// prior_extrinsic, prior_scale, prior_time_offset_s, weight_prior, and the per-sensor bool
+// flags), the 5 histogram configs, and the commit/gate thresholds that shape how calibration
+// converges. We feed the SAME explicit-byte encoding the blob payload uses (Writer) so the
+// hash is padding-free + endian-explicit + stable, then hash the written bytes. We do NOT
+// cover purely-runtime knobs that don't change what a persisted calibration MEANS (tick rate,
+// fusion delay, output flags) — they don't invalidate a committed extrinsic/scale/offset.
+void hash_histogram(persist::Writer& w, const HistogramConfig& h) {
+    w.put_i32(h.bins);
+    w.put_f64(h.range_min);
+    w.put_f64(h.range_max);
+    w.put_bool(h.circular);
+    w.put_i32(static_cast<std::int32_t>(h.aging));
+    w.put_f64(h.decay_gamma);
+    w.put_i32(h.sliding_k);
+    w.put_bool(h.vote_split);
+    w.put_bool(h.subbin);
+}
+
+std::uint64_t config_hash(const Config& cfg) {
+    // A generous fixed scratch buffer: 9 floats/ints of global shape + per-sensor records
+    // (each ~12 SE3 doubles + scalars + flags) for up to 32 sensors + 5 histograms. 8 KiB is
+    // far more than enough and is a plain stack buffer (strict core: bounded, no heap).
+    unsigned char scratch[8192];
+    persist::Writer w(scratch, static_cast<int>(sizeof(scratch)));
+
+    // Global rig shape.
+    w.put_i32(cfg.max_sources);
+    w.put_i32(static_cast<std::int32_t>(cfg.reference_sensor_id));
+    w.put_i32(cfg.buffer_capacity);
+    w.put_i32(cfg.min_sources_warn);
+    w.put_i32(static_cast<std::int32_t>(cfg.cold_start));
+
+    // Commit / gate thresholds (they shape what "committed" means).
+    w.put_f64(cfg.commit_concentration);
+    w.put_i32(cfg.commit_min_votes);
+    w.put_f64(cfg.commit_drop);
+    w.put_i32(static_cast<std::int32_t>(cfg.vote_weight));
+    w.put_f64(cfg.straight_omega_max);
+    w.put_f64(cfg.straight_trans_min);
+    w.put_f64(cfg.turn_omega_min);
+    w.put_bool(cfg.reverse_fold);
+    w.put_bool(cfg.ref_cross_check);
+    w.put_i32(static_cast<std::int32_t>(cfg.phase2_strategy));
+    w.put_bool(cfg.timesync_enabled);
+    w.put_i32(static_cast<std::int32_t>(cfg.match_metric));
+    w.put_f64(cfg.max_lag_s);
+
+    // Histogram configs (the per-quantity vote spaces).
+    hash_histogram(w, cfg.so3_hist);
+    hash_histogram(w, cfg.roll_hist);
+    hash_histogram(w, cfg.xyz_hist);
+    hash_histogram(w, cfg.scale_hist);
+    hash_histogram(w, cfg.offset_hist);
+
+    // Per-sensor records (bounded by sensor_count <= max_sources <= cap).
+    w.put_i32(cfg.sensor_count);
+    if (cfg.sensors != nullptr) {
+        const int nsens = (cfg.sensor_count < kMaxSourcesCap) ? cfg.sensor_count
+                                                              : kMaxSourcesCap;
+        for (int i = 0; i < nsens; ++i) {
+            const SensorConfig& sc = cfg.sensors[i];
+            w.put_i32(static_cast<std::int32_t>(sc.id));
+            w.put_se3(sc.prior_extrinsic);
+            w.put_f64(sc.prior_scale);
+            w.put_f64(sc.prior_time_offset_s);
+            w.put_f64(sc.weight_prior);
+            w.put_f64(sc.modeled_noise_per_m);
+            w.put_f64(sc.modeled_noise_per_rad);
+            w.put_f64(sc.kf_process_noise);
+            w.put_bool(sc.native_confidence);
+            w.put_bool(sc.per_sensor_kf);
+            w.put_bool(sc.scale_calib);
+            w.put_bool(sc.bias_states);
+            w.put_bool(sc.is_reference);
+        }
+    }
+    // On the (astronomically unlikely) scratch overflow, fold the overflow flag into the hash
+    // so two configs that both overflow at different points cannot silently collide on the
+    // truncated prefix — keeps the guard conservative.
+    const int n = w.overflow ? static_cast<int>(sizeof(scratch)) : w.pos;
+    std::uint64_t h = persist::fnv1a64(scratch, n);
+    if (w.overflow) h ^= 0x9E3779B97F4A7C15ull;
+    return h;
 }
 } // namespace
 
@@ -1198,16 +1293,237 @@ Status Estimator::step(Timestamp now) {
 
 const Result& Estimator::latest() const { return impl_->result; }
 
+// ---- Warm-restart persistence (Slice 12, D23) ------------------------------------------
+// serialize()/deserialize() of the COMMITTED CALIBRATION STATE into a caller-owned FIXED
+// buffer, versioned + checksummed + config-hash-guarded, so a fresh estimator with the SAME
+// config restores it and resumes NEAR-NOMINAL (DESIGN §7). File I/O + the double-buffer
+// ping-pong are RELAXED-EDGE (an adapter / the tests), built on these core primitives.
+//
+// HISTOGRAM BINS ARE NOT PERSISTED — the RE-ANCHOR-AND-REFILL approach (the brief's documented
+// alternative). The required restore state is the committed VALUES (priors that have absorbed
+// the committed extrinsic/scale/offset) + the per-DOF commit FLAGS + the reliability EMA +
+// the lifecycle. On deserialize we RE-ANCHOR calib1/calib2 to the restored priors
+// (set_prior/set_basepoint + reset the histograms) so calibration resumes around the CORRECT
+// basepoint and re-concentrates from scratch — while the restored commit flags drive
+// apply_calib_feedback()'s commit_gate_reanchor(prev=true) RE-FILL HYSTERESIS, which HOLDS the
+// restored-committed DOFs committed through the (sparse, refilling) histogram. So fusion uses
+// the restored priors IMMEDIATELY (= near-NOMINAL) without re-bootstrapping from the config
+// prior, and the histograms refill in the background. Persisting bins would resume the
+// confidence too, but at a large blob cost (so3 3×256 + roll 360 + xyz 3×256 + scale 256 +
+// offset 256 bins PER SOURCE); the re-anchor path is the AUTOSAR-lean choice and is what the
+// near-NOMINAL test asserts (committed flags restored + fused error ≈ the converged run).
+//
+// PAYLOAD SCHEMA (little-endian, padding-free — see persistence.hpp for the framing):
+//   int32  source_count
+//   int32  phase          (Phase as int)
+//   uint8  ever_fused
+//   per source i in [0, source_count):
+//     int32  id
+//     SE3    prior_extrinsic           (9 R doubles + 3 t doubles)
+//     f64    prior_scale
+//     f64    effective_time_offset_s   (the committed offset value, folded into the prior on
+//                                        restore — the offset DOF's re-anchor: see below)
+//     uint8  ext_committed, roll_committed, lever_committed, scale_committed, offset_committed
+//     f64    resid_mean, resid_var, reliability
+//     int32  resid_n
 Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
     if (impl_ == nullptr || !impl_->inited) return Status::NotInitialized;
-    (void)buf; (void)cap;
-    return Status::NoData;   // TODO Slice 12
+    if (buf == nullptr || cap < 0)          return Status::CapacityExceeded;
+    const Impl& s = *impl_;
+
+    // (1) Build the payload first into a temporary stack region so we know payload_len + can
+    // checksum header+payload together. The payload is bounded by source_count records; a 4
+    // KiB stack buffer covers the 32-source cap (each record ≈ 130 bytes). Strict core.
+    unsigned char payload[4096];
+    persist::Writer pw(payload, static_cast<int>(sizeof(payload)));
+    pw.put_i32(s.source_count);
+    pw.put_i32(static_cast<std::int32_t>(s.phase_));
+    pw.put_bool(s.ever_fused_);
+    for (int i = 0; i < s.source_count; ++i) {
+        const SourceId id = (s.sources[i] != nullptr) ? s.sources[i]->id()
+                                                      : static_cast<SourceId>(0);
+        pw.put_i32(static_cast<std::int32_t>(id));
+        pw.put_se3(s.prior_extrinsic[i]);
+        pw.put_f64(s.prior_scale[i]);
+        // The offset DOF re-anchor: store the EFFECTIVE offset (the committed time-sync value
+        // when committed, else the prior). On restore it is folded into prior_time_offset so
+        // the restored estimator applies it immediately (the time-sync histogram is empty
+        // post-restore, so the committed flag would otherwise read the value as 0 until refill).
+        pw.put_f64(s.effective_offset(i));
+        pw.put_bool(s.ext_committed[i]);
+        pw.put_bool(s.roll_committed[i]);
+        pw.put_bool(s.lever_committed[i]);
+        pw.put_bool(s.scale_committed[i]);
+        pw.put_bool(s.offset_committed[i]);
+        pw.put_f64(s.resid_mean[i]);
+        pw.put_f64(s.resid_var[i]);
+        pw.put_f64(s.reliability[i]);
+        pw.put_i32(s.resid_n[i]);
+    }
+    if (pw.overflow) return Status::CapacityExceeded;   // (can't happen at the 32-source cap)
+    const int payload_len = pw.pos;
+
+    // (2) Write header + payload + trailing checksum into the caller's buffer.
+    persist::Writer w(buf, cap);
+    w.put_bytes(persist::kMagic, 4);
+    w.put_u32(persist::kFormatVersion);
+    w.put_u64(config_hash(s.cfg));
+    w.put_u32(static_cast<std::uint32_t>(payload_len));
+    w.put_bytes(payload, payload_len);
+    if (w.overflow) return Status::CapacityExceeded;     // buffer too small for the blob
+    // Checksum over everything written so far (header + payload) — detects a single flipped
+    // byte anywhere on read.
+    const std::uint32_t checksum = persist::fnv1a32(buf, w.pos);
+    w.put_u32(checksum);
+    if (w.overflow) return Status::CapacityExceeded;
+
+    return Expected<int>(w.pos);   // total bytes written
 }
 
 Status Estimator::deserialize(const unsigned char* buf, int len) {
     if (impl_ == nullptr || !impl_->inited) return Status::NotInitialized;
-    (void)buf; (void)len;
-    return Status::NoData;   // TODO Slice 12 (incl. config-hash guard)
+    if (buf == nullptr || len < 0)          return Status::CorruptData;
+    Impl& s = *impl_;
+
+    // (1) Validate the framing: magic -> version -> checksum -> config-hash, each rejecting
+    // before any state is touched (a rejected blob leaves the estimator untouched).
+    persist::Reader r(buf, len);
+    unsigned char magic[4] = {0,0,0,0};
+    r.get_bytes(magic, 4);
+    if (r.underflow) return Status::CorruptData;            // too short for even the magic
+    for (int i = 0; i < 4; ++i) {
+        if (magic[i] != persist::kMagic[i]) return Status::CorruptData;   // not our blob
+    }
+    const std::uint32_t version = r.get_u32();
+    if (version != persist::kFormatVersion) return Status::VersionMismatch;
+    const std::uint64_t stored_hash = r.get_u64();
+    const std::uint32_t payload_len = r.get_u32();
+    if (r.underflow) return Status::CorruptData;
+    // The blob must hold exactly: header (4+4+8+4=20) + payload_len + checksum (4).
+    const int header_len = 20;
+    if (payload_len > static_cast<std::uint32_t>(0x40000000)) return Status::CorruptData; // sanity
+    const long long need = static_cast<long long>(header_len) +
+                           static_cast<long long>(payload_len) + 4;
+    if (static_cast<long long>(len) != need) return Status::CorruptData;   // truncated / extra
+    // Checksum over header+payload (everything before the trailing 4-byte checksum word).
+    const int covered = header_len + static_cast<int>(payload_len);
+    const std::uint32_t want = persist::fnv1a32(buf, covered);
+    persist::Reader cr(buf + covered, 4);
+    const std::uint32_t got = cr.get_u32();
+    if (got != want) return Status::CorruptData;            // a flipped byte anywhere
+    // CONFIG-HASH GUARD: the blob's rig signature must match the CURRENTLY-bound config — a
+    // changed rig (moved sensor / new reference / re-tuned gates) rejects stale calibration.
+    if (stored_hash != config_hash(s.cfg)) return Status::InvalidConfig;
+
+    // (2) All framing valid — parse the payload. Read into LOCALS first; only commit to Impl
+    // after the whole payload reads without underflow (atomic restore: a malformed payload
+    // that passed the checksum — practically impossible, but be defensive — never half-applies).
+    persist::Reader pr(buf + header_len, static_cast<int>(payload_len));
+    const std::int32_t stored_count = pr.get_i32();
+    const std::int32_t stored_phase = pr.get_i32();
+    const bool stored_ever_fused    = pr.get_bool();
+    if (stored_count < 0 || stored_count > kMaxSourcesCap) return Status::CorruptData;
+
+    struct Rec {
+        SourceId id;
+        SE3      prior_extrinsic;
+        Scalar   prior_scale;
+        Scalar   time_offset;
+        bool     ext_c, roll_c, lever_c, scale_c, offset_c;
+        Scalar   resid_mean, resid_var, reliability;
+        int      resid_n;
+    };
+    Rec recs[kMaxSourcesCap];
+    for (int i = 0; i < stored_count; ++i) {
+        Rec& rc = recs[i];
+        rc.id              = static_cast<SourceId>(pr.get_i32());
+        rc.prior_extrinsic = pr.get_se3();
+        rc.prior_scale     = pr.get_f64();
+        rc.time_offset     = pr.get_f64();
+        rc.ext_c           = pr.get_bool();
+        rc.roll_c          = pr.get_bool();
+        rc.lever_c         = pr.get_bool();
+        rc.scale_c         = pr.get_bool();
+        rc.offset_c        = pr.get_bool();
+        rc.resid_mean      = pr.get_f64();
+        rc.resid_var       = pr.get_f64();
+        rc.reliability     = pr.get_f64();
+        rc.resid_n         = pr.get_i32();
+    }
+    if (pr.underflow) return Status::CorruptData;          // payload shorter than schema
+
+    // (3) Restore INTO the init'd estimator. The estimator must already have the SAME sources
+    // registered (the config-hash matched, so the rig is identical); we restore each persisted
+    // record onto the registered slot whose id matches. A persisted source not currently
+    // registered is skipped (it cannot drive fusion); a registered source absent from the blob
+    // keeps its config prior (a cold DOF — correct, it simply was not committed when saved).
+    for (int j = 0; j < stored_count; ++j) {
+        const Rec& rc = recs[j];
+        int slot = -1;
+        for (int i = 0; i < s.source_count; ++i) {
+            if (s.sources[i] != nullptr && s.sources[i]->id() == rc.id) { slot = i; break; }
+        }
+        if (slot < 0) continue;   // persisted id not registered in this run — skip
+
+        // Restore the fusion priors (these already encode the committed extrinsic/scale; the
+        // offset value is folded into prior_time_offset — the offset DOF's re-anchor).
+        s.prior_extrinsic[slot]   = rc.prior_extrinsic;
+        s.prior_scale[slot]       = (rc.prior_scale > Scalar(0)) ? rc.prior_scale : Scalar(1);
+        s.prior_time_offset[slot] = rc.time_offset;
+        // Restore the per-DOF commit flags. The ext/roll/lever/scale flags drive
+        // apply_calib_feedback()'s commit_gate_reanchor(prev=true) RE-FILL HYSTERESIS, which
+        // holds them committed through the sparse refilling histogram (so fusion uses the
+        // restored priors immediately). offset_committed is recomputed by update_commit_state()
+        // (plain commit_gate) against the empty time-sync histogram, so it transiently reads
+        // false until votes re-accumulate — but the offset VALUE is already in
+        // prior_time_offset, so effective_offset() returns it regardless (near-NOMINAL offset).
+        s.ext_committed[slot]    = rc.ext_c;
+        s.roll_committed[slot]   = rc.roll_c;
+        s.lever_committed[slot]  = rc.lever_c;
+        s.scale_committed[slot]  = rc.scale_c;
+        s.offset_committed[slot] = rc.offset_c;
+        // Restore the variance-EMA reliability track (Slice 9) so the source's quality weight
+        // resumes rather than re-warming for kRelWarmup steps.
+        s.resid_mean[slot]  = rc.resid_mean;
+        s.resid_var[slot]   = (rc.resid_var >= Scalar(0)) ? rc.resid_var : Scalar(0);
+        s.reliability[slot] = rc.reliability;
+        s.resid_n[slot]     = (rc.resid_n >= 0) ? rc.resid_n : 0;
+
+        // RE-ANCHOR the calibrators to the restored priors so calibration resumes around the
+        // CORRECT basepoint and re-concentrates (the histograms were not persisted). This is
+        // exactly the Slice-8 commit re-anchor applied at restore: move the so(3)/lever/roll
+        // basepoint onto the restored extrinsic and drop the (absent) votes. The post-reset
+        // estimate falls back to the basepoint (= the restored committed value) until new votes
+        // land — so calib1/calib2 read the restored mount immediately.
+        const SE3& Xr = s.prior_extrinsic[slot];
+        s.calib1.set_basepoint(rc.id, Xr);
+        s.calib1.reset_so3(rc.id);
+        s.calib1.reset_scale(rc.id);
+        s.calib2.set_basepoint(rc.id, Xr);
+        s.calib2.reset_roll(rc.id);
+        s.calib2.reset_lever(rc.id);
+        // Keep Phase-2's roll basepoint (R_yp) tracking the restored yaw/pitch (calib2 composes
+        // roll on top of the R_yp it is fed each step; seed it from the restored extrinsic so a
+        // pre-first-step read is consistent).
+        s.calib2.set_yaw_pitch(rc.id, Xr.R);
+    }
+
+    // (4) Restore the lifecycle. ever_fused_ governs the WARMUP-vs-DEGRADED branch of an
+    // un-fusable step; phase_ + readiness are republished so latest() reflects the restored
+    // lifecycle even before the next step(). The phase is recomputed every step from the live
+    // fuse signals (Slice 3), so this is a sensible STARTING point, not a latch.
+    s.ever_fused_ = stored_ever_fused;
+    Phase ph = Phase::Init;
+    switch (stored_phase) {
+        case 0: ph = Phase::Init;     break;
+        case 1: ph = Phase::Warmup;   break;
+        case 2: ph = Phase::Degraded; break;
+        case 3: ph = Phase::Nominal;  break;
+        default: return Status::CorruptData;   // unknown phase enum value
+    }
+    s.publish_phase(ph);
+
+    return Status::Ok;
 }
 
 // --- validate() lives with the config it checks --------------------------

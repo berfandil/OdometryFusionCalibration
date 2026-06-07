@@ -17,6 +17,8 @@ enum class Status {
     NotReady,
     Unobservable,
     Rejected,        // e.g. Mahalanobis gate
+    CorruptData,     // persistence: bad magic / failed checksum (Slice 12)
+    VersionMismatch, // persistence: format_version != current (Slice 12)
 };
 
 constexpr bool ok(Status s) { return s == Status::Ok; }
