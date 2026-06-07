@@ -743,10 +743,16 @@ Status Estimator::step(Timestamp now) {
         const Scalar d = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
         h.residual = d;
 
-        // West's incremental EMA mean/variance of the per-source residual. resid_mean is
-        // the BIAS (systematic, routed to the calibrator); resid_var is the zero-mean
+        // West's incremental EMA mean/variance of the per-source residual. resid_mean is the
+        // BIAS diagnostic: it is the EMA mean of d (= split_distance), an UNSIGNED residual
+        // MAGNITUDE (>= 0) — "mean residual distance to consensus", NOT a signed per-DOF
+        // offset (a source biased high or low both read positive; even a zero-mean noisy
+        // source accrues positive bias). It is left for the calibrator to absorb via the
+        // existing Slice-6/7/8 observe path and is exposed for DIAGNOSTICS ONLY, NOT folded
+        // into the weight (D17 "bias → calibrator, not weight"). resid_var is the zero-mean
         // SCATTER around the running mean — a biased-but-consistent source has a large mean
-        // but a SMALL variance, so it is NOT penalized (the D17 split).
+        // but a SMALL variance, so it is NOT penalized; resid_var (not the mean) is what
+        // distinguishes noise from a systematic offset (the D17 split).
         if (s.resid_n[i] == 0) {
             s.resid_mean[i] = d;
             s.resid_var[i]  = Scalar(0);

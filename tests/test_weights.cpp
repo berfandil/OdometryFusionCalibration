@@ -239,10 +239,14 @@ TEST_CASE("weights noisy: a noisy source is downweighted but never collapses") {
 // calibration commits, its de-scaled translation is consistently too long — a systematic
 // residual). Assert:
 //   (a) its reliability stays HIGH (~ the clean sources', NOT floored) — the bias did NOT
-//       masquerade as unreliability;
+//       masquerade as unreliability. This is the assertion that DISCRIMINATES the D17 split:
+//       it fails if a constant bias were to inflate the variance and floor the biased
+//       source's reliability (a broken split). Carries the load.
 //   (b) its bias (resid_mean) is non-trivially larger than the clean sources' EARLY on;
 //   (c) its scale calibration converges toward the planted 1.2 — the bias was routed to (and
-//       acted on by) the calibrator, not masked by a collapsed weight.
+//       acted on by) the calibrator. CORROBORATING (a convergence sanity check), NOT
+//       discriminating: scale votes are weighted by sigma_conf independent of the reliability
+//       track, so scale would still converge even if reliability had collapsed.
 // Deterministic (seeded sim, fixed tick rate).
 // ===========================================================================
 TEST_CASE("weights biased: a systematically biased source is calibrated, not downweighted") {
@@ -340,12 +344,13 @@ TEST_CASE("weights biased: a systematically biased source is calibrated, not dow
 
     // (c) The bias was routed to the CALIBRATOR: the scale calibration converged toward the
     // planted 1.2 (the calibrator absorbed the systematic component the weight left alone),
-    // and the scale histogram concentrated (scale_confidence > 0). The convergence is the
-    // headline — the systematic disagreement was fixed where it belongs (the calibrator), not
-    // masked by a collapsed weight. (A hard commit-flag latch is unreliable under this rig's
-    // all-source noise — vote starvation, not the property under test — so we assert the
-    // converged ESTIMATE, per the brief's "committed extrinsic/scale approaching the planted
-    // value".)
+    // and the scale histogram concentrated (scale_confidence > 0). This CORROBORATES the
+    // split (a convergence sanity check) but does NOT discriminate it: scale votes are
+    // weighted by sigma_conf independent of the reliability track, so convergence would hold
+    // even if reliability had collapsed — assertion (a) above is what actually pins the
+    // split. (A hard commit-flag latch is unreliable under this rig's all-source noise —
+    // vote starvation, not the property under test — so we assert the converged ESTIMATE,
+    // per the brief's "committed extrinsic/scale approaching the planted value".)
     INFO("converged scale=" << cs->scale << "  planted=" << scale_t
          << "  scale_conf=" << cs->scale_confidence
          << "  committed=" << cs->scale_committed);

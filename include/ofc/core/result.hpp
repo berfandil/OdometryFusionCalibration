@@ -61,10 +61,18 @@ struct CalibSnapshot {
 //                   reliability_cap], applied to the fusion weight (w = prior ×
 //                   reliability × Σ-confidence). 1.0 before warmup / for non-participants.
 //                   A NOISY source (large residual scatter) reads < 1; a quiet source > 1.
-//   * bias        — the EMA mean of the per-source residual-to-consensus, i.e. the
-//                   SYSTEMATIC component. Surfaced for diagnostics ONLY; it is routed to
-//                   the CALIBRATOR, NOT folded into the weight (a biased-but-consistent
-//                   source keeps a high reliability — D17). 0.0 for non-participants.
+//   * bias        — the EMA mean of the per-source residual-to-consensus. The systematic
+//                   component is left for the calibrator to absorb via the existing
+//                   Slice-6/7/8 calibrator observe path; this field is exposed for
+//                   DIAGNOSTICS ONLY and is deliberately NOT folded into the fusion weight
+//                   (the D17 "bias → calibrator, not weight" contract: a biased-but-
+//                   consistent source keeps a high reliability). 0.0 for non-participants.
+//                   SEMANTICS: this is the EMA mean of d = split_distance(...), an UNSIGNED
+//                   residual MAGNITUDE (>= 0) — "mean residual distance to consensus", NOT a
+//                   signed per-DOF offset. It conflates magnitude with direction (a source
+//                   biased high or low both read positive; even a zero-mean noisy source
+//                   accrues positive bias). The VARIANCE (resid_var), not bias, is what the
+//                   weight uses to distinguish noise from a systematic offset.
 struct SourceHealth {
     SourceId id          = 0;
     Scalar   weight      = 0.0;
