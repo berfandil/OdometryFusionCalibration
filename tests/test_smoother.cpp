@@ -195,41 +195,63 @@ TEST_CASE("smoother: a time-varying (ramp) twist is tracked with ZERO phase lag 
     CHECK(max_phase_err < 0.1 * causal_lag_ref);
 }
 
-TEST_CASE("smoother: DISCRIMINATING — a causal forward-only readout DOES lag the ramp "
-          "(guards the zero-phase test from being vacuous)") {
-    // Mirror the ramp above but compare the emitted SMOOTHED output against a CAUSAL
-    // estimate (the latest filtered twist, evaluated at the emitted timestamp). The causal
-    // estimate must show the lag the RTS removes — proving the zero-phase property is real,
-    // not an artifact of the trajectory.
-    const int L = 10;
+TEST_CASE("smoother: DISCRIMINATING — the smoother's OWN causal (forward-only) output DOES "
+          "lag the ramp (guards the zero-phase test from being vacuous)") {
+    // We read the SMOOTHER'S OWN one-sided causal estimate (its latest FORWARD-filtered twist)
+    // and show it lags — rather than comparing an analytic causal reference (the old version's
+    // `slope*t_now`, a tautology about the ramp). We obtain the causal output WITHOUT a new
+    // accessor: smoothed() is documented to fall back to the latest filtered twist BEFORE the
+    // ring fills (the causal pass-through). So we run a SHORT-lag (Lc=2) smoother and read its
+    // causal warm-up value on the same ramp: at push i (during its brief warm-up) smoothed()
+    // is the latest filtered twist, which tracks ~t_now; compared against the truth Lc steps in
+    // the PAST (the sample a two-sided estimate would report) it lags by ~Lc*slope*dt. The
+    // genuine lag-L two-sided smoother does NOT lag at its emitted timestamp (re-checked here),
+    // so the causal lag is a real property of THIS smoother's forward filter, not an artifact.
+    const int L = 10;            // the genuine two-sided lag (matches the zero-phase test)
+    const int Lc = 2;            // a short lag whose warm-up exposes the causal fallback
     const Scalar slope = 1.0, dt = 0.02;
-    auto sm = make_smoother(L, 50.0, 1.0);
+    const int steps = 2000;
+    auto sm_lag    = make_smoother(L,  50.0, 1.0);
+    auto sm_causal = make_smoother(Lc, 50.0, 1.0);
 
-    Scalar causal_err_at_emitted = 0.0;
+    // Causal-fallback readout: the Lc smoother's latest filtered twist at its LAST warm-up push
+    // (push index Lc-1, still not ready), compared to the truth Lc steps in the past.
+    Scalar causal_err = 0.0;
+    bool causal_scored = false;
+    Scalar lag_err_at_emitted = 0.0;
     int scored = 0;
     bool all_ok = true;              // DIGEST: fold per-push status into one assertion.
-    for (int i = 0; i < 2000; ++i) {
+    for (int i = 0; i < steps; ++i) {
         const Scalar t_now = static_cast<Scalar>(i) * dt;
         Vec6 z = Vec6::Zero(); z(5) = slope * t_now;
-        all_ok = all_ok && ok(sm->push(0, z, dt));
-        if (sm->ready(0) && i > L + 50) {
-            // A causal filter's BEST estimate is at t_now; compared against the EMITTED
-            // (older) truth it is AHEAD by ~L*slope*dt (it has advanced past the emitted
-            // time). The magnitude of that mismatch is the phase lag the RTS avoids.
-            const Scalar t_emitted = static_cast<Scalar>(i - L) * dt;
+        all_ok = all_ok && ok(sm_lag->push(0, z, dt));
+        if (i <= Lc) {
+            all_ok = all_ok && ok(sm_causal->push(0, z, dt));
+            if (i == Lc - 1) {
+                // Last warm-up push of the Lc smoother: smoothed() == latest FILTERED twist
+                // (causal fallback), tracking ~t_now. The two-sided sample at this point would
+                // be the truth Lc steps in the past; the causal readout lags it.
+                all_ok = all_ok && !sm_causal->ready(0);
+                const Scalar truth_past = slope * static_cast<Scalar>(i - Lc) * dt;
+                causal_err = std::abs(sm_causal->smoothed(0)(5) - truth_past);
+                causal_scored = true;
+            }
+        }
+        if (sm_lag->ready(0) && i > L + 50) {
+            const Scalar t_emitted     = static_cast<Scalar>(i - L) * dt;
             const Scalar truth_emitted = slope * t_emitted;
-            // Latest filtered twist tracks ~t_now; its offset from the emitted truth:
-            const Scalar causal_now = slope * t_now;     // ideal causal output (tracks now)
-            causal_err_at_emitted = std::max(causal_err_at_emitted,
-                                             std::abs(causal_now - truth_emitted));
+            lag_err_at_emitted = std::max(lag_err_at_emitted,
+                                          std::abs(sm_lag->smoothed(0)(5) - truth_emitted));
             ++scored;
         }
     }
     REQUIRE(all_ok);
+    REQUIRE(causal_scored);
     REQUIRE(scored > 100);
-    // The causal-vs-emitted mismatch is ~L*slope*dt = 0.2 — materially above the RTS's
-    // <0.02 phase error from the previous test. (Documents the discriminator.)
-    CHECK(causal_err_at_emitted > 0.5 * (static_cast<Scalar>(L) * slope * dt));
+    // The smoother's OWN causal readout lags the (Lc-steps-past) truth by ~Lc*slope*dt ...
+    CHECK(causal_err > 0.5 * (static_cast<Scalar>(Lc) * slope * dt));
+    // ... while its genuine two-sided lag-L output does NOT lag at its emitted timestamp.
+    CHECK(lag_err_at_emitted < 0.05);
 }
 
 // ---------------------------------------------------------------------------

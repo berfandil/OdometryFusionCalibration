@@ -144,8 +144,11 @@ Status TwistSmoother::push(int slot, const Vec6& twist_meas, Scalar dt) {
         sl.Pp[idx] = P_pred;
         sl.F[idx]  = F;
     } else {
-        // Ring full: shift everything one step older (drop the oldest), append at the end.
-        // depth <= kRing so this bounded shift is cheap + heap-free (strict core).
+        // Ring full: LOGICAL SHIFT — physically copy every entry one step older (drop the
+        // oldest), then append at the end. This is an O(L) memmove per step (NOT an O(1)
+        // head/count circular buffer); depth <= kRing so the bounded shift is heap-free
+        // (strict core). The shift cost is the deliberate trade for the simple oldest==index-0
+        // invariant the backward RTS pass reads.
         for (int k = 0; k < depth - 1; ++k) {
             sl.x[k]  = sl.x[k + 1];
             sl.P[k]  = sl.P[k + 1];

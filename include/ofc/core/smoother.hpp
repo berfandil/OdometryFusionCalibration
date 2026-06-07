@@ -37,10 +37,23 @@
 // LAG FORMULA. lag_steps is supplied by the estimator as round(calib_lag_s · tick_rate_hz),
 // CLAMPED to [1, kMaxLag] (a compile-time cap sizing the fixed rings — no post-configure
 // heap). L = 0 would be a degenerate "no smoothing" pass-through; we clamp UP to 1.
+// OFF-CADENCE NOTE: L is fundamentally a STEP count derived via the NOMINAL tick rate, not a
+// duration. The smoother ring + the estimator's calib_ring both advance in STEPS, so they stay
+// mutually aligned at ANY cadence (alignment is cadence-independent). But the time-lag SEMANTIC
+// "the deeper frontier trails by calib_lag_s seconds" only holds when the caller pumps at
+// exactly tick_rate_hz; off-cadence, L steps != calib_lag_s seconds.
 //
 // STRICT CORE: all storage is fixed-capacity, sized at configure() (max_sources × (L+1)
 // ring of 12-vectors + 12×12 covariances); push()/smoothed() allocate nothing; bounded
 // loops (the RTS recursion is ≤ L+1 iterations); Status returns; no exceptions; double.
+//
+// FOOTPRINT NOTE (memory budget). The per-source rings are sized at the COMPILE-TIME caps
+// (kMaxSources=32 × kRing=kMaxLag+1=65), NOT at the configured max_sources / L, so a
+// TwistSmoother is ~7.5 MB (32 slots × 65 ring entries × five ~12×12/12-vec matrices). That
+// fixed cost lives in every Estimator::Impl and is PAID EVEN WHEN per_sensor_kf is OFF for
+// every source (the smoother stays default-constructed but the storage is still carried) and
+// regardless of the actual source count / lag. A memory-budgeted integrator should size for
+// this; reducing it to the configured depth is a possible future refinement (out of scope).
 #ifndef OFC_CORE_SMOOTHER_HPP
 #define OFC_CORE_SMOOTHER_HPP
 
@@ -100,7 +113,11 @@ public:
 
     // The refined covariance (12×12, [w; a]) of the emitted smoothed state — the RTS
     // posterior P^s of the lag-L-old entry. Identity for a not-ready / bad slot. Cheap (it
-    // is already maintained by the backward pass); exposed for the calibrators' vote weight.
+    // is already maintained by the backward pass). NOTE: this refined Σ is COMPUTED and
+    // EXPOSED but is NOT yet wired into the calibrator vote weight — the deeper path
+    // currently feeds the calibrators the RAW Σ-confidence captured at t-L (the Slice-2
+    // inverse-covariance scalar), not this posterior. Wiring the refined Σ into the per-
+    // source vote weight on the deeper path is a future refinement (out of Slice-10 scope).
     Mat12 smoothed_cov(int slot) const;
 
     bool configured() const { return configured_; }
@@ -116,10 +133,13 @@ private:
     Scalar q_           = Scalar(1);
     Scalar r_           = Scalar(1);
 
-    // Per-source fixed-lag ring. depth = lag_ + 1 entries, indexed by a head/count. Each
-    // entry stores the FORWARD filtered posterior (x, P), the one-step PREDICTION that
-    // produced it (x_pred, P_pred), and the transition F used — all needed by the backward
-    // RTS recursion. Sized at the compile-time cap so configure() is the sole allocator.
+    // Per-source fixed-lag ring. depth = lag_ + 1 entries in logical order (0 = oldest ..
+    // count-1 = newest). NOTE: this is NOT an O(1) head/count circular buffer — push() does a
+    // LOGICAL SHIFT, physically copying every entry down by one on each full push (O(L) per
+    // step, depth <= kRing — bounded, heap-free). Each entry stores the FORWARD filtered
+    // posterior (x, P), the one-step PREDICTION that produced it (x_pred, P_pred), and the
+    // transition F used — all needed by the backward RTS recursion. Sized at the compile-time
+    // cap so configure() is the sole allocator.
     static constexpr int kRing = kMaxLag + 1;
     struct Slot {
         Vec6   emitted     = Vec6::Zero();          // last emitted (lag-L) smoothed twist

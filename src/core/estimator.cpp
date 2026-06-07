@@ -214,6 +214,14 @@ struct Estimator::Impl {
         SE3      reported[kMaxSourcesCap];     // de-scaled B_corr (raw, delayed)
         Scalar   conf[kMaxSourcesCap];
         int      slot[kMaxSourcesCap];         // registered slot of each covered source
+        // Time-alignment stamp (Slice-10 review MAJOR). For each covered entry i that is a
+        // smoothing source, the smoother's MONOTONIC push-count for that slot AFTER this
+        // frame's push (push_seq[slot] post-increment). The smoother's emitted sample after
+        // N pushes is the (N-L)-th push, so at consumption the smoothed twist time-aligns
+        // with THIS frame iff (current push_seq[slot] - push_at[i]) == L. Under per-source
+        // dropout that equality fails and we fall back to the raw delayed delta (a clean
+        // variance loss, NOT a calibration bias). -1 for non-smoothing / un-pushed entries.
+        long     push_at[kMaxSourcesCap];
         Vec3     fused_omega = Vec3::Zero();
         Vec3     fused_trans = Vec3::Zero();
         SE3      fused_motion;
@@ -221,6 +229,12 @@ struct Estimator::Impl {
     };
     CalibFrame calib_ring[kCalibRing];
     int        calib_ring_count = 0;           // filled entries (saturates at L+1)
+    // Per-registered-slot MONOTONIC smoother push count (Slice-10 review MAJOR): incremented
+    // once each time this slot is pushed into the smoother (covered AND smoothing-enabled).
+    // Unlike TwistSmoother::Slot::count (which saturates at the ring depth) this never
+    // saturates, so push_seq - push_at is the true number of pushes between a frame and its
+    // consumption — the exact L-step alignment test. Reset to 0 in init().
+    long       push_seq[kMaxSourcesCap] = {};
     // Per-step scratch the deeper path writes the lag-L entry's (possibly smoothed) deltas
     // into before calling observe() (no heap in step()).
     SE3        calib_smoothed[kMaxSourcesCap];
@@ -572,6 +586,8 @@ Status Estimator::init(const Config& cfg) {
         // Per-sensor smoother gate (Slice 10): bound in add_source(); default off.
         impl_->smooth_source[i]     = false;
         impl_->calib_slot[i]        = -1;
+        // Monotonic smoother push count per slot (Slice-10 review MAJOR): empty.
+        impl_->push_seq[i]          = 0;
     }
     // Deeper-frontier calibration ring + smoother (Slice 10): empty until the first step.
     impl_->calib_ring_count = 0;
@@ -623,6 +639,10 @@ Status Estimator::init(const Config& cfg) {
             }
         }
         if (any_kf) {
+            // L bakes the NOMINAL tick rate into a STEP count. Both the smoother ring and the
+            // calib_ring advance in steps, so they stay mutually aligned at ANY cadence; but the
+            // time-lag SEMANTIC (the deeper frontier trails by calib_lag_s seconds) holds only
+            // at the nominal rate — off-cadence, L steps != calib_lag_s s (see smoother.hpp).
             int L = static_cast<int>(std::llround(cfg.calib_lag_s * cfg.tick_rate_hz));
             if (q_kf <= Scalar(0)) q_kf = Scalar(1);   // guard a non-positive knob
             const Status ss = impl_->smoother.configure(cfg.max_sources, L, q_kf);
@@ -954,17 +974,24 @@ Status Estimator::step(Timestamp now) {
         // time-aligned). Non-smoothed sources use their (delayed) raw B_corr.
         const int depth = s.calib_lag_steps + 1;
 
-        // (a) Push the measured twist of every smoothing-enabled covered source.
+        // (a) Push the measured twist of every smoothing-enabled covered source. Advance the
+        // per-slot MONOTONIC push count (Slice-10 review MAJOR) so the frame below can stamp
+        // the exact push sequence number this source reached at this wall-clock step.
         for (int i = 0; i < nc; ++i) {
             const int slot = s.calib_slot[i];
             if (slot < 0 || !s.smooth_source[slot]) continue;
             const Vec6 zt = se3::log(s.calib_reported[i]) / dt;   // body twist of de-scaled B
-            s.smoother.push(slot, zt, dt);
+            // Slot is pre-validated (slot in [0, max_sources) and smooth_source set at
+            // add_source) so push() cannot fail here; ignore the Status (strict-core ethos).
+            (void)s.smoother.push(slot, zt, dt);
+            ++s.push_seq[slot];
         }
 
         // (b) Append THIS step's calibration inputs to the deeper ring (drop oldest if
         // full). Write DIRECTLY into the destination ring slot (no large stack temporary —
-        // strict core); the full-ring case shifts entries down by one first.
+        // strict core). This is a LOGICAL SHIFT, not an O(1) circular buffer: the full-ring
+        // case copies every entry down by one (O(L) per step, depth <= kCalibRing — bounded,
+        // heap-free), matching the smoother's own ring (smoother.cpp push()).
         if (s.calib_ring_count >= depth) {
             for (int k = 0; k < depth - 1; ++k) s.calib_ring[k] = s.calib_ring[k + 1];
         }
@@ -980,6 +1007,11 @@ Status Estimator::step(Timestamp now) {
             frame.reported[i] = s.calib_reported[i];
             frame.conf[i]     = s.calib_conf[i];
             frame.slot[i]     = s.calib_slot[i];
+            // Stamp the post-push sequence number for smoothing sources (Slice-10 review
+            // MAJOR); -1 marks a non-smoothing / un-pushed entry (never substituted).
+            const int slot    = s.calib_slot[i];
+            frame.push_at[i]  = (slot >= 0 && s.smooth_source[slot]) ? s.push_seq[slot]
+                                                                     : static_cast<long>(-1);
         }
         if (s.calib_ring_count < depth) ++s.calib_ring_count;
 
@@ -990,7 +1022,22 @@ Status Estimator::step(Timestamp now) {
             const Impl::CalibFrame& old = s.calib_ring[0];
             for (int i = 0; i < old.nc; ++i) {
                 const int slot = old.slot[i];
-                if (slot >= 0 && s.smooth_source[slot] && s.smoother.ready(slot)) {
+                // Substitute the smoothed twist ONLY when it is TIME-ALIGNED with this lag-L
+                // frame (Slice-10 review MAJOR). The smoother's emitted sample after N pushes
+                // is the (N-L)-th push; it lines up with THIS frame iff the source has been
+                // pushed exactly L times since the frame was created, i.e.
+                //   current push_seq[slot] - old.push_at[i] == L.
+                // Under per-source dropout the source missed pushes inside (t-L, t], so the
+                // equality fails and the emitted twist belongs to an EARLIER wall-clock step
+                // than this frame's consensus — feeding it would inject a phase-error bias on
+                // a turning trajectory. We then fall back to the raw delayed delta (a clean
+                // variance loss instead of a calibration bias). No-dropout: equality always
+                // holds, so this path is byte-identical to the pre-fix substitution.
+                const bool aligned =
+                    slot >= 0 && s.smooth_source[slot] && s.smoother.ready(slot) &&
+                    old.push_at[i] >= 0 &&
+                    (s.push_seq[slot] - old.push_at[i]) == static_cast<long>(s.calib_lag_steps);
+                if (aligned) {
                     // Reconstruct the de-scaled SE3 from the smoothed body twist over the
                     // lag-L entry's dt: B_corr_smoothed = exp(w_smoothed · dt_old). This
                     // preserves the de-scale convention (the twist IS that of the de-scaled
