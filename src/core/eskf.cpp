@@ -74,12 +74,6 @@ void Eskf::enable_bias(Scalar bias_cov0) {
     bias_prior_trace_ = cov18_.block<6, 6>(12, 12).trace();   // for bias_confidence()
 }
 
-Scalar Eskf::bias_pose_coupling() const {
-    if (!bias_active_) return Scalar(0);
-    // Max-abs over the 6x6 pose<->bias cross-covariance block (rows 0..5, cols 12..17).
-    return cov18_.block<6, 6>(0, 12).cwiseAbs().maxCoeff();
-}
-
 Scalar Eskf::bias_confidence() const {
     if (!bias_active_ || !(bias_prior_trace_ > Scalar(0))) return Scalar(0);
     const Scalar cur = cov18_.block<6, 6>(12, 12).trace();
@@ -228,6 +222,54 @@ void Eskf::predict_aug(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar b
 
     // Mirror the published 12x12 (pose+twist) into state_.cov so latest()/frontier read the
     // augmented filter's pose/twist covariance unchanged.
+    state_.cov       = cov18_.block<12, 12>(0, 0);
+    state_.twist.cov = state_.cov.block<6, 6>(6, 6);
+    // stamp untouched — the estimator owns the frontier clock (as in predict()).
+}
+
+void Eskf::predict_aug_frozen(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn) {
+    const Scalar dt_eff = (dt > kMinDt) ? dt : kMinDt;
+
+    // --- de-bias with the FROZEN learned bias (keep helping the trajectory) -----------
+    // delta is the multi-source CONSENSUS here (out of the drives-alone regime), so this is an
+    // approximation — but it still removes the bias source's systematic contribution rather than
+    // silently dropping the de-bias. The bias MEAN is held (the coupling that would move it is
+    // invalid for the consensus, so we do not let an update touch it — see the zeroed cross-cov).
+    const SE3 bias_corr = se3::exp(-bias_ * dt_eff);
+    const SE3 delta_db  = se3::compose(delta, bias_corr);
+
+    // --- mean propagation (same as predict(), on the de-biased delta) -----------------
+    state_.pose     = se3::compose(state_.pose, delta_db);
+    state_.twist.xi = se3::log(delta_db) / dt_eff;
+    // bias mean unchanged (frozen while out of regime).
+
+    // --- covariance: propagate the 12x12 pose/twist EXACTLY as predict() does, embedded in
+    // the 18x18 with NO bias->pose coupling (J_pb = 0: the -dt*I coupling is invalid for the
+    // consensus delta), then ZERO the pose<->bias cross-cov so a later predict_aug resume starts
+    // consistent. Keeping the block in cov18_ (not on state_.cov via predict()) is the fix: the
+    // top-left 12x12 stays propagated across the out-of-regime gap, so resume is never stale.
+    const Mat6 Ad_inv = se3::adjoint(se3::inverse(delta_db));
+
+    Mat18 F = Mat18::Zero();
+    F.block<6, 6>(0, 0)   = Ad_inv;             // pose <- Ad(Delta_db^-1) * pose (12-DOF F)
+    // pose<-bias coupling DELIBERATELY ZERO (invalid for the consensus delta).
+    // twist row stays zero (re-read each step). bias row = identity (random walk):
+    F.block<6, 6>(12, 12) = Mat6::Identity();
+
+    Mat18 Q = Mat18::Zero();
+    Q.block<6, 6>(0, 0)   = q_pose;                      // pose increment noise
+    Q.block<6, 6>(6, 6)   = q_pose / (dt_eff * dt_eff);  // -> velocity noise
+    const Scalar bpn = (bias_pn > Scalar(0)) ? bias_pn : Scalar(0);
+    Q.block<6, 6>(12, 12) = (bpn * dt_eff) * Mat6::Identity();   // bias random-walk noise
+
+    cov18_ = symmetrize18(F * cov18_ * F.transpose() + Q);
+
+    // Zero the (now-meaningless) pose<->bias cross-cov in BOTH off-diagonal blocks so the next
+    // drives-alone predict_aug rebuilds the coupling from a clean prior (as enable_bias seeds it).
+    cov18_.block<6, 6>(0, 12).setZero();
+    cov18_.block<6, 6>(12, 0).setZero();
+
+    // Mirror the published 12x12 (pose+twist), as predict_aug() does.
     state_.cov       = cov18_.block<12, 12>(0, 0);
     state_.twist.cov = state_.cov.block<6, 6>(6, 6);
     // stamp untouched — the estimator owns the frontier clock (as in predict()).

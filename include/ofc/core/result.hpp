@@ -63,7 +63,7 @@ struct CalibSnapshot {
     Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
     Scalar   translation_confidence = 0.0; // xyz lever-arm concentration in [0,1] (Slice 7)
     Vec6     bias = Vec6::Zero();       // body-twist bias [v;omega] (Slice 11b; 0 unless bias src)
-    Scalar   bias_observable = 0.0;     // pose<->bias cross-cov magnitude (Slice 11b)
+    Scalar   bias_observable = 0.0;     // bias observability confidence: 1 - P_bias/P_bias_prior, in [0,1] (Slice 11b)
     bool     committed     = false;     // TIME-OFFSET commit (Slice 5)
     bool     extrinsic_committed     = false; // yaw/pitch ∘ roll commit (Slice 8)
     bool     scale_committed         = false; // scale commit (Slice 8)

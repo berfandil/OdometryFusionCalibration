@@ -10,8 +10,9 @@
 //   (c) NO-CORRECTION IDENTITY — registering no correction leaves the fused trajectory
 //       byte-identical to a baseline (the predict-only path is untouched).
 //
-// SCOPE: position fixes (dim=3). Bias states are OUT OF SCOPE this cycle (deferred to
-// Slice 11b — SensorConfig::bias_states stays a no-op flag).
+// SCOPE: position fixes (dim=3). Bias states are out of scope FOR THIS FILE; Slice 11b
+// (Option A) shipped them separately — SensorConfig::bias_states now drives the augmented
+// 18-DOF filter when set (covered by test_bias.cpp), so it is no longer a no-op flag.
 #include <doctest/doctest.h>
 
 #include "ofc/core/config.hpp"

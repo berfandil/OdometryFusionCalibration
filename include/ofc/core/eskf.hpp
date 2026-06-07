@@ -55,13 +55,6 @@ public:
     bool bias_active() const { return bias_active_; }
     Vec6 bias() const { return bias_; }   // current bias estimate (zero if inactive)
 
-    // The largest pose<->bias cross-covariance magnitude (max-abs over the 6x6 P_pose,bias
-    // block). The MECHANISM term: nonzero means the predict has built the coupling an
-    // absolute-ref update needs to MOVE the bias. NOTE it GROWS unbounded under predict-only
-    // (no update shrinks it), so it is the coupling magnitude, not a "determined" signal — use
-    // bias_confidence() for the latter. 0 when inactive.
-    Scalar bias_pose_coupling() const;
-
     // Bias OBSERVABILITY CONFIDENCE in [0, 1]: how much the bias-block uncertainty has been
     // REDUCED below its enable_bias() prior, = clamp(1 - trace(P_bias)/trace(P_bias_prior), 0, 1).
     // 0 with NO absolute ref (the bias variance only grows under the random walk -> the bias is
@@ -136,6 +129,28 @@ public:
     //   bias has ZERO cross-covariance with the pose and a GPS update cannot observe it.
     // `bias_pn` is SensorConfig::bias_process_noise (>= 0). dt <= 0 is guarded as in predict().
     void predict_aug(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn);
+
+    // predict_aug_frozen(): the OUT-OF-REGIME augmented predict. Used when the bias filter is
+    // active (bias_active_) but the bias source NO LONGER drives the predict ALONE (another
+    // source joined the fusion median, n > 1). In that regime `delta` is the multi-source
+    // CONSENSUS, not the bias source's own frame-aligned delta, so the exact -dt*I bias->pose
+    // coupling no longer holds. We therefore:
+    //   * KEEP applying the learned bias to the de-bias (Delta_db = delta o exp(-bias*dt)) so the
+    //     trajectory STILL benefits from the bias the drives-alone phase learned (it is not
+    //     silently dropped) — approximate for the consensus but in the right direction;
+    //   * propagate the pose/twist blocks of cov18_ EXACTLY as the 12-DOF predict() would
+    //     (F_pose = Ad(Delta_db^-1), Q_pose/twist), keeping cov18_'s top-left block CONSISTENT
+    //     (no stale/un-propagated 12x12 the way a plain predict() on state_.cov would leave it);
+    //   * HOLD the bias mean (no coupling injected) and random-walk the bias block
+    //     (Q_bias = bias_pn*dt*I6, so bias_confidence correctly DECAYS — the bias is frozen, not
+    //     determined, while out of regime);
+    //   * ZERO the now-meaningless pose<->bias cross-covariance, so when the bias source later
+    //     drives alone again the next predict_aug RESUMES from a CONSISTENT prior (the coupling
+    //     is rebuilt fresh from zero, exactly as enable_bias() seeds it) — never a corrupt one.
+    // state_.cov mirrors cov18_'s top-left 12x12 as in predict_aug(). bias_active_ stays true so
+    // the caller keeps routing absolute-ref updates through update_aug() (which now sees zero
+    // bias cross-cov, so it corrects pose/twist but cannot move the frozen bias). dt <= 0 guarded.
+    void predict_aug_frozen(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn);
 
     // update_aug(): the 18-DOF Mahalanobis-gated measurement update. The measurement H is the
     // SAME [H_pose(n x6) | 0(n x6)] the 12-DOF update uses; the augmented H pads a third zero

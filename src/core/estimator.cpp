@@ -1324,27 +1324,33 @@ Status Estimator::step(Timestamp now) {
     // ENABLE the augmented mode lazily on the FIRST such step (carrying the live 12-DOF pose/
     // twist + a bias prior) and route predict/update through the _aug methods from then on.
     //
-    // If the regime is NOT met (no bias source, or other sources joined the median), we use the
-    // 12-DOF predict — BYTE-IDENTICAL to pre-11b. Multi-source-median bias coupling (Option B)
-    // is DEFERRED, so once other sources drive the predict the bias is simply not updated this
-    // step (the augmented filter, if already enabled, would mis-model the consensus delta). For
-    // the documented Option-A regimes the bias source drives alone every step, so this is moot;
-    // we guard it for correctness.
+    // If the regime is NOT met, there are TWO sub-cases:
+    //   * NO bias filter active (no bias source, or it never drove alone yet): the plain 12-DOF
+    //     predict() — BYTE-IDENTICAL to pre-11b. This is the default / no-bias path.
+    //   * Bias filter ALREADY active but the bias source no longer drives alone (another source
+    //     joined the median, n > 1 — e.g. a 2-source ReferenceOnly rig after the 2nd source
+    //     commits): the REGIME-SAFE FROZEN predict_aug_frozen(). It keeps applying the learned
+    //     bias (the trajectory still benefits) and keeps cov18_ CONSISTENT (top-left 12x12
+    //     propagated, bias frozen + random-walked, pose<->bias cross-cov zeroed) so a later
+    //     drives-alone resume restarts from a clean prior — NOT a stale/corrupt one. Multi-
+    //     source-median bias COUPLING (Option B) is still deferred (the bias mean is held while
+    //     out of regime), but the de-bias is no longer silently dropped and resume is safe.
     const bool bias_drives_alone =
         (s.bias_slot >= 0) && (n == 1) && (s.med_slot[0] == s.bias_slot);
-    bool use_aug = false;
     if (bias_drives_alone) {
         if (!s.eskf.bias_active()) s.eskf.enable_bias(Impl::kBiasCov0);
         s.eskf.predict_aug(med.value, dt, q_pose, s.bias_process_noise);
-        use_aug = true;
+    } else if (s.eskf.bias_active()) {
+        s.eskf.predict_aug_frozen(med.value, dt, q_pose, s.bias_process_noise);
     } else {
-        // Predict-only 12-DOF path. NOTE: if the augmented mode was previously enabled but the
-        // bias source no longer drives alone, we fall back to the plain predict on the published
-        // 12x12 state (the bias estimate is held frozen inside the filter but not propagated/
-        // applied — the Option-B regime is out of scope). This keeps the no-bias default and the
-        // documented single-driving-source regime exact.
         s.eskf.predict(med.value, dt, q_pose);
     }
+    // The augmented (18-DOF) update path is used whenever the bias filter is active — both in
+    // the drives-alone regime (predict_aug built the live coupling) and the frozen fallback
+    // (cov18_ has zero bias cross-cov, so update_aug corrects pose/twist but leaves the frozen
+    // bias untouched). This keeps the ENTIRE correction inside cov18_ once enabled, so cov18_ is
+    // never left stale by a 12-DOF update() running on state_.cov behind its back.
+    const bool use_aug = s.eskf.bias_active();
 
     // This fuse succeeded: advance the integration frontier so the next step picks
     // up exactly where this one ended (no gap, no overlap).
@@ -1373,11 +1379,14 @@ Status Estimator::step(Timestamp now) {
             Measurement m;
             if (!corr->evaluate(x, m)) continue;   // no fix available this step
             ++cdiag.corr_evaluated;
-            // Route through the augmented 18-DOF update when the bias filter is active this step
-            // (Slice 11b, Option A): update_aug() injects the bias via the pose<->bias cross-
-            // covariance the predict_aug built, REMOVING the source's drift. Otherwise the plain
-            // 12-DOF update() (byte-identical to Slice 11). Same Mahalanobis gate either way.
-            const bool applied = (use_aug && s.eskf.bias_active())
+            // Route through the augmented 18-DOF update whenever the bias filter is active this
+            // step (Slice 11b, Option A). In the drives-alone regime update_aug() injects the bias
+            // via the pose<->bias cross-covariance predict_aug built, REMOVING the source's drift;
+            // in the frozen fallback the cross-cov is zero, so it corrects pose/twist but leaves
+            // the frozen bias untouched. EITHER way the correction stays inside cov18_ (never a
+            // 12-DOF update() on state_.cov leaving cov18_ stale). Otherwise (no bias filter) the
+            // plain 12-DOF update() — byte-identical to Slice 11. Same Mahalanobis gate either way.
+            const bool applied = use_aug
                                      ? s.eskf.update_aug(m, cfg.mahalanobis_chi2)
                                      : s.eskf.update(m, cfg.mahalanobis_chi2);
             if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
@@ -1394,9 +1403,10 @@ Status Estimator::step(Timestamp now) {
     // Per-source bias snapshot (Slice 11b, Option A). Filled HERE — after predict_aug (the
     // de-bias) and the absolute-ref update_aug (the injection) — so it reflects THIS step's
     // bias estimate. Only the single bias source carries it; every other source reads zero
-    // (set in the snapshot loop above). bias_observable is the pose<->bias cross-covariance
-    // magnitude: ~0 with no absolute ref (the bias never becomes observable, the self-test),
-    // nonzero once the predict couples the bias to the pose AND fixes start shrinking it.
+    // (set in the snapshot loop above). bias_observable is the BOUNDED observability confidence
+    // (1 - trace(P_bias)/trace(P_bias_prior), the reduction of the bias-block variance below its
+    // prior): ~0 with no absolute ref (the bias never becomes observable, the self-test), rising
+    // toward 1 once the predict couples the bias to the pose AND fixes start shrinking it.
     if (s.bias_slot >= 0 && s.eskf.bias_active()) {
         CalibSnapshot& bcs   = s.result.calib[s.bias_slot];
         bcs.bias             = s.eskf.bias();
