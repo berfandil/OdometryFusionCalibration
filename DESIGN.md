@@ -82,7 +82,7 @@ Every gate, vote weight, and reliability term derives from this table.
 
 ## 5. ESKF (the "robust integrator")
 
-- **State**: pose `T ∈ SE(3)` + body twist `(v,ω) ∈ ℝ⁶`. **Error-state**: decoupled `SO(3)×ℝ³` for pose (matches the median's split metric) + `ℝ⁶` twist. **Dense 12×12 covariance** (fixed-size, no-heap friendly).
+- **State**: pose `T ∈ SE(3)` + body twist `(v,ω) ∈ ℝ⁶`. **Error-state**: the pose error is *ordered* `[trans; rot]` and the **median** uses a split `SO(3)×ℝ³` metric — but the **ESKF covariance is NOT block-diagonal**: predict propagates it with the **full SE(3) adjoint** `F = Ad(delta⁻¹)` (the `[t]ₓR` block couples translation and rotation), so the dense 12×12 covariance lives in the **full coupled SE(3) tangent**. "Decoupled" describes the error *parameterization/ordering* (and the median metric), not the covariance — NEES must be computed in the full-SE(3) `se3::log` tangent to match (Slice-14 validation note). **Dense 12×12 covariance** (fixed-size, no-heap friendly).
 - **Predict**: `T_k = T_{k-1} ∘ Δ_median`; twist from the windowed median; const-velocity tip extrapolation to `now`.
 - **Correct**: only via optional absolute-reference plugins.
 - **Calibration params are NOT in the state** — they live in the external histograms and feed back via frame-alignment.
@@ -139,7 +139,7 @@ Every gate, vote weight, and reliability term derives from this table.
 - **Unit tests** per block (median/Weiszfeld, histogram mode + aging, hand-eye solve, xcorr, ESKF update) with analytic expected values.
 - **Simulation rig with known ground truth** (the backbone): synthetic trajectory + N synthetic sources with planted extrinsics/scale/offset/noise/outliers → the only place truth is known, hence the only place calibration *correctness* is checkable. Sweep regimes, noise, dropout.
 - **Observability self-tests**: assert each DOF converges *only* in its regime (lever-arm frozen under pure-straight sim; converges under turning) → regression-guards the spine.
-- **NEES / NIS consistency** (Monte-Carlo): a filter that publishes Σ must prove it is neither over- nor under-confident.
+- **NEES / NIS consistency** (Monte-Carlo): a filter that publishes Σ must prove it is neither over- nor under-confident. **Slice-14 status**: NEES Monte-Carlo harness implemented (6-DOF pose NEES from the published Σ vs sim GT, ensemble over seeds). **Finding**: the published Σ is **grossly pessimistic** — ensemble-mean NEES ≈ 0.13 vs DOF 6 (~46× over-conservative). Root cause: the ESKF inits `P = I₁₂` (≈100× the steady-state error) and the predict-only integrator (no correction step) never shrinks it; the right-error `Ad` propagation further inflates the translation block over distance. Not tunable via `q_scale`/`q_floor` (those only add to P). Fixing it needs a smaller init-P seeded from the first-window/median uncertainty, and/or the Slice-11 correction step. **NIS** is deferred to Slice 11 (no `ICorrection` updates exist yet → no innovation to normalize). The golden-regression net (deterministic recorded-scenario replay + committed numeric snapshot) is in place.
 - **Recorded-data golden regression**: real logs replayed; determinism → byte-stable golden output as a regression net.
 
 ---

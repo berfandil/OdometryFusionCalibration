@@ -58,6 +58,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Slice 8 — Commit + feedback loop: per-DOF commit gate (mass + hysteresis), atomic swap, **contractive** re-anchor (extrinsic/scale/offset converge from large priors), cold-start switch (green: 148 cases / 5160 assertions). **Calibration spine complete.**
 - [x] Slice 3 — Lifecycle & degrade-don't-block: `INIT→WARMUP→DEGRADED→NOMINAL` ladder driven by `n` vs `min_sources_warn`, `readiness` scalar, reference-only dead-reckon emitted as early as the reference has span, graceful downgrade on source loss (green: 156 cases / 5247 assertions).
 - [x] Slice 9 — Weight refinement: variance-EMA reliability (bias/variance split, D17) — noisy source downweighted, biased source kept (bias left to the calibrator); `reliability_floor`/`reliability_cap`; `SourceHealth.reliability`/`bias` diagnostics (green: 161 cases / 5317 assertions).
+- [~] Slice 14 — Validation harness (partial): NEES Monte-Carlo consistency + golden regression added; **finding: published Σ is ~46x PESSIMISTIC** (ensemble NEES ~0.13 vs DOF 6 — init `P=I12` + right-error Ad inflation, predict-only has no correction to shrink). NIS deferred to Slice 11; CONFIG placeholder sweep remains (green: 165 cases / 5809 assertions).
 - (remaining slices per `ISSUES.md`).
 
 ## Sub-agent task-brief template
