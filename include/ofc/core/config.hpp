@@ -41,7 +41,13 @@ struct SensorConfig {
     bool     per_sensor_kf   = false;
     Scalar   kf_process_noise = 1.0;
     bool     scale_calib     = true;
-    bool     bias_states     = false;   // GPS/INS-style drift removal (D22)
+    bool     bias_states     = false;   // GPS/INS-style drift removal (D22; Slice 11b)
+    // Random-walk process-noise rate for this source's body-twist bias (Slice 11b, Option A).
+    // Only used when bias_states == true AND this is the single driving source: the augmented
+    // ESKF adds Q_bias = bias_process_noise * dt * I6 to the bias block each predict, letting an
+    // absolute-ref update slowly re-estimate the bias. Larger => the bias tracks faster but is
+    // noisier; >= 0 (validate enforces). Default small (slow constant-bias assumption).
+    Scalar   bias_process_noise = 1e-4;
     bool     is_reference    = false;   // gauge anchor
 };
 

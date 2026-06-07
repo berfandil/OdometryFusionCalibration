@@ -17,6 +17,10 @@ using Vec6  = Eigen::Matrix<Scalar, 6, 1>;   // twist [v; omega] or se(3) error.
 using Mat3  = Eigen::Matrix<Scalar, 3, 3>;
 using Mat6  = Eigen::Matrix<Scalar, 6, 6>;
 using Mat12 = Eigen::Matrix<Scalar, 12, 12>; // pose(6) + twist(6) covariance.
+// Augmented error-state covariance (Slice 11b, Option A): pose(6) + twist(6) + bias(6).
+// Fixed-size (strict core) — used ONLY when a single bias source is active.
+using Vec18 = Eigen::Matrix<Scalar, 18, 1>;
+using Mat18 = Eigen::Matrix<Scalar, 18, 18>;
 
 // Rigid transform on SE(3). Stored as R (orthonormal) + t.
 struct SE3 {

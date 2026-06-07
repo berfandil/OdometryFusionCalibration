@@ -208,6 +208,7 @@ std::uint64_t config_hash(const Config& cfg) {
             w.put_f64(sc.modeled_noise_per_m);
             w.put_f64(sc.modeled_noise_per_rad);
             w.put_f64(sc.kf_process_noise);
+            w.put_f64(sc.bias_process_noise);
             w.put_bool(sc.native_confidence);
             w.put_bool(sc.per_sensor_kf);
             w.put_bool(sc.scale_calib);
@@ -433,6 +434,22 @@ struct Estimator::Impl {
 
     Eskf   eskf;
     bool   eskf_started = false;
+
+    // ---- Per-source bias states (Slice 11b, Option A, D22) ----------------------------------
+    // Option A supports EXACTLY ONE bias source (validate() rejects >1). At init we record which
+    // registered SLOT (if any) is the bias source + its random-walk process-noise rate. The
+    // augmented filter is ENABLED lazily on the first fused step where the bias source ACTUALLY
+    // DRIVES the predict ALONE (the median set is that source only, n == 1 — the regime where the
+    // GPS/INS structure is exact). If the source never drives the predict alone, the 12-DOF path
+    // runs unchanged and the bias stays at zero. bias_slot < 0 == no bias source (the default;
+    // every existing test) -> the entire augmented path is skipped (byte-identical 12-DOF).
+    int    bias_slot          = -1;     // registered slot of the single bias source, or -1
+    SourceId bias_src_id      = 0;      // that source's id (for the snapshot)
+    Scalar bias_process_noise = Scalar(0);
+    // Bias-prior seed for the augmented covariance's bias block (the "how big might the bias be"
+    // prior). Sized so the bias is observable but does not dominate; a fixed sensible default
+    // keeps Option A knob-light (only bias_process_noise is exposed in Config).
+    static constexpr Scalar kBiasCov0 = Scalar(1.0);
 
     // End of the last successfully-fused window. The next predict integrates the
     // actual motion over [last_t1, t1] (dt = t1 - last_t1), so integration is
@@ -698,6 +715,10 @@ Status Estimator::init(const Config& cfg) {
     impl_->last_t1      = 0;
     impl_->has_last_t1  = false;
     impl_->ticks_since_sync = 0;
+    // Per-source bias states (Slice 11b): no bias source until the sensor scan below finds one.
+    impl_->bias_slot          = -1;
+    impl_->bias_src_id        = 0;
+    impl_->bias_process_noise = Scalar(0);
     for (int i = 0; i < kMaxSourcesCap; ++i) {
         impl_->sources[i]           = nullptr;
         impl_->prior_extrinsic[i]   = SE3{};
@@ -814,6 +835,16 @@ Status Estimator::add_source(const ISource* src) {
     // calibrators iff its SensorConfig::per_sensor_kf is set (else its raw delayed B_corr
     // is used on the deeper path; off entirely if no source enables it).
     impl_->smooth_source[slot] = (sc != nullptr) ? sc->per_sensor_kf : false;
+    // Per-source bias states (Slice 11b, Option A): record the single bias source's slot +
+    // process-noise rate. validate() guarantees at most one source has bias_states, so the
+    // first match is THE bias source. The augmented filter is enabled lazily in step() only
+    // when this source drives the predict alone.
+    if (sc != nullptr && sc->bias_states) {
+        impl_->bias_slot          = slot;
+        impl_->bias_src_id        = src->id();
+        impl_->bias_process_noise = (sc->bias_process_noise >= Scalar(0))
+                                        ? sc->bias_process_noise : Scalar(0);
+    }
     // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
     {
         const SE3  Xp = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
@@ -1240,6 +1271,10 @@ Status Estimator::step(Timestamp now) {
         cs.extrinsic_committed   = s.ext_committed[i];
         cs.scale_committed       = s.scale_committed[i];
         cs.translation_committed = s.lever_committed[i];
+        // Per-source bias states (Slice 11b): the bias DOF is filled AFTER the predict/update
+        // below (it reflects this step's de-bias + any absolute-ref injection), not here.
+        cs.bias            = Vec6::Zero();
+        cs.bias_observable = Scalar(0);
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).
@@ -1278,7 +1313,38 @@ Status Estimator::step(Timestamp now) {
         s.eskf.init(SE3{}, Mat12::Zero());
         s.eskf_started = true;
     }
-    s.eskf.predict(med.value, dt, q_pose);
+
+    // ---- Per-source bias states (Slice 11b, Option A) routing -------------------
+    // The augmented (bias) filter runs ONLY in the regime where it is exact: the single bias
+    // source DRIVES THE PREDICT ALONE this step, i.e. the fusion median set is that source only
+    // (n == 1 and the lone median entry is the bias slot). That holds for a 1-source rig or a
+    // ReferenceOnly cold-start where the bias source is the reference and nothing else has
+    // committed yet (DESIGN §5 "one source drives the predict"). In that regime med.value IS the
+    // bias source's frame-aligned delta, so de-biasing it (Delta o exp(-b*dt)) is exact. We
+    // ENABLE the augmented mode lazily on the FIRST such step (carrying the live 12-DOF pose/
+    // twist + a bias prior) and route predict/update through the _aug methods from then on.
+    //
+    // If the regime is NOT met (no bias source, or other sources joined the median), we use the
+    // 12-DOF predict — BYTE-IDENTICAL to pre-11b. Multi-source-median bias coupling (Option B)
+    // is DEFERRED, so once other sources drive the predict the bias is simply not updated this
+    // step (the augmented filter, if already enabled, would mis-model the consensus delta). For
+    // the documented Option-A regimes the bias source drives alone every step, so this is moot;
+    // we guard it for correctness.
+    const bool bias_drives_alone =
+        (s.bias_slot >= 0) && (n == 1) && (s.med_slot[0] == s.bias_slot);
+    bool use_aug = false;
+    if (bias_drives_alone) {
+        if (!s.eskf.bias_active()) s.eskf.enable_bias(Impl::kBiasCov0);
+        s.eskf.predict_aug(med.value, dt, q_pose, s.bias_process_noise);
+        use_aug = true;
+    } else {
+        // Predict-only 12-DOF path. NOTE: if the augmented mode was previously enabled but the
+        // bias source no longer drives alone, we fall back to the plain predict on the published
+        // 12x12 state (the bias estimate is held frozen inside the filter but not propagated/
+        // applied — the Option-B regime is out of scope). This keeps the no-bias default and the
+        // documented single-driving-source regime exact.
+        s.eskf.predict(med.value, dt, q_pose);
+    }
 
     // This fuse succeeded: advance the integration frontier so the next step picks
     // up exactly where this one ended (no gap, no overlap).
@@ -1307,7 +1373,13 @@ Status Estimator::step(Timestamp now) {
             Measurement m;
             if (!corr->evaluate(x, m)) continue;   // no fix available this step
             ++cdiag.corr_evaluated;
-            const bool applied = s.eskf.update(m, cfg.mahalanobis_chi2);
+            // Route through the augmented 18-DOF update when the bias filter is active this step
+            // (Slice 11b, Option A): update_aug() injects the bias via the pose<->bias cross-
+            // covariance the predict_aug built, REMOVING the source's drift. Otherwise the plain
+            // 12-DOF update() (byte-identical to Slice 11). Same Mahalanobis gate either way.
+            const bool applied = (use_aug && s.eskf.bias_active())
+                                     ? s.eskf.update_aug(m, cfg.mahalanobis_chi2)
+                                     : s.eskf.update(m, cfg.mahalanobis_chi2);
             if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
             cdiag.last_nis = s.eskf.last_nis();     // last NIS, accepted or rejected
         }
@@ -1318,6 +1390,23 @@ Status Estimator::step(Timestamp now) {
     // the corrections so the published pose/covariance reflect any accepted update.
     s.result.frontier        = s.eskf.state();
     s.result.frontier.stamp  = t1;
+
+    // Per-source bias snapshot (Slice 11b, Option A). Filled HERE — after predict_aug (the
+    // de-bias) and the absolute-ref update_aug (the injection) — so it reflects THIS step's
+    // bias estimate. Only the single bias source carries it; every other source reads zero
+    // (set in the snapshot loop above). bias_observable is the pose<->bias cross-covariance
+    // magnitude: ~0 with no absolute ref (the bias never becomes observable, the self-test),
+    // nonzero once the predict couples the bias to the pose AND fixes start shrinking it.
+    if (s.bias_slot >= 0 && s.eskf.bias_active()) {
+        CalibSnapshot& bcs   = s.result.calib[s.bias_slot];
+        bcs.bias             = s.eskf.bias();
+        // bias_observable = the BOUNDED observability confidence (how much the bias-block
+        // covariance has shrunk below its prior). ~0 with no absolute ref (the bias variance
+        // only grows -> never determined); rises as fixes shrink it. NOT the raw cross-cov
+        // (which grows unbounded under predict-only) — that is the mechanism term, bias_confidence
+        // is the "determined yet?" term the self-test reads.
+        bcs.bias_observable  = s.eskf.bias_confidence();
+    }
 
     // Lifecycle (Slice 3, D23): a successful fuse latches ever_fused_; the phase is
     // NOMINAL when >= min_sources_warn sources PARTICIPATED, else DEGRADED (reduced
@@ -1658,6 +1747,20 @@ Status validate(const Config& cfg) {
     // positive — a non-positive threshold would reject EVERY measurement (NIS >= 0 always),
     // silently disabling the correction path.
     if (cfg.mahalanobis_chi2 <= 0.0)                     return Status::OutOfRange;
+
+    // Per-source bias states (Slice 11b, Option A, D22). Option A supports EXACTLY ONE bias
+    // source (the single driving source whose de-biased delta IS the predict). More than one
+    // bias_states=true source is the DEFERRED Option-B (median-coupled) regime -> reject here
+    // so the limitation is surfaced at init, not silently mis-modeled. Each bias source's
+    // random-walk process-noise rate must be non-negative.
+    if (cfg.sensors != nullptr) {
+        int bias_sources = 0;
+        for (int i = 0; i < cfg.sensor_count; ++i) {
+            if (cfg.sensors[i].bias_states) ++bias_sources;
+            if (cfg.sensors[i].bias_process_noise < 0.0) return Status::OutOfRange;
+        }
+        if (bias_sources > 1) return Status::InvalidConfig;   // Option A: single bias source only
+    }
 
     // TODO: per-sensor + histogram range checks.
     return Status::Ok;

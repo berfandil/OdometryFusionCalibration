@@ -39,6 +39,20 @@ enum class Phase { Init, Warmup, Degraded, Nominal };
 //                              recovered rotation feeds back into fusion's prior_extrinsic.R.
 //   * scale_committed        — the per-source scale commit (feeds fusion's prior_scale).
 //   * translation_committed  — the xyz lever-arm commit (feeds prior_extrinsic.t).
+// Per-source body-twist bias estimate (Slice 11b, Option A, D22):
+//   * bias            — the estimated CONSTANT body-twist bias b = [v_bias; omega_bias] in R^6
+//                       on this source's reported motion (a raw-IMU-style rate offset). Nonzero
+//                       only for the single driving source with SensorConfig::bias_states; zero
+//                       for every other source. Removed from the fused pose each predict
+//                       (Delta_db = delta o exp(-b*dt)).
+//   * bias_observable — the bias OBSERVABILITY CONFIDENCE in [0,1]: how much the bias-block
+//                       covariance has been REDUCED below its prior (1 - P_bias/P_bias_prior).
+//                       ~0 with NO absolute ref (the bias variance only grows under the random
+//                       walk -> never DETERMINED; the observability self-test reads this);
+//                       rising toward 1 as absolute-ref updates shrink it through the pose<->bias
+//                       cross-covariance. (The raw cross-cov magnitude — the coupling mechanism —
+//                       grows unbounded predict-only, so the confidence, not the cross-cov, is the
+//                       honest "is the bias observed yet" signal.)
 struct CalibSnapshot {
     SourceId id            = 0;
     SE3      extrinsic;                 // estimated mount (yaw/pitch Slice 6; + roll/t Slice 7)
@@ -48,6 +62,8 @@ struct CalibSnapshot {
     Scalar   extrinsic_confidence = 0.0; // rotation (yaw/pitch ∧ roll) concentration in [0,1]
     Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
     Scalar   translation_confidence = 0.0; // xyz lever-arm concentration in [0,1] (Slice 7)
+    Vec6     bias = Vec6::Zero();       // body-twist bias [v;omega] (Slice 11b; 0 unless bias src)
+    Scalar   bias_observable = 0.0;     // pose<->bias cross-cov magnitude (Slice 11b)
     bool     committed     = false;     // TIME-OFFSET commit (Slice 5)
     bool     extrinsic_committed     = false; // yaw/pitch ∘ roll commit (Slice 8)
     bool     scale_committed         = false; // scale commit (Slice 8)

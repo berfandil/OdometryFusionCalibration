@@ -29,8 +29,46 @@ public:
     Eskf() = default;
 
     // Initialize the filter at pose0 with covariance cov0 (12x12, [pose; twist]).
-    // Twist starts at zero; stamp at 0. Resets the filter.
+    // Twist starts at zero; stamp at 0. Resets the filter. Also resets the augmented
+    // (bias) mode to OFF — the 12-DOF path is the default (Slice 11b).
     void init(const SE3& pose0, const Mat12& cov0);
+
+    // ------------------------------------------------------------------------------------
+    // OPTIONAL AUGMENTED (bias) MODE — Slice 11b, Option A (clean single-driving-source).
+    //
+    // When a SINGLE source has SensorConfig::bias_states and drives the predict, the filter
+    // can carry that source's CONSTANT body-twist bias b = [v_bias; omega_bias] in R^6 as an
+    // extra state and let an absolute-ref update OBSERVE + REMOVE it through the pose<->bias
+    // cross-covariance (the classic loosely-coupled GPS/INS drift correction, D22). The
+    // augmented error-state is 18-DOF [delta_pose(6); delta_twist(6); delta_bias(6)] with a
+    // dense Mat18 covariance. Enabling this DOES NOT change the 12-DOF path: predict()/update()
+    // (the no-bias methods above/below) stay byte-identical; the augmented behavior lives in
+    // predict_aug()/update_aug(). The estimator routes to the aug methods only when a bias
+    // source is active, so the DEFAULT (no bias source) is unaffected.
+    //
+    // enable_bias() switches the filter into augmented mode at the current 12-DOF state:
+    // bias starts at zero, the bias block of the 18x18 covariance is seeded to bias_cov0 * I6
+    // (a prior on how large the bias might be — must be > 0 for the bias to be observable), the
+    // pose+twist blocks copy the current 12x12, and all cross-blocks start at 0. Idempotent-safe
+    // (re-enabling re-seeds). Call AFTER init().
+    void enable_bias(Scalar bias_cov0);
+    bool bias_active() const { return bias_active_; }
+    Vec6 bias() const { return bias_; }   // current bias estimate (zero if inactive)
+
+    // The largest pose<->bias cross-covariance magnitude (max-abs over the 6x6 P_pose,bias
+    // block). The MECHANISM term: nonzero means the predict has built the coupling an
+    // absolute-ref update needs to MOVE the bias. NOTE it GROWS unbounded under predict-only
+    // (no update shrinks it), so it is the coupling magnitude, not a "determined" signal — use
+    // bias_confidence() for the latter. 0 when inactive.
+    Scalar bias_pose_coupling() const;
+
+    // Bias OBSERVABILITY CONFIDENCE in [0, 1]: how much the bias-block uncertainty has been
+    // REDUCED below its enable_bias() prior, = clamp(1 - trace(P_bias)/trace(P_bias_prior), 0, 1).
+    // 0 with NO absolute ref (the bias variance only grows under the random walk -> the bias is
+    // never DETERMINED), rising toward 1 as absolute-ref updates shrink it through the pose<->bias
+    // cross-covariance. This is the bounded "is the bias observed yet" signal surfaced as
+    // CalibSnapshot::bias_observable; the observability self-test reads it staying ~0 with no ref.
+    Scalar bias_confidence() const;
 
     // Predict-only step over a window of length dt (seconds), consuming the fused
     // median delta:
@@ -78,8 +116,38 @@ public:
     // documented limitation, not over-engineered here.
     bool update(const Measurement& m, Scalar chi2_threshold);
 
-    // NIS (d2) of the LAST update() call — set whether the gate accepted or rejected; 0
-    // before any update(). Surfaced by the estimator into Result diagnostics.
+    // ---- Augmented (bias) predict/update — Slice 11b, Option A --------------------------
+    // The bias-aware counterparts of predict()/update(). The estimator calls THESE (not the
+    // 12-DOF versions) for the single driving bias source; the 12-DOF path is untouched.
+    //
+    // predict_aug(): de-biases the driving delta before propagating, then propagates the 18x18
+    // covariance with the bias->pose coupling that makes the bias observable.
+    //   de-bias:  Delta_db = delta o se3::exp(-bias * dt)   (bias is a RATE over the window;
+    //             integrating -bias over dt gives the se(3) 6-vector -bias*dt)
+    //   mean:     pose <- pose o Delta_db ;  twist <- log(Delta_db)/dt   (de-biased readout)
+    //   F (18x18, right-error, block rows pose/twist/bias):
+    //       pose row : [ Ad(Delta_db^-1) | 0 |  J_pb ]   J_pb = -dt * I6   (THE coupling)
+    //       twist row: [ 0 | 0 | 0 ]   (twist re-read each step, as in predict())
+    //       bias row : [ 0 | 0 | I6 ]  (constant-bias random walk)
+    //   P <- F P F^T + Q,  Q = blkdiag( q_pose, q_pose/dt^2, bias_pn*dt*I6 ), symmetrized.
+    // The J_pb = -dt*I6 sign/scale is EXACT for the right-perturbation Delta_db,true =
+    //   Delta_db o exp(-delta_bias*dt): the bias error enters the new pose tangent directly as
+    //   -dt*delta_bias (verified by the sim recovering the planted bias). Without this block the
+    //   bias has ZERO cross-covariance with the pose and a GPS update cannot observe it.
+    // `bias_pn` is SensorConfig::bias_process_noise (>= 0). dt <= 0 is guarded as in predict().
+    void predict_aug(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn);
+
+    // update_aug(): the 18-DOF Mahalanobis-gated measurement update. The measurement H is the
+    // SAME [H_pose(n x6) | 0(n x6)] the 12-DOF update uses; the augmented H pads a third zero
+    // block (n x6) — GPS observes the pose, NOT the bias directly. But the Kalman gain K = P H^T
+    // S^-1 (18 x n) has NONZERO bias rows via the P_pose,bias cross-covariance the predict built,
+    // so dx[12:18] != 0 and the update INJECTS the bias: bias += dx[12:18] (pose/twist injected as
+    // in update()). Joseph-form 18x18 covariance; same scalar chi2 gate; last_nis() updated.
+    // Returns true iff applied. No-op (false) when bias is inactive (caller should use update()).
+    bool update_aug(const Measurement& m, Scalar chi2_threshold);
+
+    // NIS (d2) of the LAST update() / update_aug() call — set whether the gate accepted or
+    // rejected; 0 before any update. Surfaced by the estimator into Result diagnostics.
     Scalar last_nis() const { return last_nis_; }
 
     // Const-velocity extrapolation `dt_ahead` seconds past the frontier:
@@ -103,6 +171,14 @@ public:
 private:
     State  state_{};
     Scalar last_nis_ = Scalar(0);   // NIS of the last update() (accepted or rejected)
+
+    // Augmented (bias) mode — Slice 11b, Option A. Inactive by default; enable_bias() turns it
+    // on. When active, cov18_ is the live 18x18 covariance (state_.cov mirrors its top-left
+    // 12x12 for the published frontier) and bias_ is the current body-twist bias estimate.
+    bool   bias_active_ = false;
+    Vec6   bias_   = Vec6::Zero();
+    Mat18  cov18_  = Mat18::Identity();
+    Scalar bias_prior_trace_ = Scalar(0);   // trace(P_bias) at enable_bias() (for confidence)
 };
 
 } // namespace ofc

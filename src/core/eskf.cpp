@@ -38,6 +38,10 @@ Timestamp secs_to_ns(Scalar s) {
 Mat12 symmetrize(const Mat12& M) {
     return Scalar(0.5) * (M + M.transpose());
 }
+
+Mat18 symmetrize18(const Mat18& M) {
+    return Scalar(0.5) * (M + M.transpose());
+}
 } // namespace
 
 void Eskf::init(const SE3& pose0, const Mat12& cov0) {
@@ -48,6 +52,39 @@ void Eskf::init(const SE3& pose0, const Mat12& cov0) {
     state_.cov       = symmetrize(cov0);   // ensure clean symmetry from the start
     state_.stamp     = 0;
     last_nis_        = Scalar(0);          // no update() yet
+    // Augmented (bias) mode OFF on init — the 12-DOF path is the default (Slice 11b).
+    bias_active_      = false;
+    bias_             = Vec6::Zero();
+    cov18_            = Mat18::Identity();
+    bias_prior_trace_ = Scalar(0);
+}
+
+void Eskf::enable_bias(Scalar bias_cov0) {
+    // Switch into augmented mode at the CURRENT 12-DOF state. Bias starts at zero; the
+    // augmented covariance copies the live pose+twist 12x12 into its top-left block, seeds the
+    // bias block to bias_cov0*I6 (the bias prior — must be > 0 to be observable), and zeroes all
+    // cross-blocks (the predict builds the pose<->bias coupling from here).
+    bias_active_ = true;
+    bias_        = Vec6::Zero();
+    cov18_       = Mat18::Zero();
+    cov18_.block<12, 12>(0, 0) = state_.cov;
+    const Scalar bc = (bias_cov0 > Scalar(0)) ? bias_cov0 : Scalar(1e-6);
+    cov18_.block<6, 6>(12, 12) = bc * Mat6::Identity();
+    cov18_ = symmetrize18(cov18_);
+    bias_prior_trace_ = cov18_.block<6, 6>(12, 12).trace();   // for bias_confidence()
+}
+
+Scalar Eskf::bias_pose_coupling() const {
+    if (!bias_active_) return Scalar(0);
+    // Max-abs over the 6x6 pose<->bias cross-covariance block (rows 0..5, cols 12..17).
+    return cov18_.block<6, 6>(0, 12).cwiseAbs().maxCoeff();
+}
+
+Scalar Eskf::bias_confidence() const {
+    if (!bias_active_ || !(bias_prior_trace_ > Scalar(0))) return Scalar(0);
+    const Scalar cur = cov18_.block<6, 6>(12, 12).trace();
+    const Scalar reduced = Scalar(1) - cur / bias_prior_trace_;   // 1 - P_bias/P_bias_prior
+    return std::max(Scalar(0), std::min(Scalar(1), reduced));
 }
 
 void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
@@ -152,6 +189,97 @@ bool Eskf::update(const Measurement& m, Scalar chi2_threshold) {
     state_.twist.cov = state_.cov.block<6, 6>(6, 6);
 
     // NOTE: stamp untouched — the estimator owns the frontier clock (as in predict()).
+    return true;
+}
+
+void Eskf::predict_aug(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn) {
+    const Scalar dt_eff = (dt > kMinDt) ? dt : kMinDt;
+
+    // --- de-bias the driving delta -----------------------------------------
+    // The bias is a body-twist RATE applied over the window; integrating -bias over dt gives the
+    // se(3) 6-vector -bias*dt, so the de-biased delta is Delta_db = delta o exp(-bias*dt).
+    const SE3 bias_corr = se3::exp(-bias_ * dt_eff);
+    const SE3 delta_db  = se3::compose(delta, bias_corr);
+
+    // --- mean propagation --------------------------------------------------
+    state_.pose     = se3::compose(state_.pose, delta_db);   // T <- T o Delta_db
+    state_.twist.xi = se3::log(delta_db) / dt_eff;           // de-biased const-velocity readout
+    // bias mean is unchanged (random walk; the update is the only thing that moves it).
+
+    // --- covariance propagation: P <- F P F^T + Q (18x18) ------------------
+    const Mat6 Ad_inv = se3::adjoint(se3::inverse(delta_db));
+
+    Mat18 F = Mat18::Zero();
+    F.block<6, 6>(0, 0)  = Ad_inv;                       // pose <- Ad(Delta_db^-1) * pose
+    // pose <- J_pb * bias.  J_pb = -dt*I6: the right-perturbation Delta_db,true =
+    // Delta_db o exp(-delta_bias*dt) injects -dt*delta_bias straight into the new pose tangent
+    // (exact to first order; the sim pins this sign/scale by recovering the planted bias).
+    F.block<6, 6>(0, 12) = -dt_eff * Mat6::Identity();   // THE bias->pose coupling
+    // twist row stays zero (re-read each step). bias row = identity (random walk):
+    F.block<6, 6>(12, 12) = Mat6::Identity();
+
+    Mat18 Q = Mat18::Zero();
+    Q.block<6, 6>(0, 0)   = q_pose;                      // pose increment noise
+    Q.block<6, 6>(6, 6)   = q_pose / (dt_eff * dt_eff);  // -> velocity noise
+    const Scalar bpn = (bias_pn > Scalar(0)) ? bias_pn : Scalar(0);
+    Q.block<6, 6>(12, 12) = (bpn * dt_eff) * Mat6::Identity();   // bias random-walk noise
+
+    cov18_ = symmetrize18(F * cov18_ * F.transpose() + Q);
+
+    // Mirror the published 12x12 (pose+twist) into state_.cov so latest()/frontier read the
+    // augmented filter's pose/twist covariance unchanged.
+    state_.cov       = cov18_.block<12, 12>(0, 0);
+    state_.twist.cov = state_.cov.block<6, 6>(6, 6);
+    // stamp untouched — the estimator owns the frontier clock (as in predict()).
+}
+
+bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold) {
+    if (!bias_active_) return false;        // caller should use update() when bias is off
+    const int n = m.dim;
+    if (n <= 0 || n > 6) return false;      // empty / out-of-range measurement => no-op
+
+    // Pad to full fixed-size capacity (strict core, mirrors update()). H is 6x18: the active
+    // measurement on the top-left n x 12 (pose+twist) block; the bias columns (12..17) are
+    // ZERO (GPS observes the pose, not the bias directly). Padded rows [n..5] -> 0 with R's
+    // unused diagonal at 1 so S stays invertible without coupling into the active n-block.
+    Eigen::Matrix<Scalar, 6, 18> H = Eigen::Matrix<Scalar, 6, 18>::Zero();
+    Vec6 r = Vec6::Zero();
+    Mat6 R = Mat6::Identity();
+    H.block(0, 0, n, 12) = m.H.topLeftCorner(n, 12);    // pose+twist part; bias cols stay 0
+    r.head(n)            = m.residual.head(n);
+    R.topLeftCorner(n, n) = m.R.topLeftCorner(n, n);
+
+    const Mat18& P = cov18_;
+
+    const Mat6 S = H * P * H.transpose() + R;            // innovation covariance (n-block + pad)
+    const Eigen::LDLT<Mat6> Sldlt = S.ldlt();
+    const Vec6  Sinv_r = Sldlt.solve(r);
+    const Scalar d2    = r.dot(Sinv_r);
+    last_nis_ = d2;
+
+    if (d2 > chi2_threshold) return false;               // gate: reject (state unchanged)
+
+    // Kalman gain K = P H^T S^-1 (18 x 6 capacity). The bias rows of K are NONZERO via the
+    // P_pose,bias cross-covariance the predict built -> the update injects the bias.
+    const Eigen::Matrix<Scalar, 6, 18> HP = H * P;       // 6 x 18
+    const Eigen::Matrix<Scalar, 6, 18> Kt = Sldlt.solve(HP);
+    const Eigen::Matrix<Scalar, 18, 6> K  = Kt.transpose();
+
+    const Eigen::Matrix<Scalar, 18, 1> dx = K * r;       // 18-vector error state
+
+    // Inject (same right-error tangent as update()):
+    //   pose  <- pose o exp(dx[0:6]) ;  twist += dx[6:12] ;  bias += dx[12:18]
+    state_.pose     = se3::compose(state_.pose, se3::exp(dx.segment<6>(0)));
+    state_.twist.xi = state_.twist.xi + dx.segment<6>(6);
+    bias_           = bias_ + dx.segment<6>(12);          // <-- the bias removal
+
+    // Joseph-form 18x18 covariance (guaranteed PSD), then symmetrize.
+    const Mat18 IKH = Mat18::Identity() - K * H;
+    cov18_ = symmetrize18(IKH * P * IKH.transpose() + K * R * K.transpose());
+
+    // Mirror the published 12x12.
+    state_.cov       = cov18_.block<12, 12>(0, 0);
+    state_.twist.cov = state_.cov.block<6, 6>(6, 6);
     return true;
 }
 

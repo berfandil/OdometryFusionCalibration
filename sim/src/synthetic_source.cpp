@@ -108,6 +108,14 @@ Expected<Delta> SyntheticSource::query(Timestamp t0, Timestamp t1) const {
         B = se3::exp(p_.outlier_twist * dt);
     } else {
         B = B_clean;
+        // Planted constant body-twist bias (Slice 11b): a rate over the window, B <- B o
+        // exp(b*dt). The augmented ESKF removes it via Delta o exp(-b*dt). Not applied on
+        // outlier windows (the outlier already overrides the whole delta). Skip the exp when
+        // the bias is zero so non-bias sources are byte-identical to pre-11b.
+        if (p_.body_twist_bias.squaredNorm() > Scalar(0)) {
+            const Scalar dt = static_cast<Scalar>(t1 - t0) / Scalar(1e9);
+            B = se3::compose(B, se3::exp(p_.body_twist_bias * dt));
+        }
     }
 
     // Add zero-mean Gaussian noise in the body tangent (deterministic per window). The

@@ -70,6 +70,15 @@ struct SourceParams {
     // motion the base body actually had at t + off. Negative off reads an earlier slice.
     Scalar time_offset_s = Scalar(0.0);
 
+    // Planted CONSTANT body-twist bias (Slice 11b, Option A). A rate b = [v_bias; omega_bias]
+    // in R^6 added to the reported body motion over the window: the reported delta becomes
+    // B <- B o exp(b * dt) (dt = window length in seconds). This is exactly the raw-IMU-style
+    // rate offset the augmented ESKF de-biases with Delta o exp(-b*dt); planting it here lets a
+    // bias-states source + an absolute ref recover it. Zero = no bias (every other source). The
+    // bias is applied BEFORE the per-window Gaussian noise and is NOT injected on outlier windows
+    // (the outlier already replaces the whole delta).
+    Vec6 body_twist_bias = Vec6::Zero();
+
     // Noise model (deterministic, seeded). Per-distance translational sigma and
     // per-angle rotational sigma, applied in the body tangent of the reported delta.
     Scalar noise_trans_per_m   = Scalar(0.0);  // [m sigma per m travelled]
