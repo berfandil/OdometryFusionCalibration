@@ -141,14 +141,17 @@ TEST_CASE("correction: an absolute position ref removes predict-only odometry dr
         std::vector<std::unique_ptr<SyntheticSource>> srcs;
         for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
         std::vector<SensorConfig> sensors;
-        // GATE/NOISE interplay (documented): with a tight sigma_pos (0.05 m) the innovation
-        // covariance S ~ R is small, so an accumulated DRIFT residual of a few tenths of a
-        // metre already exceeds the default chi2=9 gate — the drift IS the signal we want to
-        // admit, not an outlier. We loosen the gate to chi2=100 here so genuine drift
-        // corrections pass; the dedicated gate case below independently proves a gross 30 m
-        // outlier (NIS ~3e5) is still rejected at this same loosened threshold. (Ideally the
-        // gate would be the chi2 quantile for n=3 DOF and R would reflect the true fix
-        // trust; see eskf.hpp's documented single-scalar limitation.)
+        // chi2=100 IS A TEST ARTIFACT, NOT A RECOMMENDED PRODUCTION VALUE. Root cause: the
+        // Slice-14 covariance pessimism (see reviews/slice-14-findings.md: NEES ~= 0.13, the
+        // filter is ~46x pessimistic). The ESKF inits P = I12 and the predict-only stretches
+        // never shrink it, so the accumulated-drift residual's NIS legitimately exceeds the
+        // default chi2=9 gate even though the drift IS the signal we want to admit. With a
+        // CORRECTLY-calibrated filter (a smaller init-P and/or denser fixes that keep P from
+        // staying inflated between corrections), the default chi2=9 would already admit these
+        // legitimate drift residuals and this loosening would be unnecessary. We widen to
+        // chi2=100 ONLY so the mis-calibrated-P case can still demonstrate drift removal; the
+        // dedicated gate case below independently proves a gross 30 m outlier (NIS ~3e5) is
+        // still rejected at this same loosened threshold.
         Config cfg = corr_config(planted, sensors, /*mahalanobis_chi2=*/100.0);
 
         AbsoluteRefParams rp;
@@ -276,16 +279,20 @@ TEST_CASE("correction: registering no correction is byte-identical to the predic
         if (!a[i].fused) continue;
         const Result& ra = a[i].result;
         const Result& rb = b[i].result;
+        // Fold the byte-equality AND the all-zero no-correction-summary property into ONE
+        // boolean per fused record (mirrors test_validation.cpp's golden fold). The fold uses
+        // the SAME exact comparisons, so the CHECK still fails if ANY frontier field diverges
+        // across the two runs OR if any record shows a non-zero correction summary.
         bool equal = true;
         equal = equal && (ra.frontier.pose.R.array() == rb.frontier.pose.R.array()).all();
         equal = equal && (ra.frontier.pose.t.array() == rb.frontier.pose.t.array()).all();
         equal = equal && (ra.frontier.cov.array()    == rb.frontier.cov.array()).all();
-        CHECK(equal);
         // No correction registered -> the correction summary is the zero default every step.
-        CHECK(ra.correction.corr_evaluated == 0);
-        CHECK(ra.correction.corr_applied   == 0);
-        CHECK(ra.correction.corr_rejected  == 0);
-        CHECK(ra.correction.last_nis       == 0.0);
+        equal = equal && (ra.correction.corr_evaluated == 0);
+        equal = equal && (ra.correction.corr_applied   == 0);
+        equal = equal && (ra.correction.corr_rejected  == 0);
+        equal = equal && (ra.correction.last_nis       == 0.0);
+        CHECK(equal);     // ONE assertion per fused record
         ++fused_compared;
     }
     REQUIRE(fused_compared > 50);

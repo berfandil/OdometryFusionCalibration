@@ -61,7 +61,11 @@ struct AbsoluteRefParams {
     Scalar period_s = Scalar(0.2);
 
     // window_s mirrors the rig/estimator GT anchor: the estimator's odom origin sits at the
-    // GT pose at (first_frontier - window_s). MUST equal the Config::window_s used by the rig.
+    // GT pose at (first_frontier - window_s). FOOTGUN: this MUST equal the Config::window_s
+    // the rig was init'd with. If it does not, anchor_inv shifts the reference origin and EVERY
+    // residual is biased by a constant offset (a silent constant-offset bias — the drift test
+    // would still partially improve, masking the misconfig). Callers must set
+    // `rp.window_s = cfg.window_s`. The first evaluate() asserts this value is sane (see .cpp).
     Scalar window_s = Scalar(0.10);
 
     // Position noise (m). R = sigma_pos^2 * I3; the added measurement noise is drawn with

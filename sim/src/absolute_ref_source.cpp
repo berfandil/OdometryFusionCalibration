@@ -3,6 +3,7 @@
 
 #include "ofc/core/lie.hpp"
 
+#include <cassert>
 #include <cmath>
 #include <random>
 
@@ -40,6 +41,15 @@ bool SyntheticAbsoluteRef::evaluate(const State& x, Measurement& out) const {
     // starts the odom pose at identity at the first fused tick and composes the first
     // bootstrap window. Establish anchor_inv on the FIRST evaluate (== the first frontier).
     if (!have_anchor_) {
+        // FOOTGUN GUARD (relaxed-edge sim): window_s MUST mirror the rig's Config::window_s,
+        // else this anchor sits at a different GT pose than the estimator's odom origin and
+        // EVERY residual is biased by a constant offset (a silent constant-offset bias). We
+        // cannot read the rig's Config from here (evaluate() only gets State x), so we assert
+        // the value is at least non-negative and finite as cheap insurance; callers are
+        // responsible for setting rp.window_s == cfg.window_s (see the header field comment).
+        assert(p_.window_s >= Scalar(0) && std::isfinite(p_.window_s) &&
+               "AbsoluteRefParams::window_s must mirror the rig's Config::window_s "
+               "(non-negative); a mismatch silently biases every correction residual");
         const Timestamp window_ns =
             static_cast<Timestamp>(std::llround(p_.window_s * kNanosPerSec));
         anchor_inv_  = se3::inverse(traj_->pose(stamp - window_ns));
