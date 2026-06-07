@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: ctest 2/2 — `unit` 200 cases / 8322 assertions + `adapters` 20 cases / 319 assertions.** 60 commits on `main`, working tree clean. Remote synced through the init-P fix (`7c1592c`); the 11b-deferral + 11b-Option-A commits are local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
+- **Gate green: ctest 2/2 — `unit` 200 cases / 8322 assertions + `adapters` 20 cases / 319 assertions.** ~61 commits on `main`, working tree clean. All feature work through **11b Option A** is pushed (remote at `0c19628`); only this handoff-refresh doc commit may be local. (The gate also builds the relaxed-edge adapters — `dev.ps1` sets `OFC_BUILD_ADAPTERS=ON`, so CTest runs both `unit` and `adapters`.)
 - **Done (all green):**
 
 | Unit | What |
