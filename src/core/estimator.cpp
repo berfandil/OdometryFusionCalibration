@@ -46,6 +46,7 @@
 #include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
+#include "ofc/core/smoother.hpp"
 #include "ofc/core/timesync.hpp"
 
 #include <algorithm>
@@ -175,12 +176,54 @@ struct Estimator::Impl {
     Phase2Calibrator calib2;
     // Per-step scratch for the calibration observe() (no heap in step()).
     SourceId calib_ids[kMaxSourcesCap];
+    // Registered slot of each covered (calibration) source, aligned with calib_ids — lets
+    // the Slice-10 smoother push/look-up the per-source slot without an id re-scan.
+    int      calib_slot[kMaxSourcesCap];
     SE3      calib_reported[kMaxSourcesCap];
     // Per-source Σ-confidence aligned with calib_ids — the same inverse-covariance scalar
     // used as the fusion weight (PRE clamp/prior, the raw confidence). Fed into both
     // calibrators' observe() so the D5 vote_weight Confidence/Combo modes can weight each
     // vote by how trustworthy the source's window is.
     Scalar   calib_conf[kMaxSourcesCap];
+
+    // ---- Per-sensor fixed-lag RTS smoother (Slice 10, D18) ----------------------------
+    // The DEEPER calibration frontier. When ANY source has SensorConfig::per_sensor_kf, the
+    // calibration feed runs at now − delay_fast − L (L = calib_lag_s · tick_rate_hz steps):
+    // each step's calibration inputs are buffered in a depth-(L+1) ring, and the lag-L-OLD
+    // entry drives the calibrators — with each smoothing-enabled source's twist replaced by
+    // the TWO-SIDED RTS-smoothed twist (sharper, zero-phase). FUSION is untouched (causal).
+    //
+    // smoother_active is false (and the whole deeper path is skipped — calibration runs at
+    // the causal frontier exactly as Slice 6/7/8) UNLESS at least one source enables
+    // per_sensor_kf. So the DEFAULT (every per_sensor_kf == false) is byte-identical to
+    // pre-Slice-10. Heap-resident inside Impl (allocated once in init()).
+    TwistSmoother smoother;
+    bool          smoother_active = false;            // any source has per_sensor_kf
+    bool          smooth_source[kMaxSourcesCap] = {}; // per registered slot: per_sensor_kf
+    int           calib_lag_steps = 0;                // L (clamped), == smoother.lag_steps()
+
+    // The deeper-frontier calibration-input ring (depth L+1). Each filled slot is one past
+    // step's full calibration input set: every covered source's de-scaled B_corr + its
+    // Σ-confidence + measured twist + the source id, the covered count, the consensus
+    // (fused_omega/fused_trans/med SE3), and the step dt. Sized at the compile-time caps so
+    // init() is the sole allocator (strict core). Logical order: 0 = oldest .. fill-1.
+    static constexpr int kCalibRing = TwistSmoother::kMaxLag + 1;
+    struct CalibFrame {
+        int      nc = 0;
+        SourceId ids[kMaxSourcesCap];
+        SE3      reported[kMaxSourcesCap];     // de-scaled B_corr (raw, delayed)
+        Scalar   conf[kMaxSourcesCap];
+        int      slot[kMaxSourcesCap];         // registered slot of each covered source
+        Vec3     fused_omega = Vec3::Zero();
+        Vec3     fused_trans = Vec3::Zero();
+        SE3      fused_motion;
+        Scalar   dt = Scalar(0);
+    };
+    CalibFrame calib_ring[kCalibRing];
+    int        calib_ring_count = 0;           // filled entries (saturates at L+1)
+    // Per-step scratch the deeper path writes the lag-L entry's (possibly smoothed) deltas
+    // into before calling observe() (no heap in step()).
+    SE3        calib_smoothed[kMaxSourcesCap];
 
     // Per-source time-offset commit state (DESIGN §2/§6). A source's offset is COMMITTED
     // (driving fusion) once its histogram concentration clears commit_concentration AND
@@ -331,6 +374,23 @@ struct Estimator::Impl {
         const SourceId id = sources[i]->id();
         if (id == cfg.reference_sensor_id) return true;
         return ext_committed[i];   // ReferenceOnly: join once the extrinsic is committed
+    }
+
+    // Drive BOTH calibrators (Phase 1 + Phase 2) for one set of calibration inputs — the
+    // shared observe core used by the causal path (Slice 6/7) AND the deeper-frontier path
+    // (Slice 10). `reported` are the (possibly RTS-smoothed) de-scaled B_corr deltas, `omega`
+    // / `trans` / `motion` the consensus paired with them (causal step's consensus, or the
+    // lag-L-old consensus on the deeper path — kept TIME-ALIGNED with `reported`). This is
+    // exactly the sequence the Slice-6/7 call site ran inline; factoring it lets the smoother
+    // swap in the lagged + smoothed inputs without duplicating the observe wiring. Heap-free.
+    void run_calibration_observe(int nc_in, const SourceId* ids, const SE3* reported,
+                                 const Vec3& omega, const Vec3& trans, const SE3& motion,
+                                 const Scalar* conf) {
+        calib1.observe(nc_in, ids, reported, omega, trans, conf);
+        for (int i = 0; i < nc_in; ++i) {
+            calib2.set_yaw_pitch(ids[i], calib1.extrinsic(ids[i]).R);
+        }
+        calib2.observe(nc_in, ids, reported, motion, omega, conf);
     }
 
     // Apply the calibration->fusion feedback (Slice 8) for one step, AFTER the result is
@@ -509,7 +569,13 @@ Status Estimator::init(const Config& cfg) {
         impl_->resid_var[i]         = Scalar(0);
         impl_->resid_n[i]           = 0;
         impl_->reliability[i]       = Scalar(1);
+        // Per-sensor smoother gate (Slice 10): bound in add_source(); default off.
+        impl_->smooth_source[i]     = false;
+        impl_->calib_slot[i]        = -1;
     }
+    // Deeper-frontier calibration ring + smoother (Slice 10): empty until the first step.
+    impl_->calib_ring_count = 0;
+    impl_->smoother.reset();
 
     // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
     // configs skip it entirely (behave exactly as before — offsets stay at the priors).
@@ -533,6 +599,37 @@ Status Estimator::init(const Config& cfg) {
     {
         const Status cs = impl_->calib2.configure(cfg, cfg.reference_sensor_id);
         if (!ok(cs)) return cs;
+    }
+
+    // Per-sensor fixed-lag RTS smoother (Slice 10, D18). Scan the SensorConfigs: if ANY has
+    // per_sensor_kf, the calibration feed switches to the DEEPER (lag-L) frontier and the
+    // smoother is configured. With NONE enabled (the default for every existing test) the
+    // smoother stays INACTIVE and the calibration call site is byte-identical to Slice 6/7/8
+    // (the hard non-regression guard). L = round(calib_lag_s · tick_rate_hz), clamped to
+    // [1, TwistSmoother::kMaxLag] by configure(). Process noise = the MAX per-source
+    // kf_process_noise among enabled sources (one shared CV model strength — a per-source q
+    // is a possible later refinement; reported as a simplification).
+    impl_->smoother_active = false;
+    impl_->calib_lag_steps = 0;
+    {
+        bool   any_kf = false;
+        Scalar q_kf   = Scalar(0);
+        if (cfg.sensors != nullptr) {
+            for (int i = 0; i < cfg.sensor_count; ++i) {
+                if (cfg.sensors[i].per_sensor_kf) {
+                    any_kf = true;
+                    q_kf = std::max(q_kf, cfg.sensors[i].kf_process_noise);
+                }
+            }
+        }
+        if (any_kf) {
+            int L = static_cast<int>(std::llround(cfg.calib_lag_s * cfg.tick_rate_hz));
+            if (q_kf <= Scalar(0)) q_kf = Scalar(1);   // guard a non-positive knob
+            const Status ss = impl_->smoother.configure(cfg.max_sources, L, q_kf);
+            if (!ok(ss)) return ss;
+            impl_->smoother_active = true;
+            impl_->calib_lag_steps = impl_->smoother.lag_steps();
+        }
     }
 
     impl_->inited = true;
@@ -559,6 +656,10 @@ Status Estimator::add_source(const ISource* src) {
     impl_->prior_scale[slot] = (ps > Scalar(0)) ? ps : Scalar(1);
     impl_->prior_time_offset[slot] =
         (sc != nullptr) ? sc->prior_time_offset_s : Scalar(0);
+    // Per-sensor smoother gate (Slice 10): this slot feeds SMOOTHED twists to the
+    // calibrators iff its SensorConfig::per_sensor_kf is set (else its raw delayed B_corr
+    // is used on the deeper path; off entirely if no source enables it).
+    impl_->smooth_source[slot] = (sc != nullptr) ? sc->per_sensor_kf : false;
     // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
     {
         const SE3  Xp = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
@@ -706,6 +807,7 @@ Status Estimator::step(Timestamp now) {
         // (direction -> yaw/pitch + magnitude ratio -> scale; D11/D20). EVERY covered
         // source feeds calibration. Also carry the raw Σ-confidence (D5 vote_weight).
         s.calib_ids[nc]      = src->id();
+        s.calib_slot[nc]     = i;            // registered slot (Slice-10 smoother lookup)
         s.calib_reported[nc] = B_corr;
         s.calib_conf[nc]     = sigma_conf;
         ++nc;
@@ -822,39 +924,89 @@ Status Estimator::step(Timestamp now) {
         h.bias        = s.resid_mean[i];
     }
 
-    // ---- Phase-1 calibration stage (Slice 6, D5/D11/D20) -------------------------
-    // Drive the straight-gated calibrator with the fused consensus twist + per-source
-    // de-scaled reported deltas. The fused body angular SPEED is log(med.R)/dt (rad/s); the
-    // fused translation is the per-step DISPLACEMENT med.t (m, NOT ÷dt). NOTE the gate's two
-    // operands carry different time-normalization: straight_omega_max gates a speed, but
-    // straight_trans_min gates a per-step displacement — so straight_trans_min is
-    // CADENCE-DEPENDENT (scales with dt at fixed speed); tune it to the tick rate (see
-    // calibration.hpp observe()). The calibrator self-gates on the straight regime
-    // (||omega||<straight_omega_max AND ||t||>straight_trans_min) and votes the 3-channel
-    // so(3) direction + the magnitude-ratio scale. It runs at the SAME frontier as fusion
-    // for now (the deeper fixed-lag frontier is a later refinement). NO feedback into
-    // fusion in Slice 6 — it only populates CalibSnapshot below.
+    // ---- Calibration stage (Phase 1 Slice 6 + Phase 2 Slice 7; D5/D10/D11/D20/D21) ----
+    // The fused body angular SPEED is log(med.R)/dt (rad/s); the fused translation is the
+    // per-step DISPLACEMENT med.t (m, NOT ÷dt). NOTE the gate operands carry different
+    // time-normalization: straight_omega_max gates a speed, straight_trans_min a per-step
+    // displacement — so straight_trans_min is CADENCE-DEPENDENT (tune to the tick rate; see
+    // calibration.hpp). Phase 1 self-gates on the straight regime, Phase 2 on the turn
+    // regime. NO calibration feedback into fusion here (Slice 8 runs after publish).
     const Vec3 fused_omega = so3::log(med.value.R) / dt;
     const Vec3 fused_trans = med.value.t;
-    s.calib1.observe(nc, s.calib_ids, s.calib_reported, fused_omega, fused_trans,
-                     s.calib_conf);
 
-    // ---- Phase-2 calibration stage (Slice 7, D5/D10/D21) -------------------------
-    // Drive the TURN-gated hand-eye calibrator (A·X = X·B) with the fused consensus motion
-    // (A = the median SE3 delta) + per-source de-scaled reported deltas (B). First push the
-    // live Phase-1 yaw/pitch rotation into Phase 2 (the roll basepoint: R_X(roll) = R_yp ·
-    // Rx(roll)); then observe(). It self-gates on the turn regime (‖fused_omega‖ >
-    // turn_omega_min) and votes the roll (S¹) + the xyz lever-arm LS. Runs at the SAME
-    // frontier as fusion for now. NO feedback into fusion in Slice 7 — it only populates the
-    // CalibSnapshot extrinsic (roll + translation) + the rotation/translation confidences.
-    // R_yp is calib1.extrinsic().R, the recovered yaw/pitch (contractive minimal rotation —
-    // the same gauge the so(3) basepoint re-anchors in, so the roll composes on the corrected
-    // yaw/pitch after a re-anchor from a wrong prior).
-    for (int i = 0; i < nc; ++i) {
-        s.calib2.set_yaw_pitch(s.calib_ids[i], s.calib1.extrinsic(s.calib_ids[i]).R);
+    if (!s.smoother_active) {
+        // --- CAUSAL frontier (Slice 6/7/8 — the DEFAULT, byte-identical path) ----------
+        // No source enables per_sensor_kf: drive the calibrators IMMEDIATELY with THIS
+        // step's consensus + per-source de-scaled deltas, exactly as before Slice 10. This
+        // is the hard non-regression guard — the observe() sequence is unchanged.
+        s.run_calibration_observe(nc, s.calib_ids, s.calib_reported, fused_omega,
+                                  fused_trans, med.value, s.calib_conf);
+    } else {
+        // --- DEEPER (lag-L) frontier (Slice 10, D18) -----------------------------------
+        // Calibration tolerates latency, so it runs at now − delay − L. Push each
+        // smoothing-enabled source's MEASURED body twist log(B_corr)/dt into the smoother
+        // (it maintains its own internal two-sided lag-L window), and buffer THIS step's
+        // full calibration-input set into the depth-(L+1) ring. Once the ring is full, the
+        // OLDEST (lag-L) entry drives the calibrators — with each smoothing-enabled source's
+        // delta REPLACED by exp(smoothed_twist · dt_old) (the de-scale convention preserved:
+        // the smoothed twist is itself the twist of the de-scaled B_corr) and the consensus
+        // taken from that SAME lag-L entry (so the source-vs-consensus vote stays
+        // time-aligned). Non-smoothed sources use their (delayed) raw B_corr.
+        const int depth = s.calib_lag_steps + 1;
+
+        // (a) Push the measured twist of every smoothing-enabled covered source.
+        for (int i = 0; i < nc; ++i) {
+            const int slot = s.calib_slot[i];
+            if (slot < 0 || !s.smooth_source[slot]) continue;
+            const Vec6 zt = se3::log(s.calib_reported[i]) / dt;   // body twist of de-scaled B
+            s.smoother.push(slot, zt, dt);
+        }
+
+        // (b) Append THIS step's calibration inputs to the deeper ring (drop oldest if
+        // full). Write DIRECTLY into the destination ring slot (no large stack temporary —
+        // strict core); the full-ring case shifts entries down by one first.
+        if (s.calib_ring_count >= depth) {
+            for (int k = 0; k < depth - 1; ++k) s.calib_ring[k] = s.calib_ring[k + 1];
+        }
+        const int dst = (s.calib_ring_count < depth) ? s.calib_ring_count : (depth - 1);
+        Impl::CalibFrame& frame = s.calib_ring[dst];
+        frame.nc           = nc;
+        frame.fused_omega  = fused_omega;
+        frame.fused_trans  = fused_trans;
+        frame.fused_motion = med.value;
+        frame.dt           = dt;
+        for (int i = 0; i < nc; ++i) {
+            frame.ids[i]      = s.calib_ids[i];
+            frame.reported[i] = s.calib_reported[i];
+            frame.conf[i]     = s.calib_conf[i];
+            frame.slot[i]     = s.calib_slot[i];
+        }
+        if (s.calib_ring_count < depth) ++s.calib_ring_count;
+
+        // (c) Once the ring is full, drive the calibrators with the lag-L-OLD entry. The
+        // smoother's emitted twist is the two-sided estimate of THAT same lag-L sample
+        // (both trail the live frontier by exactly L steps), so they are time-aligned.
+        if (s.calib_ring_count >= depth) {
+            const Impl::CalibFrame& old = s.calib_ring[0];
+            for (int i = 0; i < old.nc; ++i) {
+                const int slot = old.slot[i];
+                if (slot >= 0 && s.smooth_source[slot] && s.smoother.ready(slot)) {
+                    // Reconstruct the de-scaled SE3 from the smoothed body twist over the
+                    // lag-L entry's dt: B_corr_smoothed = exp(w_smoothed · dt_old). This
+                    // preserves the de-scale convention (the twist IS that of the de-scaled
+                    // B_corr), so the calibrators' frame-align/magnitude logic is unchanged.
+                    const Vec6 w = s.smoother.smoothed(slot);
+                    s.calib_smoothed[i] = se3::exp(w * old.dt);
+                } else {
+                    s.calib_smoothed[i] = old.reported[i];   // raw delayed delta
+                }
+            }
+            s.run_calibration_observe(old.nc, old.ids, s.calib_smoothed, old.fused_omega,
+                                      old.fused_trans, old.fused_motion, old.conf);
+        }
+        // Before the ring fills, calibration simply has not started yet (the deeper frontier
+        // is not reachable until L steps have elapsed) — a no-op, documented.
     }
-    s.calib2.observe(nc, s.calib_ids, s.calib_reported, med.value, fused_omega,
-                     s.calib_conf);
 
     // Calibration snapshot (Slice 5 fills the time-offset DOF; extrinsic/scale stay at
     // their priors until Slices 6-8). Per source: the offset estimate currently APPLIED

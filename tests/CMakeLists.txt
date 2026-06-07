@@ -18,6 +18,8 @@ add_executable(ofc_tests
     test_calib_phase1.cpp
     test_calib_phase2.cpp
     test_calib_feedback.cpp
+    test_smoother.cpp
+    test_smoother_calib.cpp
     test_weights.cpp
     test_sim.cpp
     test_validation.cpp
