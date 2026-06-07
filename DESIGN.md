@@ -130,7 +130,7 @@ Every gate, vote weight, and reliability term derives from this table.
 - **Relaxed edges**: adapters + unit tests use std containers, exceptions, file IO — they never ship to the ECU.
 - **No `std::optional`/`variant`/`string_view`** (C++17) → explicit types / hand-rolled equivalents.
 - **Eigen** for linear algebra; **minimal in-house SO(3)/SE(3)** exp/log/adjoint (no Sophus/manif dependency; Sophus is the fallback).
-- **Config**: one validated POD struct at construction (`validate()` → status, bounds/capacity checks), preallocate once. Per-sensor sub-configs nest under a global config; every knob documented. File parsing (YAML/JSON/ROS-param) is an adapter that *builds* the struct.
+- **Config**: one validated POD struct at construction (`validate()` → status, bounds/capacity checks), preallocate once. Per-sensor sub-configs nest under a global config; every knob documented. File parsing (YAML/JSON/ROS-param) is an adapter that *builds* the struct. **Slice-13**: a dependency-free key=value/INI **config loader** adapter (`ofc_adapters`) parses a documented knob subset → `Config` (owns the `SensorConfig` vector; duplicate-id + reference cross-check; runs core `validate()`). A full YAML/ROS-param loader is a later adapter.
 
 ---
 

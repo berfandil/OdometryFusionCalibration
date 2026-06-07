@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: 195 doctest cases / 8274 assertions.** 50 commits on `main`, working tree clean. Remote synced through Slice 10; the Slice-12 commits are local (not pushed).
+- **Gate green: ctest 2/2 — `unit` 195 cases / 8274 assertions + `adapters` 20 cases / 319 assertions.** 53 commits on `main`, working tree clean. Remote synced through Slice 12; the Slice-13 commits are local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
 - **Done (all green):**
 
 | Unit | What |
@@ -55,13 +55,14 @@ Toolchain facts (this Windows box):
 | Slice 11 | absolute-ref correction path: `Eskf::update` (Mahalanobis-gated, Joseph, right-error full-SE(3) injection) + `add_correction` wired into `step()` + `Result::CorrectionDiag`; sim drift removed 0.58→0.20 m, outlier gated (NIS ~3e5), NIS now computable |
 | Slice 10 | per-sensor fixed-lag RTS twist smoother (`TwistSmoother`, D18): CV forward + backward RTS, deeper calibration frontier `now−delay−L`; variance ↓~0.3×, zero-phase, peaks ~4× sharper, no bias; `per_sensor_kf` OFF byte-identical; dropout time-alignment fixed (push-seq stamping) |
 | Slice 12 | warm-restart persistence (D23): core `serialize`/`deserialize` into fixed buffers (`persistence.hpp`, "OFCP" v1, FNV-1a config-hash + checksum + orthonormality guard, `CorruptData`/`VersionMismatch`); re-anchor-and-refill restore resumes near-NOMINAL (warm ~0.001 m vs cold ~0.256 m); crash-mid-write/config/checksum/version all reject. Bins NOT persisted; file double-buffer is relaxed-edge (production adapter → 13) |
+| Slice 13 (subset) | relaxed-edge `adapters/` (`ofc_adapters`, core PUBLIC API only, no new deps): file-persistence double-buffer (validity-based overwrite target — torn higher-seq can't clobber last-good), threading wrapper (mutex-guarded snapshot), dep-free config loader (subset → Config). ROS node + true fsync → 13b |
 
-The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors.
+The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors. **All numbered roadmap slices 0–14 are now addressed** (13 + 14 are partial — see below).
 
-- **Remaining slices** (any order; recommended: **13**, plus **11b**):
-  - Slice 11b — per-source bias states (augment the core state) + GPS adapter; deferred from Slice 11. The path to the classic GPS/INS bias-removal and to making the gate per-DOF.
-  - Slice 13 — adapters (YAML/ROS/threading/**file-persistence backend** = the production double-buffer ping-pong on top of the Slice-12 core serialize/deserialize).
-  - Slice 14 — `[~]` partial: NEES consistency + golden + **NIS** DONE (Slice 11 made NIS computable). Remaining: the CONFIG "tuned"-placeholder sweep (and the init-P covariance fix is the way to make NEES/NIS strictly consistent).
+- **Remaining work** (any order):
+  - Slice 11b — per-source bias states (augment the core state) + GPS adapter; deferred from Slice 11. The path to classic GPS/INS bias-removal and to making the Mahalanobis gate per-DOF.
+  - Slice 13b — real ROS node + recorded-bag round-trip; replace the persistence adapter's `flush`/`close` with a real `fsync` (durability). Deferred from Slice 13 (no ROS on the dev box).
+  - Slice 14 — `[~]` partial: NEES + golden + **NIS** DONE. Remaining: the CONFIG "tuned"-placeholder sweep (and a small **init-P covariance fix** — seed `P` ≪ `I₁₂` — would make the predict-only NEES strictly consistent).
 
 ---
 
@@ -103,11 +104,12 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - **Slice-11 correction-gate limitation**: the Mahalanobis gate is a **single scalar `mahalanobis_chi2` regardless of measurement DOF `n`** (~97% quantile for n=3, ~80% for n=6). Fine for the dim=3 position fixes shipping now; make it a per-`n` χ² quantile when a 6-DOF/mixed plugin lands (Slice 11b). The drift-removal test uses a loose `chi2=100` — a **test artifact** driven by the covariance pessimism above (legit drift residuals exceed `chi2=9` because P never shrinks on predict-only stretches), NOT a production value.
 - **Covariance tangent (doc-vs-code reconciled)**: the ESKF covariance is **full coupled SE(3)** (propagated by the full `Ad(delta⁻¹)`), NOT block-diagonal "decoupled SO(3)×ℝ³" — that phrase only describes the error ordering `[trans;rot]` + the median's split metric. NEES uses the full `se3::log` to match. (DESIGN §5, D21 now corrected.)
 - **Slice-10 smoother scope**: a single shared `TwistSmoother` uses the MAX `kf_process_noise` over enabled sources (not per-source `q`/`r`; `r` fixed 1.0). The refined RTS covariance is computed + exposed but NOT wired into the calibrator vote weight (the deeper path still feeds the raw Σ-confidence) — D18's "refined Σ" is half-wired. Fixed ~7.5 MB footprint (compile-time caps 32×65, paid even when off). The lag `L` is a step count via the nominal tick rate → off-cadence pumping gives an effective time-lag ≠ `calib_lag_s` (rings stay step-aligned regardless). Per-source dropout degrades to a variance loss (no bias) after the push-seq alignment fix.
-- **Slice-12 persistence scope**: histogram BINS are not persisted — restore re-anchors the calibrators to the committed values + holds them via hysteresis (an `offset_restored` latch does the same for the time-offset DOF), so a restored DOF's `committed` flag + value are correct immediately but its confidence reads low until the histogram re-fills. `config_hash` covers rig shape + per-sensor priors/flags + histogram configs + commit/gate thresholds + `phase2_strategy`/`calib_lag_s` (runtime knobs excluded). The **production file double-buffer adapter is Slice 13** (the Slice-12 crash-safety logic is test-side only).
-- Not yet built: per-source bias states + GPS adapter (11b), adapters (13). Partial: validation (14) — NEES/NIS/golden done, CONFIG "tuned"-placeholder sweep + the init-P covariance fix pending.
+- **Slice-12 persistence scope**: histogram BINS are not persisted — restore re-anchors the calibrators to the committed values + holds them via hysteresis (an `offset_restored` latch does the same for the time-offset DOF), so a restored DOF's `committed` flag + value are correct immediately but its confidence reads low until the histogram re-fills. `config_hash` covers rig shape + per-sensor priors/flags + histogram configs + commit/gate thresholds + `phase2_strategy`/`calib_lag_s` (runtime knobs excluded).
+- **Slice-13 adapters scope**: relaxed-edge only (std/heap/exceptions/threads/file IO). The ROS node is a compile-guarded header sketch (not built — no ROS on the dev box) → **13b**. The file-persistence adapter uses `flush`/`close`, NOT `fsync` — an OS-page-cache power-loss window remains even with the crash-safe target selection (durable `fsync` → **13b**). The config loader covers a documented knob SUBSET (not every `Config` field). Adapters are off by default (`OFC_BUILD_ADAPTERS=OFF`); the gate turns them on.
+- Not yet built: per-source bias states + GPS adapter (11b), ROS node + durable fsync (13b). Partial: validation (14) — NEES/NIS/golden done, CONFIG "tuned"-placeholder sweep + the init-P covariance fix pending.
 
 ---
 
 ## 7. Resume in one line
 
-Pick a slice (suggest **13 adapters** — the last roadmap slice, incl. the production persistence double-buffer on the Slice-12 core; or **11b bias states**, or a small **init-P covariance fix** to make NEES/NIS strictly consistent), author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
+All numbered roadmap slices (0–14) are addressed. Remaining work is the carve-outs + polish: **11b** (per-source bias states + GPS adapter), **13b** (real ROS node + durable fsync), the **init-P covariance fix** (seed `P` ≪ `I₁₂` → strictly-consistent NEES), and the **Slice-14 CONFIG "tuned"-placeholder sweep**. Pick one, author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.

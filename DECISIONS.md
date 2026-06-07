@@ -66,6 +66,8 @@ Scope chosen up front: grill the **whole system architecture**, greenfield.
 - **Chosen**: pure C++ core, no middleware dep; callback + poll; rich result struct (frontier state, tip, per-sensor calib snapshot, diagnostics). ROS/DDS/zmq adapters outside core. Pose in an odom frame anchored at init (drifts); extrinsics in base frame.
 - **Rejected**: ROS-first (couples core); pose-only (hides calib/diagnostics); streaming IPC (transport dep).
 
+- **Impl note (Slice 13, adapters subset)**: a relaxed-edge `adapters/` tree (`ofc_adapters`, links the core PUBLIC API only, no new deps; the gate builds+tests it via `OFC_BUILD_ADAPTERS=ON` in `dev.ps1`). Shipped: a **file-persistence** double-buffer ping-pong (production form of the Slice-12 core serialize/deserialize — overwrite target chosen by VALIDITY, not raw seq, so a torn higher-seq file can't clobber the last-good; a review CRITICAL was caught + fixed here), a **threading wrapper** (`ThreadedEstimator` — one worker pumps `step()`, mutex-guarded `Result` snapshot), and a dep-free **config loader** (D19). The **ROS node** is a compile-guarded header sketch only (no ROS on the dev box) and a true `fsync` is deferred — both → **Slice 13b**.
+
 ## D14 — Threading → **caller-pumped single-thread** (+ user: **C++14 / AUTOSAR**)
 - **Chosen**: core is a state machine the consumer pumps via `step()`; fusion + bounded calibration slice per step; lock-free, deterministic, trivially testable. Threading = external adapter.
 - **Constraint added by user**: **C++14** (AUTOSAR). Ripples: no `std::optional`/`variant`/`string_view`, likely no-exceptions, no runtime heap, bounded WCET, `double`/no-fast-math. Mostly *reinforces* prior choices.

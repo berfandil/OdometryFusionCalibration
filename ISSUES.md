@@ -110,10 +110,20 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: restart resumes near-NOMINAL (warm ~0.001 m vs cold ~0.256 m); crash mid-write keeps last good state; config change invalidates. ✓
 **Deps**: Slice 8.
 
-## Slice 13 — Adapters  `[ ]`
+## Slice 13 — Adapters  `[~]` (buildable subset done; ROS → 13b)
 **Goal**: relaxed-edge integrations. YAML/JSON config loader, ROS node (Odometry/TF/calib msgs), threading wrapper, file-persistence backend.
-**Done when**: each adapter builds against the core public API; ROS node round-trips on a recorded bag.
+**Done (subset)**: `adapters/` tree + `ofc_adapters` target (relaxed flags, links the core PUBLIC API only, no new deps; gate builds+tests it via `OFC_BUILD_ADAPTERS=ON` in `dev.ps1`).
+- **File-persistence**: production double-buffer ping-pong on the Slice-12 core serialize/deserialize; **validity-based** overwrite-target selection (preserves the highest-seq blob `load()` accepts; a torn higher-seq file can't clobber the last-good) → crash-mid-write keeps last good.
+- **Threading wrapper** (`ThreadedEstimator`): a worker pumps `step()`, mutex-guarded `Result` snapshot; determinism vs single-thread reference.
+- **Config loader**: dependency-free key=value/INI → `Config` (documented knob subset; owns `vector<SensorConfig>`; duplicate-id + reference cross-check; runs core `validate()`).
+**Deferred → Slice 13b**: real ROS node + recorded-bag round-trip (no ROS on the dev box; a compile-guarded header sketch ships); a true `fsync` (the relaxed-edge adapter uses `flush`/`close`, leaving an OS-page-cache power-loss window).
 **Deps**: Slices 2, 12.
+
+## Slice 13b — ROS node + durable fsync  `[ ]`
+**Goal**: the platform integrations that the dev box can't build/test.
+- Real ROS node (Odometry/TF subs → `ISource`; GPS/map-match → `ICorrection`; `Result` → calib/odom/TF msgs); round-trip on a recorded bag.
+- Replace the persistence adapter's `flush`/`close` with a real `fsync(fd)` (platform layer) to close the power-loss durability window.
+**Deps**: Slice 13.
 
 ## Slice 14 — Validation harness  `[~]` (sim rig + observability self-tests + NEES consistency + golden DONE; NIS pending Slice-11 corrections; CONFIG placeholder sweep remains)
 **Goal**: the trust apparatus (D24).
