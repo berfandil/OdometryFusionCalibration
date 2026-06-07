@@ -11,6 +11,7 @@ add_library(ofc_adapters STATIC
     src/file_persistence.cpp
     src/threaded_estimator.cpp
     src/config_loader.cpp
+    src/gps_correction.cpp
 )
 target_include_directories(ofc_adapters PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ofc_adapters PUBLIC ofc_core Eigen3::Eigen)
@@ -42,6 +43,7 @@ if (OFC_BUILD_TESTS)
         tests/test_file_persistence.cpp
         tests/test_threaded_estimator.cpp
         tests/test_config_loader.cpp
+        tests/test_gps_correction.cpp
     )
     target_link_libraries(ofc_adapters_tests PRIVATE ofc_core ofc_adapters doctest::doctest)
     set_target_properties(ofc_adapters_tests PROPERTIES
