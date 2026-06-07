@@ -103,11 +103,27 @@ public:
     // directly mitigates the Slice-14 covariance-pessimism finding WHEN an absolute ref is
     // present (the predict-only no-ref path is unchanged).
     //
-    // `chi2_threshold` is a single scalar applied REGARDLESS of n. Ideally it would be the
-    // chi-square quantile for n DOF (so a 6-DOF pose fix and a 3-DOF position fix gate at
-    // different magnitudes); the core currently uses one cfg.mahalanobis_chi2 for all n —
-    // documented limitation, not over-engineered here.
+    // `chi2_threshold` is a RAW (already-per-n) threshold: the gate compares d2 against it
+    // directly, with no DOF scaling inside update(). The per-`n` χ² scaling is the CALLER's job
+    // (the estimator runs cfg.mahalanobis_chi2 through chi2_gate(base, m.dim) before calling
+    // update()) — so every measurement DOF gates at the SAME confidence (Slice 11b). Passing a
+    // raw threshold here keeps this method a thin, testable gate (test_eskf.cpp calls
+    // update(m, 9.0) etc. directly with raw thresholds).
     bool update(const Measurement& m, Scalar chi2_threshold);
+
+    // Per-DOF Mahalanobis χ² gate threshold (Slice 11b). Scales a base threshold that is
+    // tuned at the n=3 position-fix DOF (= cfg.mahalanobis_chi2) by the χ²-quantile ratio so
+    // every measurement DOF n in 1..6 gates at the SAME confidence level. n is clamped to 1..6;
+    // n==3 returns base unchanged (back-compat). base <= 0 returns base (validate() forbids it).
+    //
+    // Rationale: the gate's statistical confidence should be DOF-invariant — a 6-DOF pose fix and
+    // a 3-DOF position fix should be rejected at the same false-reject rate, NOT at the same raw
+    // NIS magnitude. Scaling ONE base by the quantile ratio q[n]/q[3] keeps a single config knob
+    // (mahalanobis_chi2, tuned at n=3) while making the effective gate per-`n`. The absolute
+    // confidence the quantile table is built at cancels in the ratio to first order; 0.95 is the
+    // standard choice. This is a pure value function (no state); the const quantile table lives in
+    // eskf.cpp (file-scope constexpr, strict-core: no heap).
+    static Scalar chi2_gate(Scalar base_chi2_n3, int n);
 
     // ---- Augmented (bias) predict/update — Slice 11b, Option A --------------------------
     // The bias-aware counterparts of predict()/update(). The estimator calls THESE (not the
@@ -157,7 +173,8 @@ public:
     // block (n x6) — GPS observes the pose, NOT the bias directly. But the Kalman gain K = P H^T
     // S^-1 (18 x n) has NONZERO bias rows via the P_pose,bias cross-covariance the predict built,
     // so dx[12:18] != 0 and the update INJECTS the bias: bias += dx[12:18] (pose/twist injected as
-    // in update()). Joseph-form 18x18 covariance; same scalar chi2 gate; last_nis() updated.
+    // in update()). Joseph-form 18x18 covariance; gates on the RAW (already-per-n) chi2_threshold
+    // exactly as update() does (the estimator pre-scales via chi2_gate); last_nis() updated.
     // Returns true iff applied. No-op (false) when bias is inactive (caller should use update()).
     bool update_aug(const Measurement& m, Scalar chi2_threshold);
 

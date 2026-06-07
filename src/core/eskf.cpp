@@ -42,6 +42,19 @@ Mat12 symmetrize(const Mat12& M) {
 Mat18 symmetrize18(const Mat18& M) {
     return Scalar(0.5) * (M + M.transpose());
 }
+
+// chi-square quantiles at the 0.95 confidence level, indexed by DOF n = 1..6 (index 0 unused, so
+// the table can be indexed directly by n). Used by Eskf::chi2_gate to scale the n=3-tuned base
+// threshold to any DOF at the SAME confidence. File-scope constexpr (strict core: no heap).
+constexpr Scalar kChi2Q95[7] = {
+    Scalar(0),            // [0] unused (n is 1-based)
+    Scalar(3.841459),     // n=1
+    Scalar(5.991465),     // n=2
+    Scalar(7.814728),     // n=3  (the base-tuning DOF -> ratio 1.0 -> identity)
+    Scalar(9.487729),     // n=4
+    Scalar(11.070498),    // n=5
+    Scalar(12.591587),    // n=6
+};
 } // namespace
 
 void Eskf::init(const SE3& pose0, const Mat12& cov0) {
@@ -184,6 +197,20 @@ bool Eskf::update(const Measurement& m, Scalar chi2_threshold) {
 
     // NOTE: stamp untouched — the estimator owns the frontier clock (as in predict()).
     return true;
+}
+
+Scalar Eskf::chi2_gate(Scalar base_chi2_n3, int n) {
+    // base <= 0 is the validate()-forbidden "disabled gate" path: return it untouched so the
+    // caller's existing reject-everything behavior is preserved (never NaN/garbage).
+    if (!(base_chi2_n3 > Scalar(0))) return base_chi2_n3;
+
+    // Clamp n to the table's supported DOF range [1, 6].
+    const int nc = (n < 1) ? 1 : (n > 6 ? 6 : n);
+
+    // Scale the n=3-tuned base by the χ²-quantile ratio q[n]/q[3]. n==3 -> ratio 1.0 -> identity
+    // (back-compat). The shared 0.95 confidence cancels in the ratio, so every DOF gates at the
+    // SAME confidence with a single config knob.
+    return base_chi2_n3 * (kChi2Q95[nc] / kChi2Q95[3]);
 }
 
 void Eskf::predict_aug(const SE3& delta, Scalar dt, const Mat6& q_pose, Scalar bias_pn) {

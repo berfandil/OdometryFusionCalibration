@@ -1385,10 +1385,17 @@ Status Estimator::step(Timestamp now) {
             // in the frozen fallback the cross-cov is zero, so it corrects pose/twist but leaves
             // the frozen bias untouched. EITHER way the correction stays inside cov18_ (never a
             // 12-DOF update() on state_.cov leaving cov18_ stale). Otherwise (no bias filter) the
-            // plain 12-DOF update() — byte-identical to Slice 11. Same Mahalanobis gate either way.
+            // plain 12-DOF update() — byte-identical to Slice 11.
+            //
+            // Per-`n` Mahalanobis gate (Slice 11b): cfg.mahalanobis_chi2 is tuned at the n=3
+            // position-fix DOF; chi2_gate scales it by the χ²-quantile ratio for THIS measurement's
+            // DOF (m.dim) so a 3-DOF position fix and a 6-DOF pose fix gate at the SAME confidence.
+            // n==3 returns the base unchanged, so the dim=3 fixes shipping now are byte-identical to
+            // the old single-scalar behavior. The SAME per-`n` gate feeds both update paths.
+            const Scalar gate = Eskf::chi2_gate(cfg.mahalanobis_chi2, m.dim);
             const bool applied = use_aug
-                                     ? s.eskf.update_aug(m, cfg.mahalanobis_chi2)
-                                     : s.eskf.update(m, cfg.mahalanobis_chi2);
+                                     ? s.eskf.update_aug(m, gate)
+                                     : s.eskf.update(m, gate);
             if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
             cdiag.last_nis = s.eskf.last_nis();     // last NIS, accepted or rejected
         }

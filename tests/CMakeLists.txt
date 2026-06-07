@@ -24,6 +24,7 @@ add_executable(ofc_tests
     test_sim.cpp
     test_validation.cpp
     test_correction.cpp
+    test_chi2_gate.cpp
     test_bias.cpp
     test_persistence.cpp
 )
