@@ -77,8 +77,23 @@ struct Config {
     Scalar     weiszfeld_eps  = 1e-9;
     Scalar     metric_lambda  = 1.0;
     bool       adaptive_q     = true;
-    Scalar     q_scale        = 1.0;   // multiplier on the spread-derived Q (CONFIG §3)
-    Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};  // per-axis min Q ([trans;rot])
+    // Multiplier on the spread-derived adaptive Q (CONFIG §3). CALIBRATED (Slice-14 covariance
+    // sweep, was the un-calibrated 1.0 placeholder): chosen SAFETY-FIRST against the sim NEES
+    // harness across 4 trajectories (nees_traj, mixed, turning, long straight) x 2 noise levels,
+    // M=30 seeds. At 0.5 the worst-case ensemble-mean pose NEES is ~2.9 (1x noise) / ~3.5 (2x),
+    // i.e. mildly PESSIMISTIC and NEVER overconfident (<6 = DOF) on any trajectory. Lower values
+    // raised NEES toward 6 but broke the never-overconfident constraint under the 2x-noise
+    // model-mismatch proxy (q_scale=0.2 hit ~7 on `turning` at 1x), so 0.5 keeps a conservative
+    // margin (the sim under-states real-world model mismatch; mild pessimism is the safe side).
+    Scalar     q_scale        = 0.5;
+    // Per-axis minimum (additive) Q on the pose increment ([trans;rot]). Small by default: the
+    // no-ref consistency objective wants the spread term to dominate (Slice-14 sweep showed a
+    // larger floor only ADDS no-ref pessimism without helping multi-source rigs). DEPLOYMENT
+    // GUIDANCE (CONFIG §3): for absolute-ref / GPS rigs whose sources have ~zero spread (identical
+    // odometry), RAISE the translation floor (e.g. q_floor[0..2] ~ 1e-3) so the position
+    // covariance grows between fixes and the absolute-fix Kalman gain can actually pull — the
+    // adapters/GPS drift tests do exactly this test-locally. Left small here as the no-ref default.
+    Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
     // Median-variance reduction of the adaptive Q (Slice 14, approach A; CONFIG §3). When true
     // the estimator divides the spread-derived (adaptive) Q term by the participating fusion-
     // median source count n (passed as adaptive_q's n_eff), because the geometric median of n
