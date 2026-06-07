@@ -28,9 +28,12 @@
 //   se3::log returns [trans; rot] (lie.hpp), so e lines up index-for-index with P_pp.
 //   Rotation rows 3..5 are so3::log(R_est^T R_gt) embedded in the SE(3) log; translation
 //   rows 0..2 are the V^{-1}-mapped residual consistent with that same right tangent (NOT
-//   a raw t_gt - t_est, which would mix conventions). The convention is validated
-//   ALGEBRAICALLY (the reconstruction identity T_est o exp(e) == T_gt — see the first NEES
-//   case) rather than by an "ensemble-mean NEES ~ DOF" band: because this filter's
+//   a raw t_gt - t_est, which would mix conventions). The first NEES case proves e is
+//   se3::log's OWN right-error tangent (right-not-left, trans-first) via the reconstruction
+//   identity T_est o exp(e) == T_gt; that the COVARIANCE lives in this SAME tangent holds by
+//   eskf.cpp's full-SE(3)-Ad propagation (true by inspection of eskf.cpp, not asserted in
+//   this test). We pin the convention this way rather than by an "ensemble-mean NEES ~ DOF"
+//   band: because this filter's
 //   covariance is grossly pessimistic (init P = I_12, ~100x the actual error), EVERY
 //   sub-block's NEES is ~0.01..0.1 regardless of convention, so a NEES magnitude cannot
 //   distinguish right from wrong here. For a CORRECTLY-CALIBRATED linear-Gaussian filter the
@@ -91,6 +94,7 @@
 
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace ofc;
@@ -164,9 +168,15 @@ Config nees_config(const std::vector<SourceParams>& planted,
 // DELIVERABLE 1 — NEES Monte-Carlo consistency
 // ===========================================================================
 
-TEST_CASE("validation NEES: error convention is the ESKF right-error (reconstruction "
-          "identity + it is the minimal tangent)") {
-    // The error convention is validated ALGEBRAICALLY, not by an O(DOF) NEES band. We
+TEST_CASE("validation NEES: e is se3::log's right-error tangent (right-not-left, trans-first); "
+          "covariance lives in this same tangent by eskf.cpp's full-SE(3)-Ad, by inspection") {
+    // What this case PROVES: e = se3::log(T_est^-1 T_gt) is se3::log's OWN right-error tangent
+    // (right- not left-error, [trans;rot] order). With e defined as that log, the reconstruction
+    // identity T_est o exp(e) == T_gt is a near-tautology of exp/log being mutual inverses, so it
+    // pins which tangent e lives in, NOT that the covariance shares it. The covariance lives in
+    // this SAME full SE(3) tangent because eskf.cpp propagates with the full-SE(3) se3::adjoint
+    // (F = Ad(delta^-1)); that link is true by inspection of eskf.cpp and is NOT asserted here.
+    // We pin the convention this way, not by an O(DOF) NEES band. We
     // originally tried "rotation sub-NEES ~ DOF=3" as the convention probe, but the filter's
     // covariance is so PESSIMISTIC (init P = I_12, ~100x the actual error — see the next
     // case) that EVERY sub-block's NEES is ~0.01..0.1 regardless of convention. So a NEES
@@ -238,8 +248,12 @@ TEST_CASE("validation NEES: error convention is the ESKF right-error (reconstruc
     const SE3& est = probe->result.frontier.pose;
     const SE3& gt  = probe->gt_frontier;
 
-    // (1) RECONSTRUCTION IDENTITY: e = log(T_est^{-1} T_gt) must reconstruct T_gt via the
-    //     RIGHT composition T_est o exp(e) (the ESKF's error definition).
+    // (1) RECONSTRUCTION IDENTITY: e = log(T_est^{-1} T_gt) reconstructs T_gt via the RIGHT
+    //     composition T_est o exp(e). With e defined as that log this is a near-tautology of
+    //     exp/log being mutual inverses, so it pins that e is se3::log's OWN right-error tangent
+    //     (the tangent the ESKF's error T_true = T_est o exp(eta) is defined in) — it does NOT
+    //     by itself assert the covariance shares that tangent (that holds by eskf.cpp's full
+    //     SE(3) Ad propagation, by inspection).
     const Vec6 e = se3::log(se3::compose(se3::inverse(est), gt));
     REQUIRE(e.norm() > 1e-6);                          // a genuine non-zero error to test
     const SE3 reconstructed = se3::compose(est, se3::exp(e));
@@ -263,7 +277,8 @@ TEST_CASE("validation NEES: error convention is the ESKF right-error (reconstruc
     const Vec3 raw_trans = est.R.transpose() * (gt.t - est.t);
     CHECK((e.head<3>() - raw_trans).cwiseAbs().maxCoeff() > 1e-9);
 
-    MESSAGE("convention OK: T_est o exp(log(T_est^-1 T_gt)) == T_gt; |e|=" << e.norm());
+    MESSAGE("convention OK: e is se3::log's right-error tangent (right-not-left, trans-first); "
+            "T_est o exp(log(T_est^-1 T_gt)) == T_gt; |e|=" << e.norm());
 }
 
 TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square interval, 6 "
@@ -275,6 +290,13 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     // With N in the thousands the interval is TIGHT (a Wilson-Hilferty normal approximation
     // to chi2 gives, for large k=N*6, mean ~ 6*(1 +/- z*sqrt(2/k))) — so a consistent filter
     // would be pinned hard, and an inconsistent one is flagged clearly.
+    //
+    // CAVEAT (independence): this interval ASSUMES the N steady-state samples are independent,
+    // but they are autocorrelated within each run (consecutive fused frontiers share overlapping
+    // windows + the same slowly-evolving P), so the effective sample count is smaller and the
+    // TRUE interval is WIDER than the printed one. This only ever WIDENS the band, never narrows
+    // it, and the ~46x gap survives either way: even a 100x reduction in effective N widens the
+    // interval only to ~[5.4, 6.6], still ~40x above the observed ~0.13.
     //
     // EMPIRICAL OUTCOME (the honesty clause, DESIGN §10): this filter is NOT consistent. The
     // ensemble-mean pose NEES is ~0.13, far BELOW the ~6 the chi-square interval demands —
@@ -363,9 +385,13 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     const Scalar hi_mean = wh(+z) / static_cast<Scalar>(N);
 
     const bool truly_consistent = (mean_nees >= lo_mean && mean_nees <= hi_mean);
+    // Build the YES/NO verdict as a std::string first: a bare (cond ? "YES" : "NO") is a
+    // const char* that doctest's MESSAGE stringifier captures as a POINTER (prints an
+    // address), not the literal text. std::string forces the human-readable line.
+    const std::string verdict = truly_consistent ? "YES" : "NO";
     MESSAGE("NEES consistency: ensemble-mean=" << mean_nees << " DOF=6 N=" << N
             << " chi2 99% interval on mean=[" << lo_mean << ", " << hi_mean << "]"
-            << "  truly_consistent=" << (truly_consistent ? "YES" : "NO")
+            << "  truly_consistent=" << verdict
             << "  (mean << 6 => PESSIMISTIC / over-conservative covariance)");
 
     // TRUE-CONSISTENCY verdict, recorded as a (currently-failing-by-design) expectation so
@@ -497,33 +523,51 @@ TEST_CASE("validation golden: byte-identical replay of fused pose, covariance, A
     run_once(b);
     REQUIRE(a.size() == b.size());
     REQUIRE(!a.empty());
+
+    // Determinism is a BYTE-IDENTICAL property over ALL fields of ALL fused records (fused pose
+    // + full 12x12 covariance + every per-source calib field: extrinsic R/t, scale, time offset,
+    // 3 confidences, 3 commit flags). Rather than emit ~16 CHECKs per record (which inflated the
+    // suite's assertion count ~3.4x with non-discriminating repeats), we fold every exact `==`
+    // comparison for a record into ONE boolean and assert it ONCE per fused record. The fold
+    // uses the SAME exact equality (operator==, not a tolerance), so if ANY field of ANY record
+    // diverges across the two runs the per-record CHECK fails — it remains a genuine drift
+    // detector, just one assertion per record instead of per field.
+    long fused_compared = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        CHECK(a[i].fused == b[i].fused);
+        const bool fused_agrees = (a[i].fused == b[i].fused);
+        if (!fused_agrees) { CHECK(fused_agrees); continue; }  // structural divergence: flag it
         if (!a[i].fused) continue;
         const Result& ra = a[i].result;
         const Result& rb = b[i].result;
+
+        bool rec_equal = true;
         // Fused pose + covariance (as test_sim does)...
-        CHECK((ra.frontier.pose.R.array() == rb.frontier.pose.R.array()).all());
-        CHECK((ra.frontier.pose.t.array() == rb.frontier.pose.t.array()).all());
-        CHECK((ra.frontier.cov.array()    == rb.frontier.cov.array()).all());
+        rec_equal = rec_equal && (ra.frontier.pose.R.array() == rb.frontier.pose.R.array()).all();
+        rec_equal = rec_equal && (ra.frontier.pose.t.array() == rb.frontier.pose.t.array()).all();
+        rec_equal = rec_equal && (ra.frontier.cov.array()    == rb.frontier.cov.array()).all();
         // ...AND the per-source calib snapshot (the extension this golden adds).
-        REQUIRE(ra.source_count == rb.source_count);
-        for (int s = 0; s < ra.source_count; ++s) {
-            const CalibSnapshot& ca = ra.calib[s];
-            const CalibSnapshot& cb = rb.calib[s];
-            CHECK(ca.id == cb.id);
-            CHECK((ca.extrinsic.R.array() == cb.extrinsic.R.array()).all());
-            CHECK((ca.extrinsic.t.array() == cb.extrinsic.t.array()).all());
-            CHECK(ca.scale         == cb.scale);
-            CHECK(ca.time_offset_s == cb.time_offset_s);
-            CHECK(ca.extrinsic_confidence   == cb.extrinsic_confidence);
-            CHECK(ca.scale_confidence       == cb.scale_confidence);
-            CHECK(ca.translation_confidence == cb.translation_confidence);
-            CHECK(ca.extrinsic_committed   == cb.extrinsic_committed);
-            CHECK(ca.scale_committed       == cb.scale_committed);
-            CHECK(ca.translation_committed == cb.translation_committed);
+        rec_equal = rec_equal && (ra.source_count == rb.source_count);
+        if (rec_equal) {
+            for (int s = 0; s < ra.source_count; ++s) {
+                const CalibSnapshot& ca = ra.calib[s];
+                const CalibSnapshot& cb = rb.calib[s];
+                rec_equal = rec_equal && (ca.id == cb.id);
+                rec_equal = rec_equal && (ca.extrinsic.R.array() == cb.extrinsic.R.array()).all();
+                rec_equal = rec_equal && (ca.extrinsic.t.array() == cb.extrinsic.t.array()).all();
+                rec_equal = rec_equal && (ca.scale         == cb.scale);
+                rec_equal = rec_equal && (ca.time_offset_s == cb.time_offset_s);
+                rec_equal = rec_equal && (ca.extrinsic_confidence   == cb.extrinsic_confidence);
+                rec_equal = rec_equal && (ca.scale_confidence       == cb.scale_confidence);
+                rec_equal = rec_equal && (ca.translation_confidence == cb.translation_confidence);
+                rec_equal = rec_equal && (ca.extrinsic_committed   == cb.extrinsic_committed);
+                rec_equal = rec_equal && (ca.scale_committed       == cb.scale_committed);
+                rec_equal = rec_equal && (ca.translation_committed == cb.translation_committed);
+            }
         }
+        CHECK(rec_equal);     // ONE assertion per fused record: all fields byte-identical
+        ++fused_compared;
     }
+    REQUIRE(fused_compared > 50);     // guard: the replay actually produced fused records to compare
 }
 
 TEST_CASE("validation golden: committed numeric values (noise-free, portable) — fused pose "
