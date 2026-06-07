@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: 148 doctest cases / 5160 assertions.** 31 commits on `main`, **not pushed**, working tree clean.
+- **Gate green: 156 doctest cases / 5247 assertions.** 35 commits on `main`, **not pushed**, working tree clean.
 - **Done (all green):**
 
 | Unit | What |
@@ -44,6 +44,7 @@ Toolchain facts (this Windows box):
 | Slice 0 | in-house SO(3)/SE(3) Lie ops, build, doctest harness |
 | Slice 1 | `SourceBuffer` ring buffer + uniform `delta(t0,t1)→(SE3,Σ)`, native⊕modeled Σ |
 | Slice 2 | geometric-median fusion + predict-only ESKF integrator + estimator wiring (first tracer bullet) |
+| Slice 3 | lifecycle `INIT/WARMUP/DEGRADED/NOMINAL` ladder + `readiness` scalar + degrade-don't-block (reference-only dead-reckon, graceful downgrade on source loss); `min_sources_warn` NOMINAL threshold |
 | Slice 4 | `Histogram1D` primitive (fixed bins, decay/sliding-K aging, linear-split, sub-bin, circular, concentration confidence) |
 | Sim rig | `sim/` ground-truth oracle: trajectory presets + planted `SyntheticSource`s + rig driver |
 | Slice 5 | time-sync (‖ω‖ xcorr, pluggable metric, excitation gate, offset histogram, commit N_min + hysteresis) |
@@ -53,8 +54,7 @@ Toolchain facts (this Windows box):
 
 The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors.
 
-- **Remaining slices** (any order; recommended: **9 → 3 → 14 → 10 → 11 → 12 → 13**):
-  - Slice 3 — lifecycle INIT/WARMUP/DEGRADED/NOMINAL + degrade-don't-block (currently minimal).
+- **Remaining slices** (any order; recommended: **9 → 14 → 10 → 11 → 12 → 13**):
   - Slice 9 — weight refinement: variance-EMA reliability, bias→calibration (D17).
   - Slice 10 — per-sensor fixed-lag RTS smoother (two-sided, deeper frontier).
   - Slice 11 — absolute-ref plugin (Mahalanobis-gated) + optional per-source GPS/INS bias states.
@@ -96,7 +96,8 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - Extrinsic bootstrap converges from large priors but has a **~0.08 rad realistic floor** on mixed straight+turn trajectories (windows straddling a regime boundary spread the so(3) mode). Sub-0.04 recovery would need revisiting the canonical-rotation-vs-consensus coupling (see Slice-8 fix report).
 - `validate()` still has a `TODO: per-sensor + histogram range checks` — nested `HistogramConfig`s are validated at `Histogram1D::configure()` time, not in the top-level `validate()`.
 - Several thresholds are tuned placeholders (CONFIG marks them) pending the Slice-14 sweep.
-- Not yet built: lifecycle (3), weight-refine (9), RTS smoother (10), absolute-ref/bias (11), persistence (12), adapters (13), NEES/NIS+golden (14).
+- **Slice-3 lifecycle scope**: NOMINAL is source-count-driven (`n ≥ min_sources_warn`), not directly calibration-convergence-gated; under `ReferenceOnly` cold-start the DEGRADED→NOMINAL upgrade tracks convergence only *indirectly* (a source joins the median once its extrinsic commits). `min_sources_warn` is validated lower-bound only (`≥1`); a value above `max_sources` is legitimate (NOMINAL never reached). If a future slice wants readiness to encode calibration convergence directly, revisit the ladder.
+- Not yet built: weight-refine (9), RTS smoother (10), absolute-ref/bias (11), persistence (12), adapters (13), NEES/NIS+golden (14).
 
 ---
 

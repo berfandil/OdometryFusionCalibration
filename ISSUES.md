@@ -33,7 +33,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: sim rig (known motion, N sources) → fused trajectory tracks GT within noise; NEES in-bounds; deterministic replay byte-stable.
 **Deps**: Slice 1. **This is the vertical slice everything else hangs off.**
 
-## Slice 3 — Lifecycle & degrade-don't-block  `[ ]`
+## Slice 3 — Lifecycle & degrade-don't-block  `[x]`
 **Goal**: `INIT → WARMUP → DEGRADED → NOMINAL`, odom anchored at first tick, readiness in `Result`.
 - Reference-only output during DEGRADED; cold-start switch (D6).
 - Graceful downgrade on source loss.

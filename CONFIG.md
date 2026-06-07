@@ -34,7 +34,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | `weiszfeld_tol` | double | 1e-6 | (0, 1) | Convergence tolerance (step norm). |
 | `weiszfeld_eps` | double | 1e-9 | (0, 1) | ε-regularization of the `1/d` weight (vertex singularity guard). |
 | `metric_lambda` | double | 1.0 | (0, ∞) | Rotation-vs-translation weight in the split SO(3)/ℝ³ metric. |
-| `min_sources_warn` | int | 3 | [1, max_sources] | Below this, outlier rejection degrades; emit a health warning. |
+| `min_sources_warn` | int | 3 | [1, ∞) | Lifecycle NOMINAL threshold (Slice 3): a fused step with `n >= min_sources_warn` participating sources is NOMINAL, else DEGRADED; below 3 outlier rejection also degrades. `validate()` enforces only `>= 1`; a value above `max_sources` is legitimate (NOMINAL is then never reached). |
 | `adaptive_q` | bool | true | — | Derive process noise Q from the inter-source spread. |
 | `q_scale` | double | 1.0 | (0, ∞) | Multiplier on the spread-derived Q. |
 | `q_floor` | double[6] | small | ≥0 | Per-axis minimum process noise. |
