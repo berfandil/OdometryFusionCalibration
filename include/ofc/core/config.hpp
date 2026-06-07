@@ -79,6 +79,15 @@ struct Config {
     bool       adaptive_q     = true;
     Scalar     q_scale        = 1.0;   // multiplier on the spread-derived Q (CONFIG §3)
     Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};  // per-axis min Q ([trans;rot])
+    // Median-variance reduction of the adaptive Q (Slice 14, approach A; CONFIG §3). When true
+    // the estimator divides the spread-derived (adaptive) Q term by the participating fusion-
+    // median source count n (passed as adaptive_q's n_eff), because the geometric median of n
+    // agreeing sources has ~1/n the per-window variance of a single source — so the spread
+    // (inter-source DISAGREEMENT) over-states the FUSED accuracy by ~n and inflates the predict-
+    // only covariance. When false, n_eff = 1 is passed -> the old (un-reduced) covariance exactly.
+    // The floor and the non-adaptive (spread == 0) path are unaffected. RUNTIME knob (it shapes
+    // covariance magnitude, not the committed-calibration meaning) -> EXCLUDED from config_hash.
+    bool       adaptive_q_source_reduction = true;
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;

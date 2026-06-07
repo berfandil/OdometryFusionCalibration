@@ -176,6 +176,49 @@ TEST_CASE("adaptive_q grows with spread and respects the floor") {
     CHECK(q_nofloor(0, 0) == doctest::Approx(2.0));
 }
 
+TEST_CASE("adaptive_q n_eff median-variance reduction (Slice 14, approach A)") {
+    // The spread-derived term is divided by max(1, n_eff): the geometric median of n_eff agreeing
+    // sources has ~1/n_eff the per-window variance of a single source, so the disagreement-derived
+    // Q is scaled down to the FUSED accuracy. ONLY the spread term is reduced; the floor is not.
+    const Scalar floor[6] = {0.001, 0.001, 0.001, 0.002, 0.002, 0.002};
+    const Scalar spread = 2.0, q_scale = 1.0;
+
+    // BACK-COMPAT: n_eff == 1 (and the defaulted 3-arg overload) == the old behavior exactly.
+    const Mat6 q_old = Eskf::adaptive_q(spread, q_scale, floor);          // defaulted n_eff = 1
+    const Mat6 q_n1  = Eskf::adaptive_q(spread, q_scale, floor, 1);
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j)
+            CHECK(q_n1(i, j) == q_old(i, j));      // exact byte-for-byte equality (no reduction)
+    // spread^2 * q_scale = 4 on top of the floor (the pre-reduction value).
+    CHECK(q_old(0, 0) == doctest::Approx(4.0 + 0.001));
+
+    // n_eff == 3: the SPREAD term is divided by 3 (4 -> 4/3); the floor is UNCHANGED.
+    const Mat6 q_n3 = Eskf::adaptive_q(spread, q_scale, floor, 3);
+    CHECK(q_n3(0, 0) == doctest::Approx(4.0 / 3.0 + 0.001));   // trans axis: reduced spread + floor
+    CHECK(q_n3(3, 3) == doctest::Approx(4.0 / 3.0 + 0.002));   // rot axis: same reduction + its floor
+    // The reduction is exactly the spread term over n_eff (subtracting the common floor isolates it).
+    CHECK((q_n3(0, 0) - floor[0]) == doctest::Approx((q_old(0, 0) - floor[0]) / 3.0));
+    // n_eff == 2 -> /2 (the geodesic-midpoint case).
+    const Mat6 q_n2 = Eskf::adaptive_q(spread, q_scale, floor, 2);
+    CHECK(q_n2(0, 0) == doctest::Approx(4.0 / 2.0 + 0.001));
+
+    // n_eff <= 0 clamps to 1 (never divides by zero; behaves as no reduction).
+    const Mat6 q_n0    = Eskf::adaptive_q(spread, q_scale, floor, 0);
+    const Mat6 q_nneg  = Eskf::adaptive_q(spread, q_scale, floor, -5);
+    for (int i = 0; i < 6; ++i) {
+        CHECK(q_n0(i, i)   == doctest::Approx(q_old(i, i)));
+        CHECK(q_nneg(i, i) == doctest::Approx(q_old(i, i)));
+    }
+
+    // spread == 0 -> the term vanishes, so the result is EXACTLY the floor for ANY n_eff (the
+    // noise-free / single-source invariant that keeps the golden committed values unchanged).
+    for (int ne : {1, 2, 3, 7}) {
+        const Mat6 q_zero = Eskf::adaptive_q(0.0, q_scale, floor, ne);
+        CHECK(q_zero(0, 0) == doctest::Approx(0.001));
+        CHECK(q_zero(3, 3) == doctest::Approx(0.002));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Const-velocity tip extrapolation
 // ---------------------------------------------------------------------------

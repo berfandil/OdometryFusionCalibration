@@ -365,8 +365,15 @@ void Eskf::predict_tip(Scalar dt_ahead, Scalar inflation, State& tip_out) const 
     tip_out.stamp     = state_.stamp + secs_to_ns(dta);
 }
 
-Mat6 Eskf::adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor) {
-    Mat6 Q = (q_scale * spread * spread) * Mat6::Identity();
+Mat6 Eskf::adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor, int n_eff) {
+    // Divide ONLY the spread term by max(1, n_eff): the geometric median of n_eff agreeing
+    // sources has ~1/n_eff the per-window variance of a single source, so the disagreement-
+    // derived noise must be scaled down to the FUSED accuracy (Slice 14, approach A). n_eff <= 0
+    // and n_eff == 1 both leave the term unchanged (clamp to 1 -> back-compat). The additive
+    // floor is the per-axis minimum and is NOT divided. spread == 0 -> the whole term vanishes,
+    // so the result is exactly the floor for ANY n_eff (noise-free / single-source invariant).
+    const Scalar inv_neff = Scalar(1) / static_cast<Scalar>(n_eff > 1 ? n_eff : 1);
+    Mat6 Q = (q_scale * spread * spread * inv_neff) * Mat6::Identity();
     if (q_floor != nullptr) {
         for (int i = 0; i < 6; ++i) Q(i, i) += q_floor[i];
     }

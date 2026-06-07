@@ -1278,11 +1278,20 @@ Status Estimator::step(Timestamp now) {
     }
 
     // Adaptive process noise from the inter-source spread (DESIGN §4, D4).
-    // q_scale / q_floor come from Config (CONFIG §3). Adaptive: floor + q_scale*spread^2.
+    // q_scale / q_floor come from Config (CONFIG §3). Adaptive: floor + q_scale*spread^2/n_eff.
     // Non-adaptive: just the per-axis floor (no spread term).
+    //
+    // MEDIAN-VARIANCE REDUCTION (Slice 14, approach A). On the adaptive branch we pass n_eff = the
+    // participating fusion-median source count `n` when cfg.adaptive_q_source_reduction is on, so
+    // the spread term is divided by n: the geometric median of n agreeing sources has ~1/n the
+    // per-window variance of a single source, and the spread (inter-source DISAGREEMENT) otherwise
+    // over-states the FUSED median's error by ~n and inflates the predict-only covariance. With the
+    // knob OFF, n_eff = 1 recovers the old covariance exactly. The non-adaptive branch passes
+    // spread = 0 -> floor only, so n_eff is irrelevant there (the term vanishes regardless).
     Mat6 q_pose;
     if (cfg.adaptive_q) {
-        q_pose = Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor);
+        const int n_eff = cfg.adaptive_q_source_reduction ? n : 1;
+        q_pose = Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor, n_eff);
     } else {
         q_pose = Eskf::adaptive_q(Scalar(0), cfg.q_scale, cfg.q_floor);
     }
