@@ -57,6 +57,7 @@ Use a full-capability agent (`claude` / `general-purpose`) for implementation st
 - [x] Slice 7 — Phase-2 calibration: turn-gated roll (S¹) + xyz lever-arm (hand-eye LS), both strategies, vote_weight honored, observability self-test (green: 138 cases / 5031 assertions).
 - [x] Slice 8 — Commit + feedback loop: per-DOF commit gate (mass + hysteresis), atomic swap, **contractive** re-anchor (extrinsic/scale/offset converge from large priors), cold-start switch (green: 148 cases / 5160 assertions). **Calibration spine complete.**
 - [x] Slice 3 — Lifecycle & degrade-don't-block: `INIT→WARMUP→DEGRADED→NOMINAL` ladder driven by `n` vs `min_sources_warn`, `readiness` scalar, reference-only dead-reckon emitted as early as the reference has span, graceful downgrade on source loss (green: 156 cases / 5247 assertions).
+- [x] Slice 9 — Weight refinement: variance-EMA reliability (bias/variance split, D17) — noisy source downweighted, biased source kept (bias left to the calibrator); `reliability_floor`/`reliability_cap`; `SourceHealth.reliability`/`bias` diagnostics (green: 161 cases / 5317 assertions).
 - (remaining slices per `ISSUES.md`).
 
 ## Sub-agent task-brief template

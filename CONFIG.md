@@ -44,6 +44,8 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
 | `reliability_ema_alpha` | double | 0.02 | (0, 1] | EMA rate for the variance-based reliability track (smaller = slower). |
+| `reliability_floor` | double | 0.2 | (0, 1] | Minimum reliability multiplier (Slice 9): a noisy source is downweighted but never collapses. |
+| `reliability_cap` | double | 5.0 | [1, ∞) | Maximum reliability multiplier (Slice 9): a clean source is upweighted but never dominates. |
 | `weight_floor` | double | 0.05 | (0, 1) | Minimum source weight (guarantees recovery; never collapses to 0). |
 | `weight_cap` | double | 10.0 | [1, ∞) | Maximum source weight (no single source dominates). |
 | `confidence_combine` | enum | `sum` | {`native_only`, `modeled_only`, `sum`, `max`, `weighted`} | How native Σ and modeled Σ combine. |

@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: 156 doctest cases / 5247 assertions.** 35 commits on `main`, **not pushed**, working tree clean.
+- **Gate green: 161 doctest cases / 5317 assertions.** 38 commits on `main`, **not pushed**, working tree clean.
 - **Done (all green):**
 
 | Unit | What |
@@ -51,11 +51,11 @@ Toolchain facts (this Windows box):
 | Slice 6 | Phase-1 calibration: straight-gated yaw/pitch (3-ch so(3)@prior) + per-source scale |
 | Slice 7 | Phase-2 calibration: turn-gated roll (S¹) + xyz lever-arm (hand-eye LS), both strategies |
 | Slice 8 | commit + feedback loop: per-DOF commit (mass + hysteresis), atomic swap, **contractive** re-anchor, cold-start |
+| Slice 9 | weight refinement: variance-EMA reliability (bias/variance split, D17) — noisy source downweighted, biased source kept (bias → calibrator); `reliability_floor`/`reliability_cap`, `SourceHealth.reliability`/`bias` |
 
 The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors.
 
-- **Remaining slices** (any order; recommended: **9 → 14 → 10 → 11 → 12 → 13**):
-  - Slice 9 — weight refinement: variance-EMA reliability, bias→calibration (D17).
+- **Remaining slices** (any order; recommended: **14 → 10 → 11 → 12 → 13**):
   - Slice 10 — per-sensor fixed-lag RTS smoother (two-sided, deeper frontier).
   - Slice 11 — absolute-ref plugin (Mahalanobis-gated) + optional per-source GPS/INS bias states.
   - Slice 12 — warm-restart persistence (double-buffer + config-hash guard).
@@ -97,10 +97,11 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - `validate()` still has a `TODO: per-sensor + histogram range checks` — nested `HistogramConfig`s are validated at `Histogram1D::configure()` time, not in the top-level `validate()`.
 - Several thresholds are tuned placeholders (CONFIG marks them) pending the Slice-14 sweep.
 - **Slice-3 lifecycle scope**: NOMINAL is source-count-driven (`n ≥ min_sources_warn`), not directly calibration-convergence-gated; under `ReferenceOnly` cold-start the DEGRADED→NOMINAL upgrade tracks convergence only *indirectly* (a source joins the median once its extrinsic commits). `min_sources_warn` is validated lower-bound only (`≥1`); a value above `max_sources` is legitimate (NOMINAL never reached). If a future slice wants readiness to encode calibration convergence directly, revisit the ladder.
-- Not yet built: weight-refine (9), RTS smoother (10), absolute-ref/bias (11), persistence (12), adapters (13), NEES/NIS+golden (14).
+- **Slice-9 weight scope**: reliability is the variance-EMA quality factor; `sigma_confidence()`'s D21 unit-mixing (mean of trans m² + rot rad² in one scalar) is **left intact** — reliability was added multiplicatively, not as a unit-separation rewrite, so that caveat stays open. `SourceHealth.bias` is an unsigned residual *magnitude* (mean `split_distance`), not a signed per-DOF offset — it cannot itself distinguish direction; the weight uses `resid_var` (scatter), not `bias`.
+- Not yet built: RTS smoother (10), absolute-ref/bias (11), persistence (12), adapters (13), NEES/NIS+golden (14).
 
 ---
 
 ## 7. Resume in one line
 
-Pick a slice (suggest **9 weight-refinement**), author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
+Pick a slice (suggest **14 validation: NEES/NIS + golden** as a regression net before the deep frontier slices, or **10 RTS smoother**), author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.

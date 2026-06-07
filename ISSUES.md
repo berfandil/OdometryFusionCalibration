@@ -76,7 +76,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: from wrong-ish priors, sim converges extrinsics to GT and fused accuracy improves; no commit thrash.
 **Deps**: Slices 5, 6, 7.
 
-## Slice 9 — Weight refinement  `[ ]`
+## Slice 9 — Weight refinement  `[x]`
 **Goal**: variance-EMA reliability with bias routed to calibration (D17).
 - Floored/capped reliability; systematic residual → calibrator, not weight.
 **Done when**: a noisy source is downweighted; a *biased* source is calibrated (not just downweighted) in sim.
