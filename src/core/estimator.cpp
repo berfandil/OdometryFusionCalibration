@@ -135,9 +135,12 @@ bool commit_gate_reanchor(bool prev_committed, Scalar confidence, Scalar votes,
 // prior_extrinsic, prior_scale, prior_time_offset_s, weight_prior, and the per-sensor bool
 // flags), the 5 histogram configs, and the commit/gate thresholds that shape how calibration
 // converges. We feed the SAME explicit-byte encoding the blob payload uses (Writer) so the
-// hash is padding-free + endian-explicit + stable, then hash the written bytes. We do NOT
-// cover purely-runtime knobs that don't change what a persisted calibration MEANS (tick rate,
-// fusion delay, output flags) — they don't invalidate a committed extrinsic/scale/offset.
+// hash is padding-free + endian-explicit + stable, then hash the written bytes. The deliberate
+// RUNTIME EXCLUSIONS (purely-runtime knobs that don't change what a persisted calibration
+// MEANS) are tick_rate_hz, fusion_delay, and the output flags — they don't invalidate a
+// committed extrinsic/scale/offset. The CALIBRATION-SHAPING knobs ARE covered: the commit/gate
+// thresholds, phase2_strategy, AND calib_lag_s (× tick_rate_hz = the smoother's deeper-frontier
+// lag L) — so two rigs whose calibration would converge differently never cross-restore.
 void hash_histogram(persist::Writer& w, const HistogramConfig& h) {
     w.put_i32(h.bins);
     w.put_f64(h.range_min);
@@ -175,6 +178,10 @@ std::uint64_t config_hash(const Config& cfg) {
     w.put_bool(cfg.reverse_fold);
     w.put_bool(cfg.ref_cross_check);
     w.put_i32(static_cast<std::int32_t>(cfg.phase2_strategy));
+    // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
+    // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
+    // documented runtime exclusion).
+    w.put_f64(cfg.calib_lag_s);
     w.put_bool(cfg.timesync_enabled);
     w.put_i32(static_cast<std::int32_t>(cfg.match_metric));
     w.put_f64(cfg.max_lag_s);
@@ -341,6 +348,15 @@ struct Estimator::Impl {
     // (strict core); advanced once per step() in update_commit_state(). Indexed by the
     // registered-source slot. Always false for the reference / when time-sync is off.
     bool     offset_committed[kMaxSourcesCap] = {};
+    // Warm-restart offset re-fill latch (Slice 12 review). deserialize() restores
+    // offset_committed[slot]=true, but the time-sync histogram is EMPTY post-restore so the
+    // plain commit_gate in update_commit_state() would re-open the flag (confidence~0 over the
+    // empty histogram) until votes refill — the offset analog of the ext/roll/lever/scale
+    // re-fill hysteresis. This latch is SET per restored-committed offset slot in deserialize()
+    // and, while set, HOLDS offset_committed[i]=true through the refilling histogram (mirror of
+    // commit_gate_reanchor's vote-mass guard). It is CLEARED once the histogram refills to
+    // >= commit_min_votes, after which the normal commit_gate governs. Reset in init().
+    bool     offset_restored[kMaxSourcesCap] = {};
 
     // Per-source, per-DOF EXTRINSIC/SCALE commit state (Slice 8 feedback loop, DESIGN §6).
     // Same N_min + hysteresis gate (reuse commit_gate) on each DOF's own confidence + vote
@@ -442,14 +458,30 @@ struct Estimator::Impl {
     // Bounded by source_count; no heap.
     void update_commit_state() {
         for (int i = 0; i < source_count; ++i) {
-            if (sources[i] == nullptr) { offset_committed[i] = false; continue; }
+            if (sources[i] == nullptr) { offset_committed[i] = false; offset_restored[i] = false; continue; }
             const SourceId id = sources[i]->id();
             if (!timesync_active || id == cfg.reference_sensor_id) {
                 offset_committed[i] = false;          // reference / time-sync off never commits
+                offset_restored[i] = false;
                 continue;
             }
+            const Scalar votes = timesync.vote_count(id);
+            // Warm-restart re-fill hold (Slice 12 review): a restored-committed offset keeps its
+            // committed flag through the EMPTY/refilling post-restore histogram (mirroring
+            // commit_gate_reanchor's vote-mass guard for the ext/roll/lever/scale DOFs), so
+            // CalibSnapshot::committed reflects the restored state immediately rather than
+            // regressing to false until votes re-accumulate. Once the histogram has refilled to
+            // >= commit_min_votes the latch clears and the normal commit_gate governs from then
+            // on — the cold-start time-sync commit behaviour is untouched.
+            if (offset_restored[i]) {
+                if (votes < static_cast<Scalar>(cfg.commit_min_votes)) {
+                    offset_committed[i] = true;       // hold restored flag through refill
+                    continue;
+                }
+                offset_restored[i] = false;           // histogram refilled: hand back to commit_gate
+            }
             offset_committed[i] = commit_gate(
-                offset_committed[i], timesync.confidence(id), timesync.vote_count(id),
+                offset_committed[i], timesync.confidence(id), votes,
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
         }
     }
@@ -458,8 +490,14 @@ struct Estimator::Impl {
     // source's offset estimate is COMMITTED (the N_min + hysteresis gate in
     // update_commit_state has latched), use the estimated offset; otherwise fall back to
     // the configured prior (default 0). Slot `i` indexes the registered-source arrays.
+    //
+    // Warm-restart exception (Slice 12 review): while offset_restored[i] holds the committed
+    // flag through the EMPTY/refilling post-restore histogram, the time-sync estimate is not yet
+    // re-formed (timesync.offset() would read ~0). The restored offset VALUE lives in
+    // prior_time_offset[i] (deserialize folded it in), so return THAT — the restored offset is
+    // applied immediately, consistent with the held committed flag.
     Scalar effective_offset(int i) const {
-        if (timesync_active && offset_committed[i]) {
+        if (timesync_active && offset_committed[i] && !offset_restored[i]) {
             return timesync.offset(sources[i]->id());
         }
         return prior_time_offset[i];
@@ -667,6 +705,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->weight_prior[i]      = Scalar(1);
         impl_->prior_time_offset[i] = Scalar(0);
         impl_->offset_committed[i]  = false;
+        impl_->offset_restored[i]   = false;
         impl_->ext_committed[i]     = false;
         impl_->roll_committed[i]    = false;
         impl_->lever_committed[i]   = false;
@@ -1401,7 +1440,10 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
     if (r.underflow) return Status::CorruptData;
     // The blob must hold exactly: header (4+4+8+4=20) + payload_len + checksum (4).
     const int header_len = 20;
-    if (payload_len > static_cast<std::uint32_t>(0x40000000)) return Status::CorruptData; // sanity
+    // payload_len sanity cap: well above the 32-source max blob (~4 KiB), below INT overflow in
+    // the `need` length arithmetic below — short-circuits an absurd length before that add.
+    constexpr std::uint32_t kMaxPayloadLen = 0x40000000u;
+    if (payload_len > kMaxPayloadLen) return Status::CorruptData;
     const long long need = static_cast<long long>(header_len) +
                            static_cast<long long>(payload_len) + 4;
     if (static_cast<long long>(len) != need) return Status::CorruptData;   // truncated / extra
@@ -1452,6 +1494,20 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
     }
     if (pr.underflow) return Status::CorruptData;          // payload shorter than schema
 
+    // Orthonormality guard (Slice 12 review NIT): a checksum-valid-but-corrupt blob (a ~1-in-4e9
+    // FNV-1a-32 collision) could restore a non-orthonormal R that then propagates into X∘B∘X⁻¹.
+    // Belt-and-suspenders on top of checksum + config-hash: cheaply verify each restored
+    // extrinsic's rotation is ~orthonormal (RᵀR ≈ I and det > 0) before committing it, rejecting
+    // the blob otherwise. Bounded (stored_count <= cap), heap-free, no half-apply (still pre-commit).
+    {
+        const Scalar kOrthoTol = Scalar(1e-6);
+        for (int i = 0; i < stored_count; ++i) {
+            const Mat3& R = recs[i].prior_extrinsic.R;
+            const Scalar off = (R.transpose() * R - Mat3::Identity()).norm();
+            if (!(off < kOrthoTol) || !(R.determinant() > Scalar(0))) return Status::CorruptData;
+        }
+    }
+
     // (3) Restore INTO the init'd estimator. The estimator must already have the SAME sources
     // registered (the config-hash matched, so the rig is identical); we restore each persisted
     // record onto the registered slot whose id matches. A persisted source not currently
@@ -1473,15 +1529,18 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         // Restore the per-DOF commit flags. The ext/roll/lever/scale flags drive
         // apply_calib_feedback()'s commit_gate_reanchor(prev=true) RE-FILL HYSTERESIS, which
         // holds them committed through the sparse refilling histogram (so fusion uses the
-        // restored priors immediately). offset_committed is recomputed by update_commit_state()
-        // (plain commit_gate) against the empty time-sync histogram, so it transiently reads
-        // false until votes re-accumulate — but the offset VALUE is already in
-        // prior_time_offset, so effective_offset() returns it regardless (near-NOMINAL offset).
+        // restored priors immediately). The offset DOF gets the equivalent guard via the
+        // offset_restored latch (Slice 12 review): we restore offset_committed AND, for a
+        // restored-committed offset, SET offset_restored so update_commit_state() HOLDS the flag
+        // committed through the empty/refilling time-sync histogram instead of re-opening it via
+        // the plain commit_gate. The offset VALUE is already folded into prior_time_offset, so
+        // effective_offset() returns it regardless; the latch fixes only the committed READING.
         s.ext_committed[slot]    = rc.ext_c;
         s.roll_committed[slot]   = rc.roll_c;
         s.lever_committed[slot]  = rc.lever_c;
         s.scale_committed[slot]  = rc.scale_c;
         s.offset_committed[slot] = rc.offset_c;
+        s.offset_restored[slot]  = rc.offset_c;   // hold restored-committed offset through refill
         // Restore the variance-EMA reliability track (Slice 9) so the source's quality weight
         // resumes rather than re-warming for kRelWarmup steps.
         s.resid_mean[slot]  = rc.resid_mean;

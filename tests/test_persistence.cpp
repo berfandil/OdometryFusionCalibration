@@ -25,6 +25,7 @@
 #include "ofc/core/config.hpp"
 #include "ofc/core/estimator.hpp"
 #include "ofc/core/lie.hpp"
+#include "ofc/core/persistence.hpp"
 #include "ofc/core/result.hpp"
 
 #include "ofc_sim/rig.hpp"
@@ -247,6 +248,87 @@ TEST_CASE("persistence round-trip: serialize then deserialize restores committed
 }
 
 // ===========================================================================
+// RESTORED OFFSET FLAG HELD THROUGH REFILL (Slice 12 review MINOR): a restored-committed
+// time-sync offset must read `committed` TRUE IMMEDIATELY after restore — not regress to false
+// while the empty post-restore histogram refills. Pre-fix, update_commit_state() recomputed the
+// flag via the plain commit_gate over the empty histogram (confidence~0) and flipped it FALSE;
+// the offset_restored latch now holds it committed through the refill (mirroring the
+// ext/roll/lever/scale re-fill hysteresis). This case FAILS on pre-fix code.
+// ===========================================================================
+namespace {
+// A time-sync rig with a planted RELATIVE offset on source 1 — converges + COMMITS the offset.
+Config make_offset_cfg(SensorConfig* sc /*[2], outlives the call*/) {
+    Config c;
+    c.tick_rate_hz     = 100.0;
+    c.match_metric     = MatchMetric::L2;
+    c.max_lag_s        = 0.1;
+    c.timesync_enabled = true;
+    c.max_sources      = 2;
+    c.reference_sensor_id = 0;
+    c.offset_hist.bins      = 256;
+    c.offset_hist.range_min = -0.1;
+    c.offset_hist.range_max =  0.1;
+    c.offset_hist.circular  = false;
+    c.offset_hist.aging     = Aging::SlidingK;
+    c.offset_hist.sliding_k = 64;
+    c.offset_hist.vote_split = true;
+    c.offset_hist.subbin     = true;
+    c.commit_concentration = 0.5;
+    c.commit_drop          = 0.3;
+    c.commit_min_votes     = 30;     // reachable with the SlidingK=64 offset hist
+    sc[0].id = 0; sc[0].is_reference = true;
+    sc[1].id = 1;
+    c.sensors = sc; c.sensor_count = 2;
+    return c;
+}
+} // namespace
+
+TEST_CASE("persistence: a restored COMMITTED offset reads committed immediately (held through refill)") {
+    Trajectory tr = Trajectory::omega_varying();
+    const Scalar planted = 0.04;
+    SourceParams pr; pr.id = 0; pr.time_offset_s = 0.0;
+    SourceParams ps; ps.id = 1; ps.time_offset_s = planted;
+
+    SensorConfig sc[2];
+    const Config cfg = make_offset_cfg(sc);
+
+    // (1) Converge a SOURCE estimator until source 1's offset commits, then serialize.
+    SyntheticSource s0c(tr, pr), s1c(tr, ps);
+    Estimator src;
+    REQUIRE(src.init(cfg) == Status::Ok);
+    REQUIRE(src.add_source(&s0c) == Status::Ok);
+    REQUIRE(src.add_source(&s1c) == Status::Ok);
+    const Timestamp tick = secs_to_ns(0.01);   // 100 Hz
+    for (Timestamp now = secs_to_ns(0.3); now <= secs_to_ns(tr.end_s() - 0.1); now += tick) {
+        (void)src.step(now);
+    }
+    const CalibSnapshot* csrc = snap(src.latest(), 1);
+    REQUIRE(csrc != nullptr);
+    REQUIRE(csrc->committed);                   // offset committed in the source run
+
+    std::vector<unsigned char> blob(1024, 0);
+    const Expected<int> sr = src.serialize(blob.data(), static_cast<int>(blob.size()));
+    REQUIRE(sr.ok());
+    blob.resize(sr.value());
+
+    // (2) Restore into a FRESH estimator (empty time-sync histogram) and step ONCE. The restored
+    // offset must read committed IMMEDIATELY — pre-fix the plain commit_gate over the empty
+    // histogram flips it false until ~30 votes refill.
+    SyntheticSource s0w(tr, pr), s1w(tr, ps);
+    Estimator warm;
+    REQUIRE(warm.init(cfg) == Status::Ok);
+    REQUIRE(warm.add_source(&s0w) == Status::Ok);
+    REQUIRE(warm.add_source(&s1w) == Status::Ok);
+    REQUIRE(warm.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::Ok);
+    REQUIRE(ok(warm.step(secs_to_ns(0.3))));
+    const CalibSnapshot* cw = snap(warm.latest(), 1);
+    REQUIRE(cw != nullptr);
+    CHECK(cw->committed);                        // HELD through the empty/refilling histogram
+    CHECK(cw->time_offset_s > 0.0);             // restored offset VALUE is applied (correct sign)
+    CHECK(near_abs(cw->time_offset_s, planted, 0.02));
+}
+
+// ===========================================================================
 // RESTART RESUMES NEAR-NOMINAL (done-criterion 1): a restored estimator tracks GT immediately
 // (the committed scale drives fusion's de-scale from step 1), FAR better than a cold-start
 // estimator that must re-bootstrap the scale from the wrong 1.0 prior.
@@ -278,8 +360,12 @@ TEST_CASE("persistence near-NOMINAL: a restored estimator beats cold-start immed
     REQUIRE(cold >= 0);
     REQUIRE(warm >= 0);
     INFO("late fused trans err: cold-start=" << cold << "  warm-restart=" << warm);
-    // The warm restart resumes near-NOMINAL: with the committed scale restored it tracks GT,
-    // while the cold start carries the full 1.0-prior scale bias. A decisive margin.
+    // The warm restart resumes near-NOMINAL: with the committed scale restored it tracks GT
+    // (warm error stays ~mm), while the cold start carries the full 1.0-prior scale bias (a
+    // decimetre+ of bias). Assert the near-NOMINAL PROPERTY directly (warm absolutely small,
+    // cold absolutely large) rather than only the relative gap — keep the relative check too.
+    CHECK(warm < Scalar(0.01));        // warm restart is absolutely near-NOMINAL (~mm)
+    CHECK(cold > Scalar(0.1));         // cold start carries a decimetre+ of un-calibrated bias
     CHECK(warm < cold * Scalar(0.6));
 
     // And the warm estimator comes up with its commit flag ALREADY set + the right scale (it did
@@ -416,6 +502,55 @@ TEST_CASE("persistence framing: checksum / version / magic / capacity / not-init
         CHECK(r.status() == Status::NotInitialized);
         CHECK(un.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::NotInitialized);
     }
+}
+
+// ===========================================================================
+// ORTHONORMALITY GUARD (Slice 12 review NIT): a checksum-VALID blob whose extrinsic rotation is
+// non-orthonormal (the residual ~1-in-4e9 FNV collision path) is rejected as CorruptData by the
+// deserialize orthonormality check, before the corrupt R can propagate into fusion. We forge the
+// collision directly: corrupt R(0,0) of the first source's prior_extrinsic, then RE-WRITE the
+// trailing FNV-1a-32 checksum so the blob passes the checksum + config-hash gates and only the
+// orthonormality guard can catch it.
+// ===========================================================================
+TEST_CASE("persistence orthonormality: a checksum-valid but non-orthonormal R is rejected") {
+    std::vector<unsigned char> blob;
+    converge_and_serialize_scale(blob);
+
+    static const Trajectory tr = bootstrap_traj();
+    std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+    const Config cfg = make_scale_cfg(sensors);
+    std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+
+    // Payload layout: header(20) then i32 source_count + i32 phase + u8 ever_fused (= 9 bytes),
+    // then per source: i32 id (4) + SE3 (9 R doubles + 3 t doubles). So the first source's
+    // R(0,0) starts at blob offset 20 + 9 + 4 = 33.
+    const int r00_off = 20 + 9 + 4;
+    std::vector<unsigned char> bad = blob;
+    const double non_ortho = 2.0;                 // scaling one entry breaks RᵀR == I
+    std::memcpy(bad.data() + r00_off, &non_ortho, sizeof(double));
+    // Re-write the trailing checksum so the corrupt blob PASSES the checksum gate (forge the
+    // collision): FNV-1a-32 over header+payload (everything before the trailing 4-byte word).
+    const int covered = static_cast<int>(bad.size()) - 4;
+    const std::uint32_t cs = persist::fnv1a32(bad.data(), covered);
+    for (int i = 0; i < 4; ++i) bad[covered + i] = static_cast<unsigned char>((cs >> (8 * i)) & 0xFFu);
+
+    // Sanity: the re-checksummed UNcorrupted blob still deserializes Ok (the forge mechanism is
+    // sound — it is the non-orthonormal R, not a broken checksum, that triggers the rejection).
+    {
+        std::vector<unsigned char> ok_blob = blob;
+        const std::uint32_t cs2 = persist::fnv1a32(ok_blob.data(), static_cast<int>(ok_blob.size()) - 4);
+        for (int i = 0; i < 4; ++i)
+            ok_blob[static_cast<int>(ok_blob.size()) - 4 + i] =
+                static_cast<unsigned char>((cs2 >> (8 * i)) & 0xFFu);
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(ok_blob.data(), static_cast<int>(ok_blob.size())) == Status::Ok);
+    }
+
+    std::vector<std::unique_ptr<SyntheticSource>> srcs2; make_scale_sources(tr, srcs2);
+    Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+    for (auto& sp : srcs2) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+    CHECK(est.deserialize(bad.data(), static_cast<int>(bad.size())) == Status::CorruptData);
 }
 
 // ===========================================================================
