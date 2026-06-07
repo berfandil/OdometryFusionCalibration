@@ -112,8 +112,8 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `native_confidence` | bool | true | — | Use the provider's reported Σ if present. |
 | `modeled_noise_per_m` | double | tuned | ≥0 | Synthetic translation noise (per metre). |
 | `modeled_noise_per_rad` | double | tuned | ≥0 | Synthetic rotation noise (per radian). |
-| `per_sensor_kf` | bool | false | — | Enable the pre-calibration smoother. |
-| `kf_process_noise` | double | tuned | ≥0 | Smoothing strength (larger = looser/closer-tracking). |
+| `per_sensor_kf` | bool | false | — | Enable the per-sensor fixed-lag RTS twist smoother feeding calibration (Slice 10, **wired**). On ⇒ calibration runs at the deeper frontier `now − delay − L` with two-sided (zero-phase) smoothed twists; OFF ⇒ byte-identical to no-smoothing. |
+| `kf_process_noise` | double | tuned | ≥0 | Smoothing strength `q` (larger = looser/closer-tracking; only `q/r` shapes smoothing, `r` fixed at 1.0). **Note**: a single shared smoother uses the MAX `q` over enabled sources (not yet per-source). |
 | `scale_calib` | bool | true | — | Calibrate scale; if false, fixed at `prior_scale`. |
 | `bias_states` | bool | false | — | Add nuisance-bias states (GPS/INS-style drift removal); enable for raw-IMU sources. |
 | `is_reference` | bool | (id==ref) | — | Marks the gauge anchor. |

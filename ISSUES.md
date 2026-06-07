@@ -82,7 +82,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: a noisy source is downweighted; a *biased* source is calibrated (not just downweighted) in sim.
 **Deps**: Slices 2, 8.
 
-## Slice 10 — Per-sensor fixed-lag RTS smoother  `[ ]`
+## Slice 10 — Per-sensor fixed-lag RTS smoother  `[x]`
 **Goal**: two-sided pre-calibration smoothing at the deeper frontier (D18).
 - CV twist ESKF forward + backward RTS pass over lag `L`.
 **Done when**: calibration histogram peaks sharpen vs raw input; no peak shift (zero-phase) in sim.
