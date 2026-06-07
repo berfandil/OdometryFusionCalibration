@@ -66,6 +66,9 @@ struct SourceHealth {
 
 struct Result {
     Phase  phase = Phase::Init;
+    // Coarse [0,1] readiness exposed alongside `phase` (DESIGN §7/§8). A monotone
+    // map of the phase: Init 0.0 / Warmup 0.25 / Degraded 0.6 / Nominal 1.0.
+    Scalar readiness = 0.0;
 
     State  frontier;                    // trustworthy, causal (now - delay)
     State  tip;                         // predict-only extrapolation to now

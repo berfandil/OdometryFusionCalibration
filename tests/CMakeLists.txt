@@ -12,6 +12,7 @@ add_executable(ofc_tests
     test_median.cpp
     test_eskf.cpp
     test_fusion.cpp
+    test_lifecycle.cpp
     test_histogram.cpp
     test_timesync.cpp
     test_calib_phase1.cpp

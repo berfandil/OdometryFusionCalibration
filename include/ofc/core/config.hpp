@@ -58,6 +58,12 @@ struct Config {
     // Gauge
     SourceId   reference_sensor_id = 0;
     ColdStart  cold_start     = ColdStart::ReferenceOnly;
+    // Lifecycle (Slice 3): below this many PARTICIPATING sources fused in a step,
+    // outlier rejection degrades and the phase stays DEGRADED (a health warning);
+    // at/above it the phase is NOMINAL (CONFIG §3). Lower-bound only — NOT tied to
+    // max_sources: if min_sources_warn > max_sources, NOMINAL is simply never
+    // reached (a legitimate "never enough sources" state).
+    int        min_sources_warn = 3;
 
     // Median fusion
     int        weiszfeld_max_iters = 10;

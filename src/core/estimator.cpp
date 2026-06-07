@@ -195,6 +195,29 @@ struct Estimator::Impl {
     // per-source residual diagnostics to attribute the consensus distance correctly.
     int    med_slot[kMaxSourcesCap];
 
+    // Lifecycle state (Slice 3, D23). Persisted across steps; the phase is
+    // RECOMPUTED every step from the current fuse signals, so an upgrade
+    // (DEGRADED->NOMINAL) and a graceful downgrade (NOMINAL->DEGRADED on source
+    // loss) both fall out automatically. `ever_fused_` latches on the first
+    // successful fuse and distinguishes the pre-first-fuse WARMUP from the
+    // post-fuse DEGRADED of a total source loss. Reset in init().
+    Phase  phase_      = Phase::Init;
+    bool   ever_fused_ = false;
+
+    // Set both result.phase and result.readiness from one Phase (the coarse [0,1]
+    // readiness map of DESIGN §7/§8). Centralizes the mapping so the two fields
+    // never drift apart.
+    void publish_phase(Phase p) {
+        phase_ = p;
+        result.phase = p;
+        switch (p) {
+            case Phase::Init:     result.readiness = Scalar(0.0);  break;
+            case Phase::Warmup:   result.readiness = Scalar(0.25); break;
+            case Phase::Degraded: result.readiness = Scalar(0.6);  break;
+            case Phase::Nominal:  result.readiness = Scalar(1.0);  break;
+        }
+    }
+
     Eskf   eskf;
     bool   eskf_started = false;
 
@@ -409,7 +432,12 @@ Status Estimator::init(const Config& cfg) {
     if (impl_ == nullptr) impl_ = new Impl();   // allocate-once at init
     impl_->cfg          = cfg;
     impl_->result       = Result{};
-    impl_->result.phase = Phase::Init;
+    // Lifecycle reset (Slice 3): INIT is observable before the first step. publish_phase
+    // sets both result.phase (== Init, as Result{} already does) AND result.readiness
+    // (== 0.0), and resets the persisted phase_. ever_fused_ clears so the first
+    // un-fusable step reads WARMUP, not the post-fuse DEGRADED.
+    impl_->ever_fused_  = false;
+    impl_->publish_phase(Phase::Init);
     impl_->source_count = 0;
     impl_->eskf_started = false;
     impl_->last_t1      = 0;
@@ -512,9 +540,11 @@ Status Estimator::step(Timestamp now) {
     const Timestamp t1 = now - secs_to_ns(cfg.fusion_delay_s);
     const Timestamp q0 = s.has_last_t1 ? s.last_t1 : (t1 - secs_to_ns(cfg.window_s));
 
-    // Degenerate / non-causal interval guard: nothing to integrate.
+    // Degenerate / non-causal interval guard: nothing to integrate. Lifecycle
+    // (Slice 3): before any fuse this is WARMUP; after a fuse it is a graceful
+    // DEGRADED (the last good frontier in `result` is retained) — never a crash.
     if (t1 <= q0) {
-        s.result.phase     = Phase::Warmup;
+        s.publish_phase(s.ever_fused_ ? Phase::Degraded : Phase::Warmup);
         s.result.tip_valid = false;
         return Status::NotReady;
     }
@@ -625,11 +655,14 @@ Status Estimator::step(Timestamp now) {
 
     s.result.source_count = s.source_count;
 
-    // Phase: need at least one PARTICIPATING source covering the window. (Full lifecycle —
-    // INIT/WARMUP/DEGRADED/NOMINAL — is Slice 3; keep this minimal but correct.) Under
-    // ReferenceOnly cold-start before any commit this is the reference alone (dead-reckon).
+    // Lifecycle (Slice 3, D23): need at least one PARTICIPATING source covering the
+    // window to fuse. Total source loss this step is a graceful downgrade, not a
+    // crash: before any fuse it is WARMUP; after a fuse it is DEGRADED + NotReady
+    // (the last good frontier stays in `result`; no new frontier is published).
+    // Under ReferenceOnly cold-start before any commit, n is the reference alone
+    // (reference-only dead-reckon) — that is n == 1, handled by the fuse path below.
     if (n == 0) {
-        s.result.phase     = Phase::Warmup;
+        s.publish_phase(s.ever_fused_ ? Phase::Degraded : Phase::Warmup);
         s.result.tip_valid = false;
         return Status::NotReady;
     }
@@ -764,7 +797,14 @@ Status Estimator::step(Timestamp now) {
     // Frontier state. Drive the published stamp from the real frontier t1.
     s.result.frontier        = s.eskf.state();
     s.result.frontier.stamp  = t1;
-    s.result.phase           = Phase::Nominal;
+
+    // Lifecycle (Slice 3, D23): a successful fuse latches ever_fused_; the phase is
+    // NOMINAL when >= min_sources_warn sources PARTICIPATED, else DEGRADED (reduced
+    // outlier-rejection margin — e.g. ReferenceOnly dead-reckon at n == 1, or a
+    // partial source loss below the warn threshold). Recomputed every step from `n`,
+    // so a drop below min_sources_warn downgrades NOMINAL->DEGRADED automatically.
+    s.ever_fused_ = true;
+    s.publish_phase((n >= cfg.min_sources_warn) ? Phase::Nominal : Phase::Degraded);
 
     // Predicted tip: const-velocity extrapolation from the frontier to `now`.
     if (cfg.emit_predicted_tip) {
@@ -813,6 +853,9 @@ Status validate(const Config& cfg) {
     if (cfg.metric_lambda <= 0.0)                    return Status::OutOfRange;
     if (cfg.commit_drop >= cfg.commit_concentration) return Status::InvalidConfig;
     if (cfg.reference_sensor_id >= cfg.max_sources)  return Status::OutOfRange;
+    // Lifecycle (Slice 3): lower-bound only. NOT tied to max_sources — a
+    // min_sources_warn > max_sources is a legitimate "never NOMINAL" config.
+    if (cfg.min_sources_warn < 1)                    return Status::OutOfRange;
 
     // Median / fusion knob ranges (CONFIG §§1-4).
     if (cfg.confidence_blend < 0.0 || cfg.confidence_blend > 1.0)
