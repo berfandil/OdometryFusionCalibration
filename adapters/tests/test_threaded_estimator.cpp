@@ -137,3 +137,23 @@ TEST_CASE("ThreadedEstimator: snapshot before any step is the default Result; st
     // After stop, further submits are rejected.
     CHECK(te.submit(secs_to_ns(2.0)) == Status::Rejected);
 }
+
+TEST_CASE("ThreadedEstimator: drain_and_stop() after stop() honors the drop (no resurrection)") {
+    // Contract: stop() DROPS pending stamps; a later drain_and_stop() must NOT replay them via
+    // the inline-drain branch. Submit before start, stop() (drops), then drain_and_stop(): the
+    // estimator must have stepped ZERO stamps.
+    std::vector<SensorConfig> sensors;
+    const Config cfg = make_rig_cfg(sensors);
+    const std::vector<Timestamp> ts = stamp_schedule();
+
+    std::vector<TwistSource> srcs; make_rig_sources(srcs);
+    Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+    for (auto& s : srcs) REQUIRE(est.add_source(&s) == Status::Ok);
+
+    adapters::ThreadedEstimator te(est);
+    CHECK(te.submit_batch(ts.data(), static_cast<int>(ts.size())) == Status::Ok);  // before start
+    CHECK(te.stop() == Status::Ok);                  // drops the pending batch
+    CHECK(te.drain_and_stop() == Status::Ok);        // must NOT resurrect the dropped stamps
+    CHECK(te.steps_done() == 0);                      // nothing was processed
+    CHECK_FALSE(te.running());
+}

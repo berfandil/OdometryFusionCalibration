@@ -3,8 +3,9 @@
 // RELAXED EDGE. The strict core's Estimator::serialize()/deserialize() touch ONLY a
 // caller-owned fixed buffer (no heap / file IO / exceptions — see ofc/core/persistence.hpp).
 // This adapter wraps those primitives in the production DOUBLE-BUFFER PING-PONG over two
-// files A/B so a crash mid-write leaves at most the INACTIVE file torn and load() always
-// recovers the last good state.
+// files A/B. save() always writes to the file load() would REJECT (the invalid / older / missing
+// one) and never the highest-seq VALID file, so a crash mid-write leaves at most that
+// rejected-anyway file torn and load() always recovers the last good state.
 //
 // THE ON-DISK RECORD (one per file): a small header then the core blob.
 //   [ uint64 seq        : 8 bytes, little-endian — monotonic write sequence    ]
@@ -15,11 +16,18 @@
 // falls back to the other file. blob_len lets load() detect a short write before handing the
 // (possibly garbage) tail to the core.
 //
-// STATELESS ACROSS RESTARTS. save() reads BOTH files' seq words to pick the INACTIVE target
-// (the one with the LOWER seq, or a missing/unreadable file) and writes seq = max(seq)+1 —
-// so a fresh process resumes the ping-pong correctly without remembering which file it wrote
-// last. load() reads both, tries the HIGHER-seq blob first, and falls back to the other if
-// the higher one fails the core guards.
+// STATELESS ACROSS RESTARTS. save() reads BOTH files and picks the INACTIVE target by VALIDITY,
+// not by the raw on-disk seq word: it checks whether each file holds a complete, checksum +
+// config-hash-valid blob for the rig being saved (the same framing guards load()/the core apply),
+// and OVERWRITES the file load() would reject — the invalid / torn / missing one; if both are
+// valid it overwrites the LOWER-seq one. It NEVER overwrites the highest-seq VALID file (the one
+// load() would return), then writes seq = max(seq)+1. This handles the crash residue the whole
+// design exists to survive: a higher-seq file with an intact 12-byte adapter header but a TORN
+// body reads as present with a higher seq YET is invalid, so it is the overwrite target and the
+// genuinely-good lower-seq file is preserved (the seq-word-only target choice could clobber the
+// good file and lose BOTH copies on a crash during that write). A fresh process resumes the
+// ping-pong correctly without remembering which file it wrote last. load() reads both, tries the
+// HIGHER-seq blob first, and falls back to the other if the higher one fails the core guards.
 //
 // EXCEPTIONS DO NOT ESCAPE. std::fstream IO can throw / fail; every public method catches and
 // maps failures to a Status. The adapter never lets an exception cross its own API boundary.
@@ -48,8 +56,9 @@ public:
     FilePersistence(std::string path_a, std::string path_b,
                     int max_blob_bytes = kDefaultMaxBlobBytes);
 
-    // Serialize `est` into the INACTIVE file (the lower-seq / missing one) with the next seq,
-    // flushing + closing before returning so a crash leaves at most the inactive file torn.
+    // Serialize `est` into the INACTIVE file (the one load() would reject — the invalid / torn /
+    // older / missing one; never the highest-seq VALID file) with the next seq, flushing +
+    // closing before returning so a crash leaves at most that rejected-anyway file torn.
     //   Ok               — written + flushed.
     //   NotInitialized   — est.serialize() reports the estimator was never init()'d.
     //   CapacityExceeded — the blob did not fit the staging buffer.

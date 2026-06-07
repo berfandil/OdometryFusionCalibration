@@ -70,6 +70,8 @@ public:
     // Block until the queue is EMPTY (every submitted stamp has been step()'d), then stop +
     // join. The deterministic batch mode: submit_batch(...) then drain_and_stop() leaves the
     // final snapshot equal to a single-threaded run over the same stamps. Returns Ok.
+    // NOTE: a drain_and_stop() AFTER a prior stop() does NOT resurrect the stamps stop() dropped
+    // — stop()'s drop is honored (the leftover queue is discarded, not replayed inline).
     Status drain_and_stop();
 
     // Signal the worker to finish the CURRENT step then exit, and JOIN it (does NOT wait for

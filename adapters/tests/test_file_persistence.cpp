@@ -167,8 +167,10 @@ TEST_CASE("FilePersistence crash-mid-write: a torn higher-seq file falls back to
     CHECK(db2.load(e2) == Status::Ok);
     CHECK(db2.last_seq() == 1);                       // chose A (the last good), not torn B
 
-    // (3) A clean save now targets the INACTIVE file. A=1 (valid), B=2 (torn but seq 2 reads as
-    // the higher), so next_seq = 3 written to A (the lower valid... actually A=1 < B=2 -> A).
+    // (3) A clean save now targets the INACTIVE file by VALIDITY: A=1 is the only VALID record
+    // (B=2 has an intact header but a torn body), so save() PRESERVES A and overwrites B with
+    // next_seq = max(1,2)+1 = 3. (See the dedicated "overwrites the TORN higher-seq file"
+    // test below for the crash-safety assertion that A is left untouched.)
     REQUIRE(db2.save(e2) == Status::Ok);
     CHECK(db2.last_seq() == 3);
     // A subsequent load now returns the clean seq-3 record.
@@ -178,6 +180,111 @@ TEST_CASE("FilePersistence crash-mid-write: a torn higher-seq file falls back to
     adapters::FilePersistence db3(pa, pb);
     CHECK(db3.load(e3) == Status::Ok);
     CHECK(db3.last_seq() == 3);
+
+    std::remove(pa.c_str());
+    std::remove(pb.c_str());
+}
+
+namespace {
+
+// Read the full on-disk record bytes (adapter header + body) of `path`.
+std::vector<unsigned char> read_all(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const std::streamoff sz = f.tellg();
+    f.seekg(0);
+    std::vector<unsigned char> v(static_cast<std::size_t>(sz));
+    if (!v.empty()) f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size()));
+    return v;
+}
+
+// Hand-write a TORN record into `path`: seq + a blob_len that CLAIMS `claim_len` bytes, but only
+// `body_bytes` of the (valid) body `good` actually written -> an intact 12-byte header over a
+// short body (the realistic crash-mid-write residue).
+void write_torn(const std::string& path, std::uint64_t seq,
+                const std::vector<unsigned char>& good, std::size_t body_bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::uint32_t len = static_cast<std::uint32_t>(good.size());   // claim the full length
+    f.write(reinterpret_cast<const char*>(&seq), 8);
+    f.write(reinterpret_cast<const char*>(&len), 4);
+    if (body_bytes > 0)
+        f.write(reinterpret_cast<const char*>(good.data()),
+                static_cast<std::streamsize>(body_bytes));         // ... but write only a prefix
+    f.flush();
+}
+
+} // namespace
+
+// CRITICAL (Slice-13 review): save() must NOT overwrite the genuinely last-good file when the
+// OTHER file has a HIGHER seq but a TORN body. Pre-fix, save() picked the overwrite target by the
+// raw on-disk seq word alone (overwrite the lower seq), so it clobbered the VALID lower-seq file
+// A and a crash during THAT write would lose BOTH copies. Post-fix, save() picks by VALIDITY:
+// A (valid, seq 1) is preserved and the torn B (seq 2) is overwritten with seq 3. This test FAILS
+// on the pre-fix code (which would leave A holding seq 3 and lose the original good A blob).
+TEST_CASE("FilePersistence crash-safety: save() overwrites the TORN higher-seq file, not the good one") {
+    std::vector<SensorConfig> sensors;
+    const Config cfg = make_rig_cfg(sensors);
+
+    const std::string pa = temp_path("torn_A.bin");
+    const std::string pb = temp_path("torn_B.bin");
+    std::remove(pa.c_str());
+    std::remove(pb.c_str());
+
+    std::vector<TwistSource> srcs; make_rig_sources(srcs);
+    Estimator est; make_and_run(est, cfg, srcs);
+
+    // (1) A clean save -> A holds a VALID seq-1 record. Snapshot A's exact bytes to prove later
+    // that save() left A byte-for-byte untouched.
+    adapters::FilePersistence db(pa, pb);
+    REQUIRE(db.save(est) == Status::Ok);
+    REQUIRE(db.last_seq() == 1);
+    const std::vector<unsigned char> a_before = read_all(pa);
+    REQUIRE_FALSE(a_before.empty());
+
+    // (2) Crash-mid-write residue in B: a HIGHER seq (2) with an intact 12-byte header but a TORN
+    // (half-written) body. read_record() reports it present with seq 2; the core would reject it.
+    {
+        std::vector<unsigned char> good(a_before.begin() + 12, a_before.end());  // A's valid blob
+        REQUIRE(good.size() >= 2);
+        write_torn(pb, /*seq=*/2, good, /*body_bytes=*/good.size() / 2);          // only half
+    }
+
+    // (3) save() must PRESERVE the valid A and overwrite the torn B with the next seq (3).
+    adapters::FilePersistence db2(pa, pb);
+    REQUIRE(db2.save(est) == Status::Ok);
+    CHECK(db2.last_seq() == 3);
+
+    // A is byte-for-byte the ORIGINAL valid seq-1 record (NOT overwritten).
+    const std::vector<unsigned char> a_after = read_all(pa);
+    REQUIRE(a_after.size() == a_before.size());
+    CHECK(std::memcmp(a_after.data(), a_before.data(), a_before.size()) == 0);
+
+    // B now holds the fresh seq-3 record, and a load picks it (highest-seq valid).
+    {
+        std::vector<TwistSource> sl; make_rig_sources(sl);
+        Estimator el; REQUIRE(el.init(cfg) == Status::Ok);
+        for (auto& s : sl) REQUIRE(el.add_source(&s) == Status::Ok);
+        adapters::FilePersistence dl(pa, pb);
+        CHECK(dl.load(el) == Status::Ok);
+        CHECK(dl.last_seq() == 3);                    // the new B record
+    }
+
+    // (4) Simulate a crash DURING that seq-3 write to B: tear B's body again. The invariant holds
+    // only because save() preserved A — load() falls back to A's good seq-1 state.
+    {
+        const std::vector<unsigned char> b_now = read_all(pb);
+        REQUIRE(b_now.size() > 12);
+        std::vector<unsigned char> b_body(b_now.begin() + 12, b_now.end());
+        write_torn(pb, /*seq=*/3, b_body, /*body_bytes=*/b_body.size() / 2);   // tear seq-3 B
+    }
+    {
+        std::vector<TwistSource> sr; make_rig_sources(sr);
+        Estimator er; REQUIRE(er.init(cfg) == Status::Ok);
+        for (auto& s : sr) REQUIRE(er.add_source(&s) == Status::Ok);
+        adapters::FilePersistence dr(pa, pb);
+        CHECK(dr.load(er) == Status::Ok);            // recovered, NOT NoData
+        CHECK(dr.last_seq() == 1);                    // fell back to the preserved good A
+    }
 
     std::remove(pa.c_str());
     std::remove(pb.c_str());

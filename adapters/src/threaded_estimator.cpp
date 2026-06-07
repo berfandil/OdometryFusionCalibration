@@ -62,8 +62,13 @@ bool ThreadedEstimator::running() const {
 }
 
 Status ThreadedEstimator::drain_and_stop() {
+    bool already_stopped;
     {
         std::lock_guard<std::mutex> lk(q_mtx_);
+        // A prior stop() (which DROPS pending stamps) must stay honored: a later
+        // drain_and_stop() must not resurrect those dropped stamps via the inline-drain branch
+        // below. Capture it now so we can skip the inline drain when stop already happened.
+        already_stopped = stop_now_;
         if (!started_) {
             // Never started: drain synchronously here (the caller may have submitted stamps
             // before start()). Process them inline, then mark stopped.
@@ -75,6 +80,12 @@ Status ThreadedEstimator::drain_and_stop() {
 
     if (worker_.joinable()) {
         worker_.join();
+    } else if (already_stopped) {
+        // A prior stop() already dropped the pending queue's claim to be processed; honor the
+        // drop. Clear the leftover stamps so a later snapshot/observation does not imply they
+        // ran, then fall through to mark stopped. (No worker exists to drain them in any case.)
+        std::lock_guard<std::mutex> lk(q_mtx_);
+        queue_.clear();
     } else {
         // No worker (start() was never called): drain the queue inline on this thread so the
         // contract ("the final snapshot equals a single-threaded run over the stamps") still

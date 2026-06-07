@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -54,7 +55,10 @@ bool parse_double(const std::string& v, Scalar& out) {
     }
 }
 
-bool parse_int(const std::string& v, long& out) {
+// Parse a base-10 int. On failure returns false; if the value was a well-formed number that
+// overflows `long`, *overflow (when non-null) is set true so the caller can report it distinctly.
+bool parse_int(const std::string& v, long& out, bool* overflow = nullptr) {
+    if (overflow != nullptr) *overflow = false;
     try {
         std::size_t used = 0;
         const long n = std::stol(trim(v), &used, 10);
@@ -63,6 +67,9 @@ bool parse_int(const std::string& v, long& out) {
         if (!rest.empty()) return false;
         out = n;
         return true;
+    } catch (const std::out_of_range&) {
+        if (overflow != nullptr) *overflow = true;
+        return false;
     } catch (...) {
         return false;
     }
@@ -126,6 +133,16 @@ Status ConfigLoader::parse(const std::string& text) {
         return Status::InvalidConfig;
     };
 
+    // Parse an int field, distinguishing a well-formed-but-out-of-range value (NIT) from generic
+    // junk in the message. Returns true on success (out set); on failure leaves out untouched and
+    // sets *why to the appropriate diagnostic for the caller to pass to fail().
+    auto parse_int_field = [](const std::string& v, long& out, std::string& why) -> bool {
+        bool overflow = false;
+        if (parse_int(v, out, &overflow)) return true;
+        why = overflow ? "int value out of range" : "expected int";
+        return false;
+    };
+
     enum class Scope { Global, Sensor };
     Scope scope = Scope::Global;
     int   cur_sensor = -1;   // index into sensors_
@@ -181,11 +198,13 @@ Status ConfigLoader::parse(const std::string& text) {
             long   iv;
             Scalar dv;
             bool   bv;
+            std::string why;
             if (key == "max_sources") {
-                if (!parse_int(val, iv)) return fail("expected int", line_no, raw);
+                if (!parse_int_field(val, iv, why)) return fail(why, line_no, raw);
                 cfg_.max_sources = static_cast<int>(iv);
             } else if (key == "reference_sensor_id") {
-                if (!parse_int(val, iv) || iv < 0) return fail("expected non-negative int", line_no, raw);
+                if (!parse_int_field(val, iv, why)) return fail(why, line_no, raw);
+                if (iv < 0) return fail("expected non-negative int", line_no, raw);
                 cfg_.reference_sensor_id = static_cast<SourceId>(iv);
             } else if (key == "window_s") {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
@@ -208,7 +227,7 @@ Status ConfigLoader::parse(const std::string& text) {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 cfg_.commit_concentration = dv;
             } else if (key == "commit_min_votes") {
-                if (!parse_int(val, iv)) return fail("expected int", line_no, raw);
+                if (!parse_int_field(val, iv, why)) return fail(why, line_no, raw);
                 cfg_.commit_min_votes = static_cast<int>(iv);
             } else if (key == "commit_drop") {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
@@ -233,8 +252,10 @@ Status ConfigLoader::parse(const std::string& text) {
             long   iv;
             Scalar dv;
             bool   bv;
+            std::string why;
             if (key == "id") {
-                if (!parse_int(val, iv) || iv < 0) return fail("expected non-negative int", line_no, raw);
+                if (!parse_int_field(val, iv, why)) return fail(why, line_no, raw);
+                if (iv < 0) return fail("expected non-negative int", line_no, raw);
                 sc.id = static_cast<SourceId>(iv);
             } else if (key == "prior_extrinsic") {
                 if (!parse_extrinsic(val, sc.prior_extrinsic))
@@ -260,6 +281,47 @@ Status ConfigLoader::parse(const std::string& text) {
             } else {
                 return fail("unknown sensor key '" + key + "'", line_no, raw);
             }
+        }
+    }
+
+    // Cross-section semantic checks the core validate() does not yet make (estimator.cpp's
+    // validate() has a "TODO: per-sensor checks" and only range-checks reference_sensor_id):
+    //
+    // (a) Duplicate sensor id. The [sensor.N] section index is just a dense storage slot; the
+    // bound id is `id=`. Two sections can set the same id, which parses + validates Ok yet
+    // silently mis-binds at add_source/restore time. Reject it loudly here.
+    for (std::size_t i = 0; i < sensors_.size(); ++i) {
+        for (std::size_t j = i + 1; j < sensors_.size(); ++j) {
+            if (sensors_[i].id == sensors_[j].id) {
+                std::ostringstream os;
+                os << "duplicate sensor id " << static_cast<long>(sensors_[i].id)
+                   << " (sections [sensor." << i << "] and [sensor." << j << "])";
+                error_ = os.str();
+                return Status::InvalidConfig;
+            }
+        }
+    }
+
+    // (b) is_reference (per-sensor) vs reference_sensor_id (global) consistency. We treat
+    // reference_sensor_id as the source of truth: AT MOST ONE sensor may carry is_reference=true,
+    // and if one does its id must equal reference_sensor_id — otherwise the two disagree silently.
+    {
+        int  ref_flag_count = 0;
+        long flagged_id = -1;
+        for (const SensorConfig& sc : sensors_) {
+            if (sc.is_reference) { ++ref_flag_count; flagged_id = static_cast<long>(sc.id); }
+        }
+        if (ref_flag_count > 1) {
+            error_ = "more than one sensor flagged is_reference=true";
+            return Status::InvalidConfig;
+        }
+        if (ref_flag_count == 1 &&
+            static_cast<SourceId>(flagged_id) != cfg_.reference_sensor_id) {
+            std::ostringstream os;
+            os << "is_reference=true on sensor id " << flagged_id
+               << " disagrees with reference_sensor_id=" << static_cast<long>(cfg_.reference_sensor_id);
+            error_ = os.str();
+            return Status::InvalidConfig;
         }
     }
 

@@ -138,6 +138,60 @@ TEST_CASE("ConfigLoader bad input: unknown key / section / malformed value are r
     }
 }
 
+TEST_CASE("ConfigLoader: a duplicate sensor id across sections is rejected (InvalidConfig)") {
+    // Two distinct [sensor.N] storage slots that bind the SAME id -> silent mis-bind; reject it.
+    // (The core validate() does not catch this — its per-sensor checks are a TODO.)
+    ConfigLoader loader;
+    const Status st = loader.parse("[sensor.0]\nid = 0\nis_reference = true\n[sensor.1]\nid = 0\n");
+    CHECK(st == Status::InvalidConfig);
+    CHECK(loader.error().find("duplicate sensor id") != std::string::npos);
+}
+
+TEST_CASE("ConfigLoader: is_reference disagreeing with reference_sensor_id is rejected") {
+    {
+        // is_reference flagged on sensor id 1 but the global reference_sensor_id is 0 -> disagree.
+        ConfigLoader loader;
+        const Status st = loader.parse(
+            "[global]\nmax_sources = 2\nreference_sensor_id = 0\n"
+            "[sensor.0]\nid = 0\n"
+            "[sensor.1]\nid = 1\nis_reference = true\n");
+        CHECK(st == Status::InvalidConfig);
+        CHECK(loader.error().find("disagrees with reference_sensor_id") != std::string::npos);
+    }
+    {
+        // More than one sensor flagged is_reference -> rejected.
+        ConfigLoader loader;
+        const Status st = loader.parse(
+            "[sensor.0]\nid = 0\nis_reference = true\n"
+            "[sensor.1]\nid = 1\nis_reference = true\n");
+        CHECK(st == Status::InvalidConfig);
+        CHECK(loader.error().find("more than one sensor") != std::string::npos);
+    }
+    {
+        // Agreement: is_reference on the sensor whose id == reference_sensor_id -> Ok.
+        ConfigLoader loader;
+        const Status st = loader.parse(
+            "[global]\nmax_sources = 2\nreference_sensor_id = 1\n"
+            "[sensor.0]\nid = 0\n"
+            "[sensor.1]\nid = 1\nis_reference = true\n");
+        CHECK(st == Status::Ok);
+    }
+}
+
+TEST_CASE("ConfigLoader: an out-of-range int is reported distinctly from junk") {
+    {
+        ConfigLoader loader;   // a value far beyond `long` range -> distinct overflow message
+        CHECK(loader.parse("[global]\nmax_sources = 99999999999999999999999\n")
+              == Status::InvalidConfig);
+        CHECK(loader.error().find("out of range") != std::string::npos);
+    }
+    {
+        ConfigLoader loader;   // plain junk -> the generic "expected int"
+        CHECK(loader.parse("[global]\nmax_sources = abc\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("expected int") != std::string::npos);
+    }
+}
+
 TEST_CASE("ConfigLoader: a parse that succeeds but fails validate() surfaces the validate status") {
     // max_sources out of range (validate requires 1..32). Parsing is fine; validate rejects it.
     ConfigLoader loader;
