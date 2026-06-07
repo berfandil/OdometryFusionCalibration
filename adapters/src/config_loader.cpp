@@ -1,0 +1,309 @@
+// ofc_adapters/config_loader.cpp — see config_loader.hpp for the format + ownership contract.
+//
+// RELAXED EDGE: std::string / std::vector / heap / exceptions fine. No exception escapes a
+// public method (parse-time std::stod throws are caught -> InvalidConfig).
+#include "ofc_adapters/config_loader.hpp"
+
+#include "ofc/core/types.hpp"
+
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace ofc {
+namespace adapters {
+
+namespace {
+
+// --- small string helpers ----------------------------------------------------------------
+std::string trim(const std::string& s) {
+    std::size_t a = 0, b = s.size();
+    while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return s.substr(a, b - a);
+}
+
+std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+bool parse_bool(const std::string& v, bool& out) {
+    const std::string s = lower(trim(v));
+    if (s == "true" || s == "1" || s == "on" || s == "yes")  { out = true;  return true; }
+    if (s == "false" || s == "0" || s == "off" || s == "no") { out = false; return true; }
+    return false;
+}
+
+bool parse_double(const std::string& v, Scalar& out) {
+    try {
+        std::size_t used = 0;
+        const double d = std::stod(trim(v), &used);
+        if (used == 0) return false;
+        // reject trailing garbage after the number (e.g. "1.0abc")
+        const std::string rest = trim(trim(v).substr(used));
+        if (!rest.empty()) return false;
+        out = static_cast<Scalar>(d);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parse_int(const std::string& v, long& out) {
+    try {
+        std::size_t used = 0;
+        const long n = std::stol(trim(v), &used, 10);
+        if (used == 0) return false;
+        const std::string rest = trim(trim(v).substr(used));
+        if (!rest.empty()) return false;
+        out = n;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// 6 whitespace-separated numbers: yaw pitch roll x y z.
+bool parse_extrinsic(const std::string& v, SE3& out) {
+    std::istringstream is(v);
+    Scalar a[6];
+    for (int i = 0; i < 6; ++i) {
+        double d;
+        if (!(is >> d)) return false;
+        a[i] = static_cast<Scalar>(d);
+    }
+    double extra;
+    if (is >> extra) return false;   // too many numbers
+
+    const Scalar yaw = a[0], pitch = a[1], roll = a[2];
+    Mat3 Rz, Ry, Rx;
+    Rz << std::cos(yaw), -std::sin(yaw), 0,
+          std::sin(yaw),  std::cos(yaw), 0,
+          0, 0, 1;
+    Ry << std::cos(pitch), 0, std::sin(pitch),
+          0, 1, 0,
+          -std::sin(pitch), 0, std::cos(pitch);
+    Rx << 1, 0, 0,
+          0, std::cos(roll), -std::sin(roll),
+          0, std::sin(roll),  std::cos(roll);
+    out.R = Rz * Ry * Rx;
+    out.t = Vec3(a[3], a[4], a[5]);
+    return true;
+}
+
+const char* kKnobDoc =
+    "ofc config (key=value / INI). '#' or ';' comment. Sections: [global], [sensor.N].\n"
+    "[global]\n"
+    "  max_sources=<int>            reference_sensor_id=<int>\n"
+    "  window_s=<f>   fusion_delay_s=<f>   tick_rate_hz=<f>   calib_lag_s=<f>\n"
+    "  cold_start=reference_only|median_from_start\n"
+    "  commit_concentration=<f>     commit_min_votes=<int>   commit_drop=<f>\n"
+    "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
+    "  timesync_enabled=<bool>\n"
+    "[sensor.N]\n"
+    "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
+    "  prior_time_offset_s=<f>   weight_prior=<f>\n"
+    "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n";
+
+} // namespace
+
+const char* ConfigLoader::knob_doc() { return kKnobDoc; }
+
+Status ConfigLoader::parse(const std::string& text) {
+    cfg_ = Config{};
+    sensors_.clear();
+    error_.clear();
+
+    auto fail = [&](const std::string& msg, int line_no, const std::string& line) -> Status {
+        std::ostringstream os;
+        os << "line " << line_no << ": " << msg << "  [" << line << "]";
+        error_ = os.str();
+        return Status::InvalidConfig;
+    };
+
+    enum class Scope { Global, Sensor };
+    Scope scope = Scope::Global;
+    int   cur_sensor = -1;   // index into sensors_
+
+    std::istringstream in(text);
+    std::string raw;
+    int line_no = 0;
+    while (std::getline(in, raw)) {
+        ++line_no;
+        // strip comments
+        std::string line = raw;
+        const std::size_t hash = line.find_first_of("#;");
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        line = trim(line);
+        if (line.empty()) continue;
+
+        // section header
+        if (line.front() == '[') {
+            if (line.back() != ']') return fail("malformed section header", line_no, raw);
+            const std::string sec = lower(trim(line.substr(1, line.size() - 2)));
+            if (sec == "global" || sec.empty()) {
+                scope = Scope::Global;
+            } else if (sec.compare(0, 7, "sensor.") == 0) {
+                long idx;
+                if (!parse_int(sec.substr(7), idx) || idx < 0)
+                    return fail("bad sensor section index", line_no, raw);
+                // sensors are stored densely in first-seen order; the index must match the
+                // next slot (so [sensor.0] then [sensor.1] ...). Re-entering an existing slot
+                // is allowed (append more keys); skipping ahead is an error.
+                if (idx == static_cast<long>(sensors_.size())) {
+                    sensors_.push_back(SensorConfig{});
+                    cur_sensor = static_cast<int>(idx);
+                } else if (idx < static_cast<long>(sensors_.size())) {
+                    cur_sensor = static_cast<int>(idx);   // re-open
+                } else {
+                    return fail("sensor index skips a slot (expected sequential)", line_no, raw);
+                }
+                scope = Scope::Sensor;
+            } else {
+                return fail("unknown section", line_no, raw);
+            }
+            continue;
+        }
+
+        // key = value
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos) return fail("expected key = value", line_no, raw);
+        const std::string key = lower(trim(line.substr(0, eq)));
+        const std::string val = trim(line.substr(eq + 1));
+        if (key.empty()) return fail("empty key", line_no, raw);
+
+        if (scope == Scope::Global) {
+            long   iv;
+            Scalar dv;
+            bool   bv;
+            if (key == "max_sources") {
+                if (!parse_int(val, iv)) return fail("expected int", line_no, raw);
+                cfg_.max_sources = static_cast<int>(iv);
+            } else if (key == "reference_sensor_id") {
+                if (!parse_int(val, iv) || iv < 0) return fail("expected non-negative int", line_no, raw);
+                cfg_.reference_sensor_id = static_cast<SourceId>(iv);
+            } else if (key == "window_s") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.window_s = dv;
+            } else if (key == "fusion_delay_s") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.fusion_delay_s = dv;
+            } else if (key == "tick_rate_hz") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.tick_rate_hz = dv;
+            } else if (key == "calib_lag_s") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.calib_lag_s = dv;
+            } else if (key == "cold_start") {
+                const std::string lv = lower(val);
+                if (lv == "reference_only")       cfg_.cold_start = ColdStart::ReferenceOnly;
+                else if (lv == "median_from_start") cfg_.cold_start = ColdStart::MedianFromStart;
+                else return fail("cold_start: reference_only|median_from_start", line_no, raw);
+            } else if (key == "commit_concentration") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.commit_concentration = dv;
+            } else if (key == "commit_min_votes") {
+                if (!parse_int(val, iv)) return fail("expected int", line_no, raw);
+                cfg_.commit_min_votes = static_cast<int>(iv);
+            } else if (key == "commit_drop") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.commit_drop = dv;
+            } else if (key == "straight_omega_max") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.straight_omega_max = dv;
+            } else if (key == "straight_trans_min") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.straight_trans_min = dv;
+            } else if (key == "turn_omega_min") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.turn_omega_min = dv;
+            } else if (key == "timesync_enabled") {
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.timesync_enabled = bv;
+            } else {
+                return fail("unknown global key '" + key + "'", line_no, raw);
+            }
+        } else {  // Scope::Sensor
+            SensorConfig& sc = sensors_[static_cast<std::size_t>(cur_sensor)];
+            long   iv;
+            Scalar dv;
+            bool   bv;
+            if (key == "id") {
+                if (!parse_int(val, iv) || iv < 0) return fail("expected non-negative int", line_no, raw);
+                sc.id = static_cast<SourceId>(iv);
+            } else if (key == "prior_extrinsic") {
+                if (!parse_extrinsic(val, sc.prior_extrinsic))
+                    return fail("prior_extrinsic: yaw pitch roll x y z (6 numbers)", line_no, raw);
+            } else if (key == "prior_scale") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                sc.prior_scale = dv;
+            } else if (key == "prior_time_offset_s") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                sc.prior_time_offset_s = dv;
+            } else if (key == "weight_prior") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                sc.weight_prior = dv;
+            } else if (key == "per_sensor_kf") {
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                sc.per_sensor_kf = bv;
+            } else if (key == "scale_calib") {
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                sc.scale_calib = bv;
+            } else if (key == "is_reference") {
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                sc.is_reference = bv;
+            } else {
+                return fail("unknown sensor key '" + key + "'", line_no, raw);
+            }
+        }
+    }
+
+    // Point Config at the owned sensor storage (the ownership contract).
+    cfg_.sensors      = sensors_.empty() ? nullptr : sensors_.data();
+    cfg_.sensor_count = static_cast<int>(sensors_.size());
+
+    // Run the core validator — the adapter's job is to BUILD a struct the core accepts.
+    const Status vs = validate(cfg_);
+    if (!ok(vs)) {
+        std::ostringstream os;
+        os << "validate() rejected the parsed config (status " << static_cast<int>(vs) << ")";
+        error_ = os.str();
+        return vs;
+    }
+    return Status::Ok;
+}
+
+Status ConfigLoader::parse_file(const std::string& path) {
+    std::string text;
+    try {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { error_ = "could not open file: " + path; return Status::NoData; }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+    } catch (...) {
+        error_ = "IO error reading file: " + path;
+        return Status::CorruptData;
+    }
+    return parse(text);
+}
+
+Status load_config(const std::string& text, Config& out_cfg,
+                   std::vector<SensorConfig>& out_sensors, std::string* out_error) {
+    ConfigLoader loader;
+    const Status st = loader.parse(text);
+    out_sensors = loader.sensors();                 // copy the owned storage to the caller's
+    out_cfg = loader.config();
+    out_cfg.sensors = out_sensors.empty() ? nullptr : out_sensors.data();  // re-point at caller's
+    out_cfg.sensor_count = static_cast<int>(out_sensors.size());
+    if (out_error != nullptr) *out_error = loader.error();
+    return st;
+}
+
+} // namespace adapters
+} // namespace ofc

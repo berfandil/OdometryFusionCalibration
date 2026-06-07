@@ -37,7 +37,11 @@ function Invoke-Dev([string]$inner) {
 }
 
 function Invoke-Configure {
-    Invoke-Dev "`"$cmake`" -G Ninja -S `"$root`" -B `"$build`" -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=Release"
+    # OFC_BUILD_ADAPTERS=ON (Slice 13): build the relaxed-edge adapters + their doctest
+    # target so the gate covers them alongside the core 'unit' test. NOTE: configure is
+    # CACHED below (only re-run when build.ninja is absent), so after changing this flag
+    # you must run -Task clean first, then -Task test, for it to take effect.
+    Invoke-Dev "`"$cmake`" -G Ninja -S `"$root`" -B `"$build`" -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=Release -DOFC_BUILD_ADAPTERS=ON"
 }
 
 switch ($Task) {
