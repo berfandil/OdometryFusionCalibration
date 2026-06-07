@@ -125,7 +125,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - Replace the persistence adapter's `flush`/`close` with a real `fsync(fd)` (platform layer) to close the power-loss durability window.
 **Deps**: Slice 13.
 
-## Slice 14 — Validation harness  `[~]` (sim rig + observability self-tests + NEES consistency + golden DONE; NIS pending Slice-11 corrections; CONFIG placeholder sweep remains)
+## Slice 14 — Validation harness  `[~]` (sim rig + observability self-tests + NEES + NIS + golden DONE; init-P covariance fix DONE; CONFIG placeholder sweep + a distance-aware covariance model for strict no-ref NEES consistency remain)
 **Goal**: the trust apparatus (D24).
 - Sim rig (parameterized GT trajectory + sources), observability self-tests (per regime), NEES/NIS Monte-Carlo, recorded-data golden regression.
 **Done when**: CI runs unit + observability + consistency + golden; tuned defaults replace the "tuned" placeholders in `CONFIG.md`.
