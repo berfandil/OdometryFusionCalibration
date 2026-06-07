@@ -103,10 +103,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: with `bias_states` on, a raw-IMU source's bias is observed and removed in sim.
 **Deps**: Slice 11. **Note**: gate single-scalar `mahalanobis_chi2` should become a per-DOF chi² quantile when a 6-DOF/mixed plugin lands.
 
-## Slice 12 — Persistence (warm restart)  `[ ]`
+## Slice 12 — Persistence (warm restart)  `[x]`
 **Goal**: serialize/deserialize calibration state; survive crashes.
-- Core `serialize/deserialize` into fixed buffers; file double-buffer + version + checksum in adapter; config-hash guard.
-**Done when**: restart resumes near-NOMINAL; crash mid-write keeps last good state; config change invalidates.
+- Core `serialize/deserialize` into fixed buffers (`persistence.hpp` format primitives: "OFCP" v1, explicit-LE/padding-free, FNV-1a-64 config-hash + FNV-1a-32 checksum + orthonormality guard); config-hash guard rejects a changed rig; new Status `CorruptData`/`VersionMismatch`.
+- **Re-anchor-and-refill restore** (committed values + flags + reliability + lifecycle restored, calibrators re-anchored to the restored priors; histogram BINS not persisted — they re-fill, held committed by the hysteresis guard). File double-buffer ping-pong is relaxed-edge (test-side here; production adapter is Slice 13).
+**Done when**: restart resumes near-NOMINAL (warm ~0.001 m vs cold ~0.256 m); crash mid-write keeps last good state; config change invalidates. ✓
 **Deps**: Slice 8.
 
 ## Slice 13 — Adapters  `[ ]`
