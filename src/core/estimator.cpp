@@ -1259,27 +1259,23 @@ Status Estimator::step(Timestamp now) {
     // INIT-P SEED (Slice-14 covariance-pessimism fix). The OLD seed P = I_12 was grossly
     // PESSIMISTIC (~46x): a 1.0 m^2/rad^2 pose block is ~100x the steady-state squared
     // error, and a predict-only stretch has no correction to shrink it (NEES collapsed to
-    // ~0.13 vs DOF 6). The PHYSICALLY-MOTIVATED seed is the uncertainty of exactly ONE
-    // integrated window — which is precisely what the state IS at the first fuse:
-    //   * POSE block: the gauge-anchored pose at identity is the reference frame, so its
-    //     error is ~0 by definition PLUS the uncertainty of the one window already
-    //     integrated into it = q_pose (the same per-window pose-increment process noise the
-    //     predict() adds). No magic floor: the first fuse's own q_pose.
-    //   * TWIST block: the twist is read as log(delta)/dt, so its covariance is the
-    //     pose-increment covariance mapped through 1/dt^2 = q_pose / dt^2 — the SAME mapping
-    //     predict() uses for the twist block (eskf.cpp Qmap). dt and q_pose are both in hand
-    //     at this first fuse.
-    // i.e. P_init = blkdiag(q_pose, q_pose/dt^2) == exactly the Q one predict() step adds
-    // from P=0: the filter starts as if it has integrated its first window (which it has),
-    // not as if it knows nothing (I_12). Symmetric PSD by construction (q_pose is PSD; the
-    // 1/dt^2 scaling preserves PSD; eskf::init symmetrizes). Derived entirely from existing
-    // knobs (q_floor/q_scale via q_pose + the first-window dt) — no new config knob.
+    // ~0.13 vs DOF 6). The PHYSICALLY-MOTIVATED state at the first fuse is the uncertainty of
+    // exactly ONE integrated window = blkdiag(q_pose, q_pose/dt^2). We do NOT seed that
+    // directly: instead we start from P = 0 and let the SAME first predict() ESTABLISH it.
+    //   * The gauge-anchored pose (identity) is the REFERENCE frame: its error is ~0 by
+    //     definition, so P = 0 is the correct pre-integration covariance.
+    //   * The first predict() then computes P <- F * 0 * F^T + Q = Q = blkdiag(q_pose,
+    //     q_pose/dt^2) — EXACTLY the one-window process noise (eskf.cpp Qmap: pose = q_pose,
+    //     twist = q_pose/dt^2 via the same log(delta)/dt readout mapping). So after the first
+    //     fuse the published frontier.cov is precisely ONE window's process noise.
+    // This is cleaner than (and supersedes) the old "seed blkdiag(q_pose, q_pose/dt^2) then
+    // predict" path: that DOUBLE-COUNTED the first window (init's seed + predict's Q ~= 2x
+    // q_pose in the pose block). Seeding P = 0 removes the double-count AND the separate seed
+    // computation — the first predict is the single source of the one-window covariance.
+    // Symmetric PSD by construction (0 is PSD; predict adds Q which is PSD; eskf::init/predict
+    // symmetrize). No new config knob (q_pose derives from the existing q_floor/q_scale).
     if (!s.eskf_started) {
-        const Scalar dt_eff   = (dt > Scalar(0)) ? dt : Scalar(1e-9);
-        Mat12 P_init          = Mat12::Zero();
-        P_init.block<6, 6>(0, 0) = q_pose;                          // gauge-anchored pose: one window
-        P_init.block<6, 6>(6, 6) = q_pose / (dt_eff * dt_eff);      // twist = log(delta)/dt readout
-        s.eskf.init(SE3{}, P_init);
+        s.eskf.init(SE3{}, Mat12::Zero());
         s.eskf_started = true;
     }
     s.eskf.predict(med.value, dt, q_pose);
