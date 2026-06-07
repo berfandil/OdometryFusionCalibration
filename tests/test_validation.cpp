@@ -33,11 +33,12 @@
 //   identity T_est o exp(e) == T_gt; that the COVARIANCE lives in this SAME tangent holds by
 //   eskf.cpp's full-SE(3)-Ad propagation (true by inspection of eskf.cpp, not asserted in
 //   this test). We pin the convention this way rather than by an "ensemble-mean NEES ~ DOF"
-//   band: because this filter's
-//   covariance is grossly pessimistic (init P = I_12, ~100x the actual error), EVERY
-//   sub-block's NEES is ~0.01..0.1 regardless of convention, so a NEES magnitude cannot
-//   distinguish right from wrong here. For a CORRECTLY-CALIBRATED linear-Gaussian filter the
-//   ensemble-mean NEES would sit near the DOF count (6); this one sits at ~0.13 (pessimistic).
+//   band: because this filter's covariance is still mildly pessimistic (after the init-P fix
+//   it is ~17x, was ~46x under the old I_12 seed), EVERY sub-block's NEES is well below its
+//   DOF regardless of convention, so a NEES magnitude cannot distinguish right from wrong
+//   here. For a CORRECTLY-CALIBRATED linear-Gaussian filter the ensemble-mean NEES would sit
+//   near the DOF count (6); this one sits at ~0.35 after the init-P fix (was ~0.13 with the
+//   old P = I_12 seed) — see the Monte-Carlo case below for the full diagnosis.
 //
 // MONTE-CARLO: the SAME scenario is run across an ensemble of M independent seeds (each
 // SyntheticSource's `seed` varies per run) with genuine injected noise so the covariance
@@ -179,8 +180,9 @@ TEST_CASE("validation NEES: e is se3::log's right-error tangent (right-not-left,
     // (F = Ad(delta^-1)); that link is true by inspection of eskf.cpp and is NOT asserted here.
     // We pin the convention this way, not by an O(DOF) NEES band. We
     // originally tried "rotation sub-NEES ~ DOF=3" as the convention probe, but the filter's
-    // covariance is so PESSIMISTIC (init P = I_12, ~100x the actual error — see the next
-    // case) that EVERY sub-block's NEES is ~0.01..0.1 regardless of convention. So a NEES
+    // covariance is still mildly PESSIMISTIC (after the init-P fix the ensemble-mean pose NEES
+    // is ~0.35 vs DOF 6 — see the next case for the predict-only Ad-inflation diagnosis) so
+    // every sub-block's NEES is well below its DOF regardless of convention. So a NEES
     // magnitude cannot distinguish a right convention from a wrong one here. Instead we pin
     // the convention by the two properties that actually define it:
     //
@@ -283,7 +285,7 @@ TEST_CASE("validation NEES: e is se3::log's right-error tangent (right-not-left,
 }
 
 TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square interval, 6 "
-          "DOF) — documents a PESSIMISTIC covariance") {
+          "DOF) — residual PESSIMISM is predict-only Ad-inflation, not init-P") {
     // The non-vacuous consistency test. Ensemble-mean pose NEES over N steady-state samples
     // is compared to a chi-square consistency interval for 6 DOF. For N averaged samples the
     // sum N*nees ~ chi2(N*6) under the consistency hypothesis, so the bound on the MEAN is
@@ -296,28 +298,39 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     // but they are autocorrelated within each run (consecutive fused frontiers share overlapping
     // windows + the same slowly-evolving P), so the effective sample count is smaller and the
     // TRUE interval is WIDER than the printed one. This only ever WIDENS the band, never narrows
-    // it, and the ~46x gap survives either way: even a 100x reduction in effective N widens the
-    // interval only to ~[5.4, 6.6], still ~40x above the observed ~0.13.
+    // it, and the gap survives either way: even a 100x reduction in effective N widens the
+    // interval only to ~[5.4, 6.6], still ~16x above the observed ~0.35.
     //
-    // EMPIRICAL OUTCOME (the honesty clause, DESIGN §10): this filter is NOT consistent. The
-    // ensemble-mean pose NEES is ~0.13, far BELOW the ~6 the chi-square interval demands —
-    // the published covariance is GROSSLY PESSIMISTIC (too large) relative to the actual
-    // fused-vs-GT error. Root cause (diagnosed, see report):
-    //   (1) The ESKF initializes P = I_12 (eskf.cpp / estimator.cpp:910), so the pose block
-    //       starts at 1.0 rad^2 / 1.0 m^2 — already ~100x the steady-state squared error
-    //       (|e| ~ 0.09, e^T e ~ 0.009). A predict-only filter has NO correction to shrink
-    //       P, so it can only grow from there.
-    //   (2) The right-error Ad(delta^-1) propagation INFLATES the translation block with
-    //       distance travelled (P_tt grows to O(3..20) m^2 over the run), compounding (1).
-    // This CANNOT be fixed by tuning the test's Q knobs (q_scale/q_floor only ADD to P,
-    // making it MORE pessimistic) — it needs a SMALLER initial P and/or a correction step,
-    // both of which are STRICT-CORE changes out of scope for this validation slice. So per
-    // the brief's honesty clause we: (a) compute + report the actual NEES and the chi-square
-    // bound it violates, and (b) assert a DOCUMENTED ACHIEVABLE band on the value the filter
-    // actually produces, making this a non-vacuous regression guard (a 3x change in either P
-    // or the tracking error breaks it) while explicitly recording the mis-calibration.
-    // Surfaced to the orchestrator as an open question (covariance calibration → likely a
-    // core init-P fix and feeds the CONFIG Q sweep).
+    // EMPIRICAL OUTCOME (the honesty clause, DESIGN §10). HISTORY: the filter used to seed
+    // P = I_12, which is ~100x the steady-state squared error; with a predict-only path that
+    // never shrinks P, the ensemble-mean NEES collapsed to ~0.13 (the original ~46x-pessimistic
+    // Slice-14 finding). The INIT-P FIX (estimator.cpp first-fuse: seed P = blkdiag(q_pose,
+    // q_pose/dt^2) — the uncertainty of the ONE window already integrated into the gauge-anchored
+    // pose, instead of I_12) raised the ensemble-mean NEES to ~0.35 — a ~2.7x improvement (the
+    // pessimism shrank from ~46x to ~17x). The filter is STILL NOT strictly chi-square-consistent
+    // (0.35 << 6), and that residual pessimism is NO LONGER the init-P magnitude — it is a
+    // STRUCTURAL property of the predict-only path that the seed cannot touch:
+    //   * The right-error Ad(delta^-1) propagation transports the rotation uncertainty into the
+    //     TRANSLATION block via the [t]x R coupling as |t| grows: the P translation diagonal
+    //     climbs from ~0.008 m^2 early to ~2.5..5 m^2 by ~6 s of travel, while the actual
+    //     squared error grows far more slowly. The ROTATION block, which has no such distance
+    //     coupling, stays an order of magnitude tighter (~0.14 rad^2) and is much better
+    //     calibrated — confirming the residual gap is the translation Ad-inflation, not a
+    //     uniform over-sizing the seed could fix.
+    //   * A predict-only filter has NO correction step to pull P back down between windows, so
+    //     once translation P inflates with distance it stays inflated. (Slice 11's absolute-ref
+    //     correction DOES shrink P when a ref is present — see the NIS case below, NIS ~2.4 vs
+    //     DOF 3, near-consistent.)
+    // Tuning the test's Q knobs cannot help (q_scale/q_floor only ADD to P). A bias-free fully
+    // consistent predict-only Sigma would need a distance-aware covariance model (or denser
+    // corrections), out of scope here. So per the brief's honesty clause we: (a) compute +
+    // report the actual NEES and the chi-square bound it still violates, and (b) assert a
+    // DOCUMENTED ACHIEVABLE band TIGHT around the post-fix value, making this a non-vacuous
+    // regression guard (a ~1.5x change in either P or the tracking error breaks it, AND a
+    // regression back to the old I_12 seed — which would drop the mean to ~0.13 — re-trips it).
+    // Surfaced to the orchestrator: the init-P pessimism is RESOLVED; the residual is the
+    // predict-only translation Ad-inflation (a distance-aware covariance model / correction is
+    // the remaining path to strict consistency).
     Trajectory tr = nees_traj();
     const int M = 30;
 
@@ -393,22 +406,26 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     MESSAGE("NEES consistency: ensemble-mean=" << mean_nees << " DOF=6 N=" << N
             << " chi2 99% interval on mean=[" << lo_mean << ", " << hi_mean << "]"
             << "  truly_consistent=" << verdict
-            << "  (mean << 6 => PESSIMISTIC / over-conservative covariance)");
+            << "  (mean < 6 => still mildly PESSIMISTIC: predict-only translation Ad-inflation; "
+               "init-P pessimism RESOLVED, was ~0.13 with the old I_12 seed)");
 
-    // TRUE-CONSISTENCY verdict, recorded as a (currently-failing-by-design) expectation so
-    // the day the core gains a calibrated init-P / correction step this flips to PASS and the
-    // ACHIEVABLE band below should be tightened toward the chi-square interval. We assert the
-    // verdict is FALSE here to PIN the documented inconsistency (a silent flip to consistent —
-    // e.g. someone fixes init-P — should prompt revisiting this test's bounds).
-    CHECK_FALSE(truly_consistent);     // documents: filter is NOT chi-square-consistent today
+    // TRUE-CONSISTENCY verdict. The init-P fix MATERIALLY improved this (NEES ~0.13 -> ~0.35),
+    // but the predict-only path's distance-driven translation Ad-inflation keeps the filter from
+    // strict chi-square consistency, so the verdict is still FALSE — for a DIFFERENT, documented
+    // reason than before (no longer the I_12 init). We pin FALSE so that the day the core gains a
+    // distance-aware covariance model and/or a no-ref correction this flips to PASS and the
+    // ACHIEVABLE band below should be tightened toward the chi-square interval.
+    CHECK_FALSE(truly_consistent);     // NOT yet chi-square-consistent (residual = Ad-inflation)
 
-    // DOCUMENTED ACHIEVABLE BOUND (non-vacuous regression guard on the value the filter
-    // ACTUALLY produces). Observed ensemble-mean ~0.13..0.16 across seed bases; the band
-    // [0.04, 0.40] absorbs Monte-Carlo seed variation yet a ~3x drift in EITHER the published
-    // covariance OR the fused-vs-GT tracking error breaks it. This is NOT the consistency
-    // interval — it pins the (pessimistic) covariance the filter emits today.
-    CHECK(mean_nees > 0.04);
-    CHECK(mean_nees < 0.40);
+    // DOCUMENTED ACHIEVABLE BOUND (non-vacuous regression guard on the value the filter ACTUALLY
+    // produces AFTER the init-P fix). Observed ensemble-mean ~0.35 (was ~0.13 under the old I_12
+    // seed). The band [0.22, 0.50] brackets the post-fix value with ~1.5x headroom each side: it
+    // absorbs Monte-Carlo seed variation, yet a ~1.5x drift in EITHER the published covariance OR
+    // the fused-vs-GT tracking error breaks it — AND, critically, a REGRESSION back to the old
+    // I_12 seed (which collapses the mean to ~0.13) trips the lower bound. This is NOT the
+    // consistency interval — it pins the (mildly pessimistic) covariance the filter emits today.
+    CHECK(mean_nees > 0.22);     // NOT regressed to the old I_12 seed (~0.13) or pessimistic
+    CHECK(mean_nees < 0.50);     // NOT overconfident (consistency would be ~6)
 }
 
 // ===========================================================================
@@ -423,10 +440,11 @@ TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolu
     // n=3), so the ensemble mean over many accepted fixes ~ 3.
     //
     // The correction step SHRINKS P toward the measurement (the Slice-14 covariance-
-    // pessimism finding's fix WHEN a ref is present): repeated fixes pull the pessimistic
-    // init P=I_12 down toward a steady state set by the measurement noise, so unlike the
-    // predict-only NEES (~0.13, grossly pessimistic) the NIS on the CORRECTED path is in a
-    // sane range. We use priors == planted (no calibration transient) + a clean position
+    // pessimism finding's fix WHEN a ref is present): repeated fixes pull P down toward a
+    // steady state set by the measurement noise, so unlike the predict-only NEES (~0.35 after
+    // the init-P fix, still mildly pessimistic from the distance-driven translation Ad-inflation)
+    // the NIS on the CORRECTED path is in a sane range. We use priors == planted (no
+    // calibration transient) + a clean position
     // ref whose sim sigma_pos EQUALS the R the measurement reports, so the filter's noise
     // model matches the actual draw — the only honest way to expect NIS ~ DOF.
     //
@@ -520,20 +538,23 @@ TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolu
 
     // EMPIRICAL OUTCOME: ensemble-mean NIS ~ 2.4 for DOF=3 — MILDLY conservative (just
     // below the tight chi2 interval ~[2.91, 3.09]), a NIGHT-AND-DAY contrast with the
-    // predict-only NEES (~0.13, ~46x pessimistic). The correction step pulls the pessimistic
-    // init P=I_12 down toward the measurement noise, so the innovation is normalized by a
-    // covariance close to the true error. The residual ~20% shortfall is P re-inflating
-    // between fixes (predict adds Q + the Ad propagation before the next fix), biasing
-    // S = HPH^T + R slightly HIGH. So the filter is NOT strictly chi-square-consistent yet,
-    // but is now in a SANE O(DOF) range (vs the ~46x predict-only gap) — reported as a
-    // partial close of the Slice-14 covariance finding (full consistency would need a
-    // smaller init P and/or denser fixes; surfaced to the orchestrator).
+    // predict-only NEES (~0.35 after the init-P fix, still ~17x pessimistic from the
+    // distance-driven translation Ad-inflation). The correction step pulls P down toward the
+    // measurement noise, so the innovation is normalized by a covariance close to the true
+    // error. The residual ~20% shortfall is P re-inflating between fixes (predict adds Q + the
+    // Ad propagation before the next fix), biasing S = HPH^T + R slightly HIGH. So the filter
+    // is NOT strictly chi-square-consistent yet, but is now in a SANE O(DOF) range (vs the
+    // ~17x predict-only gap) — reported as a partial close of the Slice-14 covariance finding
+    // (full consistency would need a distance-aware covariance model and/or denser fixes;
+    // surfaced to the orchestrator). The init-P fix shrank the predict-only seed but the
+    // CORRECTED-path NIS is set by the measurement noise + the between-fix re-inflation, so it
+    // is largely insensitive to the seed (the correction dominates P within a few fixes).
     //
     // ACHIEVABLE BAND (non-vacuous regression guard on the value the filter ACTUALLY
     // produces). Pins the observed ~2.4 while absorbing Monte-Carlo seed variation; a ~1.5x
     // drift in EITHER the published covariance OR the tracking error breaks it. Stays well
     // clear of both the pessimistic (<<1) and overconfident (>>DOF) failure modes.
-    CHECK(mean_nis > 1.5);     // NOT collapsed like the predict-only NEES (~0.13)
+    CHECK(mean_nis > 1.5);     // NOT collapsed like the predict-only NEES (~0.35)
     CHECK(mean_nis < 3.5);     // NOT overconfident (would blow past DOF)
 }
 
