@@ -37,7 +37,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | `min_sources_warn` | int | 3 | [1, ∞) | Lifecycle NOMINAL threshold (Slice 3): a fused step with `n >= min_sources_warn` participating sources is NOMINAL, else DEGRADED; below 3 outlier rejection also degrades. `validate()` enforces only `>= 1`; a value above `max_sources` is legitimate (NOMINAL is then never reached). |
 | `adaptive_q` | bool | true | — | Derive process noise Q from the inter-source spread. |
 | `q_scale` | double | 1.0 | (0, ∞) | Multiplier on the spread-derived Q. |
-| `q_floor` | double[6] | small | ≥0 | Per-axis minimum process noise. |
+| `q_floor` | double[6] | small | ≥0 | Per-axis minimum process noise. **GPS/absolute-ref coupling (Slice 11b)**: `q_floor` is the floor `q_pose` collapses to when the inter-source spread is ~0 (e.g. two near-identical sources, or a single source). If it is too small the predict-only `P` never re-inflates between absolute fixes, so the Kalman gain on a GPS/absolute correction → ~0 and fixes barely pull the estimate. If absolute fixes seem ignored, raise the translation `q_floor` (the GPS adapter end-to-end test uses `1e-3`). Right value is a Slice-14-sweep item. |
 
 ## 4. Source weights (`WeightConfig`)
 
