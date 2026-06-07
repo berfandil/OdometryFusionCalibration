@@ -57,6 +57,15 @@ namespace {
 constexpr Scalar kNanosPerSec = Scalar(1e9);
 constexpr int    kMaxSourcesCap = 32;   // matches Result::calib/health array sizes
 
+// Variance-EMA reliability (Slice 9, D17). A source's residual-to-consensus EMA mean +
+// variance accrue per fused step; once it has at least kRelWarmup samples the reliability
+// multiplier is recomputed from the ratio of a robust baseline variance (the MEDIAN of the
+// warmed-up participants' variances) to its own variance. Before warmup — and whenever
+// fewer than 2 participants have warmed up — the reliability holds at 1.0 (Slice-2 weights
+// unchanged), so a short run never perturbs fusion.
+constexpr int    kRelWarmup = 20;       // min residual samples before reliability applies
+constexpr Scalar kRelVarEps = Scalar(1e-12);   // guards the ref_var / resid_var ratio
+
 Timestamp secs_to_ns(Scalar s) {
     return static_cast<Timestamp>(std::llround(s * kNanosPerSec));
 }
@@ -194,6 +203,29 @@ struct Estimator::Impl {
     // the median, so the median index no longer matches the covered order). Used by the
     // per-source residual diagnostics to attribute the consensus distance correctly.
     int    med_slot[kMaxSourcesCap];
+
+    // Variance-EMA reliability state (Slice 9, D17). Per registered-source slot, accrued
+    // each fused step from that source's residual-to-consensus d (the split_distance used
+    // by the residual diagnostics). The D17 BIAS/VARIANCE SPLIT:
+    //   * resid_mean = EMA mean of d  -> the SYSTEMATIC component (a biased source's
+    //                  residual is large but CONSISTENT, so it lands here, NOT in the
+    //                  variance). Surfaced as SourceHealth::bias; routed to the calibrator,
+    //                  never folded into the weight.
+    //   * resid_var  = EMA variance of d AROUND its running mean -> the zero-mean SCATTER.
+    //                  A genuinely NOISY source has large scatter; a biased-but-low-noise
+    //                  source has SMALL scatter (its bias is in resid_mean) -> NOT
+    //                  penalized. reliability = clamp(ref_var / max(resid_var, eps), floor,
+    //                  cap) downweights only true scatter.
+    //   * resid_n    = sample count (for the kRelWarmup gate).
+    //   * reliability= the applied multiplier (init 1.0; held at 1.0 pre-warmup / for
+    //                  non-participants). Reset in init().
+    Scalar resid_mean[kMaxSourcesCap];
+    Scalar resid_var[kMaxSourcesCap];
+    int    resid_n[kMaxSourcesCap];
+    Scalar reliability[kMaxSourcesCap];
+    // Fixed stack scratch for the robust baseline (median of warmed-up variances). Sized at
+    // the cap so the per-step median selection is heap-free + bounded (strict core).
+    Scalar rel_scratch[kMaxSourcesCap];
 
     // Lifecycle state (Slice 3, D23). Persisted across steps; the phase is
     // RECOMPUTED every step from the current fuse signals, so an upgrade
@@ -458,6 +490,12 @@ Status Estimator::init(const Config& cfg) {
         impl_->lever_committed[i]   = false;
         impl_->scale_committed[i]   = false;
         impl_->med_slot[i]          = -1;
+        // Variance-EMA reliability reset (Slice 9, D17): clean EMA state + neutral
+        // multiplier so the first kRelWarmup steps weight exactly as Slice 2.
+        impl_->resid_mean[i]        = Scalar(0);
+        impl_->resid_var[i]         = Scalar(0);
+        impl_->resid_n[i]           = 0;
+        impl_->reliability[i]       = Scalar(1);
     }
 
     // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
@@ -611,12 +649,17 @@ Status Estimator::step(Timestamp now) {
         const Timestamp off = secs_to_ns(s.effective_offset(i));
         const Expected<Delta> q = src->query(q0 - off, t1 - off);
 
-        // Diagnostics (best-effort; coverage flag set regardless of fuse outcome).
+        // Diagnostics (best-effort; coverage flag set regardless of fuse outcome). Reset
+        // the per-step fields to neutral so a covered-but-non-participating source (cold
+        // start) reads sensible defaults rather than a stale prior-step value; the EMA
+        // reliability/bias are re-published below for the participating slots only.
         SourceHealth& h = s.result.health[i];
-        h.id        = src->id();
-        h.in_window = q.ok();
-        h.weight    = Scalar(0);
-        h.residual  = Scalar(0);
+        h.id          = src->id();
+        h.in_window   = q.ok();
+        h.weight      = Scalar(0);
+        h.residual    = Scalar(0);
+        h.reliability = Scalar(1);
+        h.bias        = Scalar(0);
 
         if (!q.ok()) continue;
 
@@ -633,9 +676,14 @@ Status Estimator::step(Timestamp now) {
         const SE3& X = s.prior_extrinsic[i];
         const SE3 A  = se3::compose(se3::compose(X, B_corr), se3::inverse(X));
 
-        // Weight = prior x Sigma-confidence, clamped to [floor, cap].
+        // Weight = prior x reliability x Sigma-confidence, clamped to [floor, cap]
+        // (DESIGN §4, D17). CAUSAL ORDERING: reliability[i] is the value accumulated from
+        // PRIOR steps (init 1.0) — this step's residual updates it only AFTER the median is
+        // solved (below), so the weight never uses this step's own residual to weight this
+        // step's median (that would be circular). The Σ-confidence keeps the Slice-2
+        // unit-mixing placeholder; reliability is the NEW quality factor (see sigma_confidence).
         const Scalar sigma_conf = sigma_confidence(d.cov);
-        Scalar w = s.weight_prior[i] * sigma_conf;
+        Scalar w = s.weight_prior[i] * s.reliability[i] * sigma_conf;
         w = std::max(cfg.weight_floor, std::min(cfg.weight_cap, w));
 
         // Capture the de-scaled reported sensor-frame delta for the calibrators
@@ -681,9 +729,75 @@ Status Estimator::step(Timestamp now) {
     // Per-source residual to the consensus (diagnostics). Indexed by the median set via
     // med_slot (cold-start may exclude covered-but-non-participating sources from the
     // median); a covered source not in the median keeps its residual at 0.
+    //
+    // VARIANCE-EMA RELIABILITY (Slice 9, D17). Each fused step, attribute the consensus
+    // distance d to the participating slot and accrue an EMA mean (bias) + EMA variance
+    // (zero-mean scatter) of d. Then recompute the reliability multiplier from a robust
+    // baseline (the median of the warmed-up participants' variances). The update is
+    // strictly AFTER the median + weights are formed (causal — this step's residual never
+    // weights this step's median). Bounded by n (<= max_sources); no heap.
+    const Scalar alpha = cfg.reliability_ema_alpha;
     for (int k = 0; k < n; ++k) {
-        SourceHealth& h = s.result.health[s.med_slot[k]];
-        h.residual = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
+        const int i = s.med_slot[k];
+        SourceHealth& h = s.result.health[i];
+        const Scalar d = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
+        h.residual = d;
+
+        // West's incremental EMA mean/variance of the per-source residual. resid_mean is
+        // the BIAS (systematic, routed to the calibrator); resid_var is the zero-mean
+        // SCATTER around the running mean — a biased-but-consistent source has a large mean
+        // but a SMALL variance, so it is NOT penalized (the D17 split).
+        if (s.resid_n[i] == 0) {
+            s.resid_mean[i] = d;
+            s.resid_var[i]  = Scalar(0);
+        } else {
+            const Scalar delta = d - s.resid_mean[i];
+            s.resid_mean[i] += alpha * delta;
+            s.resid_var[i]  += alpha * (delta * delta - s.resid_var[i]);
+        }
+        ++s.resid_n[i];
+    }
+
+    // Robust baseline ref_var = the MEDIAN of resid_var[j] over THIS step's median
+    // participants that have warmed up (resid_n >= kRelWarmup). Copy the qualifying values
+    // into the fixed stack scratch and median-select in place (bounded, heap-free). If
+    // fewer than 2 qualify, SKIP the recompute (hold prior reliability) — warmup / low-data
+    // never thrashes the weights.
+    int q = 0;
+    for (int k = 0; k < n; ++k) {
+        const int i = s.med_slot[k];
+        if (s.resid_n[i] >= kRelWarmup) s.rel_scratch[q++] = s.resid_var[i];
+    }
+    if (q >= 2) {
+        // Median of the q values (q <= max_sources <= kMaxSourcesCap). std::nth_element on
+        // a fixed stack array is heap-free; for even q take the lower-middle (deterministic,
+        // a reference variance only needs to be representative, not the exact midpoint).
+        const int mid = q / 2;
+        std::nth_element(s.rel_scratch, s.rel_scratch + mid, s.rel_scratch + q);
+        // Floor BOTH the baseline and each source's variance by the same kRelVarEps so the
+        // ratio is well-conditioned. Critically this makes the DEGENERATE near-zero case
+        // (a noiseless oracle with correct priors -> all resid_var ~ machine-zero) read
+        // ratio ~ eps/eps = 1 (reliability ~ 1) instead of 0/0 noise that would collapse
+        // every clean source to the floor. Equal-noise sources -> equal resid_var ->
+        // ratio ~ 1; a NOISIER source -> larger resid_var -> ratio < 1 (reliability floored);
+        // a BIASED-but-low-noise source -> small resid_var (its bias is in resid_mean, NOT
+        // here) -> ratio ~ 1 (NOT collapsed) — the D17 split.
+        const Scalar ref_var = std::max(s.rel_scratch[mid], kRelVarEps);
+        for (int k = 0; k < n; ++k) {
+            const int i = s.med_slot[k];
+            if (s.resid_n[i] < kRelWarmup) continue;   // pre-warmup keeps reliability 1.0
+            const Scalar ratio = ref_var / std::max(s.resid_var[i], kRelVarEps);
+            s.reliability[i] = std::max(cfg.reliability_floor,
+                                        std::min(cfg.reliability_cap, ratio));
+        }
+    }
+    // Surface the reliability + bias diagnostics for every participating slot (non-
+    // participants keep the neutral 1.0 / 0.0 the result struct defaults to).
+    for (int k = 0; k < n; ++k) {
+        const int i = s.med_slot[k];
+        SourceHealth& h = s.result.health[i];
+        h.reliability = s.reliability[i];
+        h.bias        = s.resid_mean[i];
     }
 
     // ---- Phase-1 calibration stage (Slice 6, D5/D11/D20) -------------------------
@@ -873,6 +987,11 @@ Status validate(const Config& cfg) {
         return Status::OutOfRange;                       // floor in (0, 1)
     if (cfg.weight_cap < 1.0)
         return Status::OutOfRange;                       // cap >= 1
+    // Variance-EMA reliability clamp (Slice 9, D17): floor in (0, 1]; cap >= 1.
+    if (cfg.reliability_floor <= 0.0 || cfg.reliability_floor > 1.0)
+        return Status::OutOfRange;                       // reliability floor in (0, 1]
+    if (cfg.reliability_cap < 1.0)
+        return Status::OutOfRange;                       // reliability cap >= 1
     if (cfg.tip_cov_inflation < 1.0)
         return Status::OutOfRange;                       // inflation >= 1
     if (cfg.q_scale <= 0.0)

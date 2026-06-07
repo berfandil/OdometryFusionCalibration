@@ -18,6 +18,7 @@ add_executable(ofc_tests
     test_calib_phase1.cpp
     test_calib_phase2.cpp
     test_calib_feedback.cpp
+    test_weights.cpp
     test_sim.cpp
 )
 target_link_libraries(ofc_tests PRIVATE ofc_core ofc_sim doctest::doctest)

@@ -76,6 +76,13 @@ struct Config {
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;
+    // Variance-EMA reliability clamp (Slice 9, D17). The reliability multiplier is
+    // ref_var / max(resid_var, eps) clamped to [reliability_floor, reliability_cap]:
+    //   * reliability_floor in (0, 1] — a NOISY source can never collapse to 0 (always
+    //     recoverable); a multiplier of 1 disables down-weighting.
+    //   * reliability_cap   in [1, ∞) — a quiet source never DOMINATES the median.
+    Scalar      reliability_floor = 0.2;   // min reliability multiplier (0, 1]
+    Scalar      reliability_cap   = 5.0;   // max reliability multiplier [1, ∞)
     Scalar      weight_floor  = 0.05;
     Scalar      weight_cap    = 10.0;
     ConfCombine conf_combine  = ConfCombine::Sum;

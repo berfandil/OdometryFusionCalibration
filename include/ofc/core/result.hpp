@@ -55,10 +55,22 @@ struct CalibSnapshot {
 };
 
 // Per-source diagnostics (populated when Config::emit_diagnostics).
+//
+// reliability / bias are the Slice-9 variance-EMA weight refinement diagnostics (D17):
+//   * reliability — the current reliability multiplier in [reliability_floor,
+//                   reliability_cap], applied to the fusion weight (w = prior ×
+//                   reliability × Σ-confidence). 1.0 before warmup / for non-participants.
+//                   A NOISY source (large residual scatter) reads < 1; a quiet source > 1.
+//   * bias        — the EMA mean of the per-source residual-to-consensus, i.e. the
+//                   SYSTEMATIC component. Surfaced for diagnostics ONLY; it is routed to
+//                   the CALIBRATOR, NOT folded into the weight (a biased-but-consistent
+//                   source keeps a high reliability — D17). 0.0 for non-participants.
 struct SourceHealth {
     SourceId id          = 0;
     Scalar   weight      = 0.0;
     Scalar   residual    = 0.0;         // to consensus
+    Scalar   reliability = 1.0;         // variance-EMA reliability multiplier (Slice 9)
+    Scalar   bias        = 0.0;         // EMA-mean residual = systematic component (Slice 9)
     bool     in_window   = false;
     bool     straight    = false;
     bool     turning     = false;
