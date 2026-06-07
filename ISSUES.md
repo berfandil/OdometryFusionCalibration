@@ -88,12 +88,20 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: calibration histogram peaks sharpen vs raw input; no peak shift (zero-phase) in sim.
 **Deps**: Slices 1, 6.
 
-## Slice 11 — Absolute-ref plugin + optional bias states  `[ ]`
-**Goal**: correction path + classic GPS/INS drift removal.
-- `ICorrection` interface, Mahalanobis-gated ESKF update.
-- Optional per-source bias states; GPS adapter (in `adapters/`).
-**Done when**: sim with GPS fixes removes pose drift; with `bias_states` on, a raw-IMU source's bias is observed and removed.
+## Slice 11 — Absolute-ref correction path  `[x]`
+**Goal**: correction path — absolute refs remove fused pose drift.
+- `ICorrection` interface, **Mahalanobis-gated ESKF update** (`Eskf::update`, Joseph form, right-error full-SE(3) injection).
+- `Estimator::add_correction` wired into `step()` (after predict, before publish); `Result::CorrectionDiag` (evaluated/applied/rejected/last NIS); `validate()` `mahalanobis_chi2 > 0`.
+- Sim `SyntheticAbsoluteRef` (position fix) for tests. **NIS now computable** (closes the Slice-14 NIS deferral; ensemble ~2.4 vs DOF 3, mildly conservative).
+**Done when**: sim with absolute fixes removes pose drift (✓ 0.58→0.20 m tail error); a gross outlier fix is Mahalanobis-rejected (✓ NIS ~3e5).
 **Deps**: Slice 2.
+
+## Slice 11b — Per-source bias states + GPS adapter  `[ ]`
+**Goal**: classic loosely-coupled GPS/INS drift removal via online bias estimation.
+- Optional per-source bias states (augment the fixed core state; `SensorConfig::bias_states` is a no-op today); absolute-ref updates observe/remove the bias through filter cross-covariance (D22).
+- Concrete GPS adapter (in `adapters/`, Slice 13 territory).
+**Done when**: with `bias_states` on, a raw-IMU source's bias is observed and removed in sim.
+**Deps**: Slice 11. **Note**: gate single-scalar `mahalanobis_chi2` should become a per-DOF chi² quantile when a 6-DOF/mixed plugin lands.
 
 ## Slice 12 — Persistence (warm restart)  `[ ]`
 **Goal**: serialize/deserialize calibration state; survive crashes.

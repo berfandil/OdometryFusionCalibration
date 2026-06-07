@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: 165 doctest cases / 5809 assertions.** 41 commits on `main`, working tree clean. Remote synced through Slice 9; the Slice-14 commits are local (not pushed).
+- **Gate green: 175 doctest cases / 7705 assertions.** 44 commits on `main`, working tree clean. Remote synced through Slice 14; the Slice-11 commits are local (not pushed).
 - **Done (all green):**
 
 | Unit | What |
@@ -52,15 +52,16 @@ Toolchain facts (this Windows box):
 | Slice 7 | Phase-2 calibration: turn-gated roll (S¹) + xyz lever-arm (hand-eye LS), both strategies |
 | Slice 8 | commit + feedback loop: per-DOF commit (mass + hysteresis), atomic swap, **contractive** re-anchor, cold-start |
 | Slice 9 | weight refinement: variance-EMA reliability (bias/variance split, D17) — noisy source downweighted, biased source kept (bias → calibrator); `reliability_floor`/`reliability_cap`, `SourceHealth.reliability`/`bias` |
+| Slice 11 | absolute-ref correction path: `Eskf::update` (Mahalanobis-gated, Joseph, right-error full-SE(3) injection) + `add_correction` wired into `step()` + `Result::CorrectionDiag`; sim drift removed 0.58→0.20 m, outlier gated (NIS ~3e5), NIS now computable |
 
 The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors.
 
-- **Remaining slices** (any order; recommended: **10 → 11 → 12 → 13**):
+- **Remaining slices** (any order; recommended: **10 → 12 → 13**, plus **11b**):
   - Slice 10 — per-sensor fixed-lag RTS smoother (two-sided, deeper frontier).
-  - Slice 11 — absolute-ref plugin (Mahalanobis-gated) + optional per-source GPS/INS bias states. **Also unblocks Slice-14 NIS** and is the path to fixing the covariance pessimism (a correction step lets P shrink).
+  - Slice 11b — per-source bias states (augment the core state) + GPS adapter; deferred from Slice 11. The path to the classic GPS/INS bias-removal and to making the gate per-DOF.
   - Slice 12 — warm-restart persistence (double-buffer + config-hash guard).
   - Slice 13 — adapters (YAML/ROS/threading/file-persistence).
-  - Slice 14 — `[~]` partial: NEES consistency + golden regression DONE (see §6 covariance finding). Remaining: NIS (needs Slice-11 corrections) + the CONFIG "tuned"-placeholder sweep.
+  - Slice 14 — `[~]` partial: NEES consistency + golden + **NIS** DONE (Slice 11 made NIS computable). Remaining: the CONFIG "tuned"-placeholder sweep (and the init-P covariance fix is the way to make NEES/NIS strictly consistent).
 
 ---
 
@@ -98,12 +99,13 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - Several thresholds are tuned placeholders (CONFIG marks them) pending the Slice-14 sweep.
 - **Slice-3 lifecycle scope**: NOMINAL is source-count-driven (`n ≥ min_sources_warn`), not directly calibration-convergence-gated; under `ReferenceOnly` cold-start the DEGRADED→NOMINAL upgrade tracks convergence only *indirectly* (a source joins the median once its extrinsic commits). `min_sources_warn` is validated lower-bound only (`≥1`); a value above `max_sources` is legitimate (NOMINAL never reached). If a future slice wants readiness to encode calibration convergence directly, revisit the ladder.
 - **Slice-9 weight scope**: reliability is the variance-EMA quality factor; `sigma_confidence()`'s D21 unit-mixing (mean of trans m² + rot rad² in one scalar) is **left intact** — reliability was added multiplicatively, not as a unit-separation rewrite, so that caveat stays open. `SourceHealth.bias` is an unsigned residual *magnitude* (mean `split_distance`), not a signed per-DOF offset — it cannot itself distinguish direction; the weight uses `resid_var` (scatter), not `bias`.
-- **Slice-14 finding — published covariance is PESSIMISTIC (~46×)**: Monte-Carlo NEES (6-DOF pose, full-SE(3) `se3::log` tangent) is ensemble-mean ≈ **0.13** vs DOF **6** — the filter is grossly over-conservative, not over-confident. Root cause: ESKF inits `P = I₁₂` (≈100× the steady-state error) and the predict-only integrator has **no correction step** to shrink P; the right-error `Ad(delta⁻¹)` propagation further inflates the translation block over distance. **Not** fixable via `q_scale`/`q_floor` (those only add to P). Fix path: seed init-P from the first-window/median uncertainty (much smaller than 1.0 m²/rad²), and/or add the Slice-11 correction step. The NEES test pins this with `CHECK_FALSE(truly_consistent)` so a future fix re-trips it.
+- **Slice-14 finding — published covariance is PESSIMISTIC (~46×) on the predict-only path**: Monte-Carlo NEES (6-DOF pose, full-SE(3) `se3::log` tangent) is ensemble-mean ≈ **0.13** vs DOF **6** — over-conservative, not over-confident. Root cause: ESKF inits `P = I₁₂` (≈100× the steady-state error) and a predict-only stretch has no correction to shrink P; the right-error `Ad(delta⁻¹)` propagation further inflates the translation block over distance. **Not** fixable via `q_scale`/`q_floor` (those only add to P). Fix path: seed init-P from the first-window/median uncertainty (≪ 1.0 m²/rad²). **Slice 11 partially mitigates this when an absolute ref is present** (the correction step shrinks P → NIS ≈ 2.4 vs DOF 3, near-consistent); the no-ref NEES test still trips `CHECK_FALSE(truly_consistent)` so a future init-P fix re-trips it.
+- **Slice-11 correction-gate limitation**: the Mahalanobis gate is a **single scalar `mahalanobis_chi2` regardless of measurement DOF `n`** (~97% quantile for n=3, ~80% for n=6). Fine for the dim=3 position fixes shipping now; make it a per-`n` χ² quantile when a 6-DOF/mixed plugin lands (Slice 11b). The drift-removal test uses a loose `chi2=100` — a **test artifact** driven by the covariance pessimism above (legit drift residuals exceed `chi2=9` because P never shrinks on predict-only stretches), NOT a production value.
 - **Covariance tangent (doc-vs-code reconciled)**: the ESKF covariance is **full coupled SE(3)** (propagated by the full `Ad(delta⁻¹)`), NOT block-diagonal "decoupled SO(3)×ℝ³" — that phrase only describes the error ordering `[trans;rot]` + the median's split metric. NEES uses the full `se3::log` to match. (DESIGN §5, D21 now corrected.)
-- Not yet built: RTS smoother (10), absolute-ref/bias (11), persistence (12), adapters (13). Partial: validation (14) — NIS pending Slice 11, CONFIG sweep pending.
+- Not yet built: RTS smoother (10), per-source bias states + GPS adapter (11b), persistence (12), adapters (13). Partial: validation (14) — NEES/NIS/golden done, CONFIG "tuned"-placeholder sweep + the init-P covariance fix pending.
 
 ---
 
 ## 7. Resume in one line
 
-Pick a slice (suggest **11 absolute-ref + bias** — it unblocks Slice-14 NIS and is the path to fixing the covariance pessimism; or **10 RTS smoother**), author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
+Pick a slice (suggest **10 RTS smoother**, or **11b bias states**, or a small **init-P covariance fix** to make NEES/NIS strictly consistent), author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.

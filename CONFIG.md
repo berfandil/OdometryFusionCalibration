@@ -122,7 +122,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `mahalanobis_chi2` | double | 9.0 | (0, ∞) | Innovation χ² gate (reject GPS multipath / outliers). |
+| `mahalanobis_chi2` | double | 9.0 | (0, ∞) | Innovation χ² (NIS) gate on absolute-ref updates: reject when `dᵀS⁻¹d > mahalanobis_chi2` (GPS multipath / outliers). `validate()` enforces `> 0` (Slice 11). **Limitation**: a single scalar applied regardless of measurement DOF `n` — ~the 97% quantile for `n=3` but only ~80% for `n=6`. Calibrated for the `dim=3` position fixes shipping now; make it a per-`n` quantile when a 6-DOF/mixed plugin lands (Slice 11b). |
 | Plugin-specific extrinsic / noise | — | — | — | Supplied by the concrete adapter (GPS, map-match). |
 
 ## 11. Lifecycle & persistence (`PersistenceConfig`)
