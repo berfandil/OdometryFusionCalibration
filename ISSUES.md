@@ -137,10 +137,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - Replace the persistence adapter's `flush`/`close` with a real `fsync(fd)` (platform layer) to close the power-loss durability window.
 **Deps**: Slice 13.
 
-## Slice 14 — Validation harness  `[~]` (sim rig + observability self-tests + NEES + NIS + golden DONE; init-P covariance fix DONE; CONFIG placeholder sweep + a distance-aware covariance model for strict no-ref NEES consistency remain)
+## Slice 14 — Validation harness  `[~]` (sim rig + observability self-tests + NEES + NIS + golden DONE; init-P fix DONE; median-variance Q reduction DONE; CONFIG `q_scale` sweep + distance-aware cov SHAPE / NHC for strict no-ref NEES remain)
 **Goal**: the trust apparatus (D24).
 - Sim rig (parameterized GT trajectory + sources), observability self-tests (per regime), NEES/NIS Monte-Carlo, recorded-data golden regression.
-**Done when**: CI runs unit + observability + consistency + golden; tuned defaults replace the "tuned" placeholders in `CONFIG.md`.
+- **No-ref covariance pessimism — approach A DONE** (`730bcfa`): a read-only spike attributed the ~17× pessimism to the spread-derived Q over-stating the FUSED median's accuracy (`spread` = inter-source disagreement, not fused error; the median of `n` sources has ~`1/n` the variance), amplified by the `Ad` translation transport. Fix: `adaptive_q_source_reduction` (default on) divides the spread term by the participating-median source count `n_eff` → NEES **0.35 → ~1.0** (~17× → ~6×), principled + safe (never overconfident). Remaining ~6× = the un-calibrated `q_scale=1` coefficient (the sweep below); the `Ad` distance *shape* (and/or an NHC no-ref correction, approach B) is the path to full strict consistency.
+**Done when**: CI runs unit + observability + consistency + golden; tuned defaults replace the "tuned" placeholders in `CONFIG.md` (the `q_scale` coefficient is the main one left).
 **Deps**: grows alongside Slices 2–11.
 
 ---
