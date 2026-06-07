@@ -29,6 +29,10 @@ Status Rig::add_source(const SyntheticSource* src) {
     return s;
 }
 
+Status Rig::add_correction(const ICorrection* corr) {
+    return est_.add_correction(corr);
+}
+
 int Rig::run(Scalar from_s, Scalar to_s, Scalar tick_rate_hz) {
     records_.clear();
     if (traj_ == nullptr || tick_rate_hz <= Scalar(0) || to_s <= from_s) return 0;

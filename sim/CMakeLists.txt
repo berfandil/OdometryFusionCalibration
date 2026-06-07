@@ -5,6 +5,7 @@
 add_library(ofc_sim STATIC
     src/trajectory.cpp
     src/synthetic_source.cpp
+    src/absolute_ref_source.cpp
     src/rig.cpp
 )
 target_include_directories(ofc_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -56,6 +56,10 @@ namespace ofc {
 namespace {
 constexpr Scalar kNanosPerSec = Scalar(1e9);
 constexpr int    kMaxSourcesCap = 32;   // matches Result::calib/health array sizes
+// Absolute-reference corrections cap (Slice 11, D22). Fixed-capacity registry (strict
+// core: no post-init heap, bounded loops). 8 is generous for the GPS/INS/map-match
+// plugin count a single rig carries; past it add_correction returns CapacityExceeded.
+constexpr int    kMaxCorrectionsCap = 8;
 
 // Variance-EMA reliability (Slice 9, D17). A source's residual-to-consensus EMA mean +
 // variance accrue per fused step; once it has at least kRelWarmup samples the reliability
@@ -128,6 +132,12 @@ struct Estimator::Impl {
     // the live count is bounded by cfg.max_sources.
     const ISource* sources[kMaxSourcesCap] = {};
     int            source_count = 0;
+
+    // Registered absolute-reference corrections (Slice 11, D22). Pointers owned by the
+    // caller; fixed-capacity registry (strict core). Evaluated in step() AFTER predict and
+    // BEFORE publishing, each Mahalanobis-gated by cfg.mahalanobis_chi2. Reset in init().
+    const ICorrection* corrections[kMaxCorrectionsCap] = {};
+    int                correction_count = 0;
 
     // Per-source prior extrinsic (sensor->base), prior translation scale, and prior
     // weight, looked up from the SensorConfig matching the source id (identity / 1.0 /
@@ -474,6 +484,9 @@ Status Estimator::init(const Config& cfg) {
     impl_->ever_fused_  = false;
     impl_->publish_phase(Phase::Init);
     impl_->source_count = 0;
+    // Absolute-ref corrections reset (Slice 11): no plugins until re-registered.
+    impl_->correction_count = 0;
+    for (int i = 0; i < kMaxCorrectionsCap; ++i) impl_->corrections[i] = nullptr;
     impl_->eskf_started = false;
     impl_->last_t1      = 0;
     impl_->has_last_t1  = false;
@@ -561,8 +574,11 @@ Status Estimator::add_source(const ISource* src) {
 
 Status Estimator::add_correction(const ICorrection* corr) {
     if (impl_ == nullptr || !impl_->inited) return Status::NotInitialized;
-    (void)corr;
-    return Status::Ok;   // TODO Slice 11
+    if (corr == nullptr)                    return Status::InvalidConfig;
+    if (impl_->correction_count >= kMaxCorrectionsCap) return Status::CapacityExceeded;
+    impl_->corrections[impl_->correction_count] = corr;
+    ++impl_->correction_count;
+    return Status::Ok;
 }
 
 Status Estimator::step(Timestamp now) {
@@ -917,7 +933,37 @@ Status Estimator::step(Timestamp now) {
     s.last_t1     = t1;
     s.has_last_t1 = true;
 
-    // Frontier state. Drive the published stamp from the real frontier t1.
+    // ---- Absolute-reference corrections (Slice 11, D22) -------------------------
+    // AFTER predict, BEFORE publishing the frontier/tip: for each registered ICorrection,
+    // evaluate its measurement at the CURRENT (post-predict) frontier state, then run the
+    // Mahalanobis-gated ESKF update. Accepted updates SHRINK P toward the measurement and
+    // correct the fused pose (e.g. a GPS-like position fix removing odometry drift); the
+    // published frontier + the predicted tip are re-read from the CORRECTED state below.
+    // No-op (byte-identical to the predict-only path) when no correction is registered.
+    //
+    // Diagnostics: count availability (evaluate true), acceptance vs gate-rejection, and the
+    // last NIS (computable now that there is an innovation — closes the Slice-14 NIS
+    // deferral). The evaluate() State carries the real frontier stamp t1 (the absolute ref
+    // needs it to sample the reference at the frontier), so we stamp a working copy first.
+    CorrectionDiag cdiag;
+    if (s.correction_count > 0) {
+        for (int c = 0; c < s.correction_count; ++c) {
+            const ICorrection* corr = s.corrections[c];
+            if (corr == nullptr) continue;
+            State x = s.eskf.state();      // post-predict (+ any earlier accepted update)
+            x.stamp = t1;                  // give the plugin the real frontier time
+            Measurement m;
+            if (!corr->evaluate(x, m)) continue;   // no fix available this step
+            ++cdiag.corr_evaluated;
+            const bool applied = s.eskf.update(m, cfg.mahalanobis_chi2);
+            if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
+            cdiag.last_nis = s.eskf.last_nis();     // last NIS, accepted or rejected
+        }
+    }
+    s.result.correction = cdiag;
+
+    // Frontier state. Drive the published stamp from the real frontier t1. Re-read AFTER
+    // the corrections so the published pose/covariance reflect any accepted update.
     s.result.frontier        = s.eskf.state();
     s.result.frontier.stamp  = t1;
 
@@ -1014,6 +1060,11 @@ Status validate(const Config& cfg) {
         return Status::OutOfRange;                        // ‖ω‖ variance gate >= 0
     if (cfg.max_lag_s <= 0.0 || cfg.max_lag_s > 2.0)
         return Status::OutOfRange;                        // max_lag_s in (0, 2]
+
+    // Absolute-ref Mahalanobis gate (Slice 11, D22): the chi-square threshold must be
+    // positive — a non-positive threshold would reject EVERY measurement (NIS >= 0 always),
+    // silently disabling the correction path.
+    if (cfg.mahalanobis_chi2 <= 0.0)                     return Status::OutOfRange;
 
     // TODO: per-sensor + histogram range checks.
     return Status::Ok;

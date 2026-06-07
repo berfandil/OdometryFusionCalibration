@@ -2,6 +2,7 @@
 // covariance growth + symmetry/PSD, const-velocity tip).
 #include <doctest/doctest.h>
 
+#include "ofc/core/absolute_ref.hpp"
 #include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 
@@ -213,4 +214,142 @@ TEST_CASE("predict_tip with a turning twist follows the rotation") {
     const SE3 expected = se3::compose(delta, delta);
     CHECK(close(tip.pose.R, expected.R, 1e-6));
     CHECK(close(tip.pose.t, expected.t, 1e-6));
+}
+
+// ---------------------------------------------------------------------------
+// Mahalanobis-gated measurement update (Slice 11)
+// ---------------------------------------------------------------------------
+namespace {
+// Build a POSITION-fix measurement (dim=3) against a target world position z, at the
+// CURRENT pose. residual = z - h(x) = z - pose.t; H_pos = [ R | 0_3x3 | 0_3x6 ]
+// (3x12, right-error [trans;rot] tangent — the odom-frame translation perturbs as
+// t + R*rho to first order under T o exp(eta)); R_noise = sigma^2 I3.
+Measurement position_fix(const SE3& pose, const Vec3& z, Scalar sigma) {
+    Measurement m;
+    m.dim = 3;
+    m.residual.setZero();
+    m.residual.head<3>() = z - pose.t;
+    m.H.setZero();
+    m.H.block<3, 3>(0, 0) = pose.R;
+    m.R.setZero();
+    m.R.block<3, 3>(0, 0) = (sigma * sigma) * Mat3::Identity();
+    return m;
+}
+} // namespace
+
+TEST_CASE("update: empty / out-of-range measurement is a no-op (returns false)") {
+    Eskf f;
+    f.init(SE3{}, Mat12::Identity());
+    const SE3 pose0 = f.state().pose;
+
+    Measurement m;          // dim defaults to 0
+    CHECK_FALSE(f.update(m, 9.0));
+    CHECK(close(f.state().pose.t, pose0.t, 1e-15));
+
+    m.dim = 7;              // out of range
+    CHECK_FALSE(f.update(m, 9.0));
+}
+
+TEST_CASE("update: a position fix pulls the pose toward it and shrinks the pose cov") {
+    Eskf f;
+    f.init(SE3{}, Mat12::Identity());
+
+    // Move the filter to a non-trivial pose first (rotation + translation).
+    SE3 delta;
+    delta.R = so3::exp(Vec3(0, 0, 0.3));
+    delta.t = Vec3(1.0, 0.5, -0.2);
+    f.predict(delta, 0.1, q_pose_simple(0.01));
+
+    const Vec3 t_before  = f.state().pose.t;
+    const Scalar trP_before = f.cov().block<6, 6>(0, 0).trace();
+
+    // A position measurement 0.2 m off in +x from the current pose (small -> linearization
+    // valid). It should pull the pose toward z and reduce the pose-block covariance.
+    const Vec3 z = t_before + Vec3(0.2, -0.1, 0.05);
+    Measurement m = position_fix(f.state().pose, z, /*sigma=*/0.05);
+    CHECK(f.update(m, 1e6));           // huge threshold -> always accepted
+
+    const Vec3 t_after = f.state().pose.t;
+    // Moved toward z (closer than before on the residual norm).
+    CHECK((t_after - z).norm() < (t_before - z).norm());
+    // Pose-block covariance shrank (the one step that reduces P).
+    CHECK(f.cov().block<6, 6>(0, 0).trace() < trP_before);
+    CHECK(is_symmetric(f.cov()));
+    CHECK(is_psd(f.cov()));
+    // NIS recorded for an accepted update.
+    CHECK(f.last_nis() > 0.0);
+}
+
+TEST_CASE("update: a tight, near-zero-residual position fix re-pulls pose almost exactly") {
+    Eskf f;
+    f.init(SE3{}, 0.5 * Mat12::Identity());
+    SE3 delta; delta.t = Vec3(2.0, 0.0, 0.0);
+    f.predict(delta, 0.1, q_pose_simple(0.001));
+
+    // A VERY tight measurement (tiny sigma) at a target slightly off -> the posterior pose
+    // should land very close to z (gain ~ 1 on the position).
+    const Vec3 z = f.state().pose.t + Vec3(0.10, 0.0, 0.0);
+    Measurement m = position_fix(f.state().pose, z, /*sigma=*/1e-3);
+    CHECK(f.update(m, 1e9));
+    CHECK((f.state().pose.t - z).norm() < 1e-2);
+}
+
+TEST_CASE("update: a wildly-off measurement is gated out (state unchanged, NIS recorded)") {
+    Eskf f;
+    f.init(SE3{}, Mat12::Identity());
+    SE3 delta; delta.t = Vec3(1.0, 0.0, 0.0);
+    f.predict(delta, 0.1, q_pose_simple(0.01));
+
+    const SE3   pose_before = f.state().pose;
+    const Mat12 cov_before  = f.cov();
+    const Vec6  twist_before = f.state().twist.xi;
+
+    // A gross outlier: 50 m off with a tight sigma -> NIS huge -> rejected by the gate.
+    const Vec3 z = f.state().pose.t + Vec3(50.0, 0.0, 0.0);
+    Measurement m = position_fix(f.state().pose, z, /*sigma=*/0.1);
+    CHECK_FALSE(f.update(m, /*chi2=*/9.0));
+
+    // State + covariance + twist are byte-for-byte untouched.
+    CHECK(close(f.state().pose.R, pose_before.R, 1e-15));
+    CHECK(close(f.state().pose.t, pose_before.t, 1e-15));
+    CHECK(close(f.cov(), cov_before, 1e-15));
+    CHECK(close(f.state().twist.xi, twist_before, 1e-15));
+    // NIS is still recorded (above threshold) even though the update was rejected.
+    CHECK(f.last_nis() > 9.0);
+}
+
+TEST_CASE("update: Joseph form keeps P symmetric PSD across many accepted updates") {
+    Eskf f;
+    f.init(SE3{}, Mat12::Identity());
+
+    SE3 delta;
+    delta.R = so3::exp(Vec3(0.02, -0.01, 0.05));
+    delta.t = Vec3(0.5, 0.1, 0.0);
+
+    for (int k = 0; k < 20; ++k) {
+        f.predict(delta, 0.1, q_pose_simple(0.005));
+        const Vec3 z = f.state().pose.t + Vec3(0.05, -0.02, 0.01);
+        Measurement m = position_fix(f.state().pose, z, /*sigma=*/0.05);
+        f.update(m, 1e6);
+        CHECK(is_symmetric(f.cov()));
+        CHECK(is_psd(f.cov()));
+    }
+}
+
+TEST_CASE("update: the position H = [R|0|0] convention is correct (residual shrinks)") {
+    // A discriminating check that H uses pose.R (not identity, not R^T). With the WRONG H
+    // the posterior would move the WRONG way / not reduce the residual for a rotated pose.
+    Eskf f;
+    f.init(SE3{}, Mat12::Identity());
+    SE3 delta;
+    delta.R = so3::exp(Vec3(0, 0, 1.2));     // a large yaw so R differs from I markedly
+    delta.t = Vec3(3.0, -1.0, 0.4);
+    f.predict(delta, 0.1, q_pose_simple(0.01));
+
+    const Vec3 z = f.state().pose.t + Vec3(0.3, 0.2, -0.1);
+    const Scalar r_before = (z - f.state().pose.t).norm();
+    Measurement m = position_fix(f.state().pose, z, /*sigma=*/0.02);
+    CHECK(f.update(m, 1e9));
+    const Scalar r_after = (z - f.state().pose.t).norm();
+    CHECK(r_after < 0.25 * r_before);        // tight fix -> residual collapses
 }

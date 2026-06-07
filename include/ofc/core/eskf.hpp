@@ -19,6 +19,7 @@
 #ifndef OFC_CORE_ESKF_HPP
 #define OFC_CORE_ESKF_HPP
 
+#include "ofc/core/absolute_ref.hpp"
 #include "ofc/core/types.hpp"
 
 namespace ofc {
@@ -47,6 +48,40 @@ public:
     // (uses a tiny positive dt to avoid division by zero).
     void predict(const SE3& delta, Scalar dt, const Mat6& q_pose);
 
+    // Mahalanobis-gated error-state measurement update (Slice 11, D22). Applies a
+    // linearized absolute-reference measurement `m` (residual = z (-) h(x), Jacobian H,
+    // noise R) at the current frontier, in the SAME right-error tangent predict() lives
+    // in (T_true = T o exp(eta), eta = [trans; rot], pose 0..5, twist 6..11). Steps, all
+    // sliced to the measurement's ACTIVE dimension n = m.dim (1..6; top-left n rows of H,
+    // first n entries of residual, top-left n x n of R):
+    //   S  = H P H^T + R                  (innovation covariance, n x n)
+    //   d2 = residual^T S^-1 residual     (NIS — Normalized Innovation Squared)
+    //   GATE: d2 > chi2_threshold  =>  REJECT (return false, state UNCHANGED). d2 is still
+    //         recorded (last_nis()) for diagnostics, accepted OR rejected.
+    //   K  = P H^T S^-1                   (Kalman gain, 12 x n; stable ldlt solve, no inverse)
+    //   dx = K * residual                 (12-vector error state)
+    //   INJECT: pose  <- pose o se3::exp(dx[0..5])   (full SE(3) exp of the [trans;rot]
+    //                                                  tangent — the same coupled-SE(3)
+    //                                                  tangent the covariance lives in)
+    //           twist <- twist + dx[6..11]            (additive)
+    //   P  <- (I - K H) P (I - K H)^T + K R K^T       (Joseph form -> guaranteed PSD), then
+    //         symmetrize. twist.cov <- P block(6,6).
+    // Returns true iff the update was APPLIED (gate passed AND m.dim in 1..6); false if
+    // gated out or empty (m.dim <= 0). Does NOT touch `stamp` (estimator owns the clock,
+    // like predict()). This is the ONLY step that SHRINKS P toward a measurement — it
+    // directly mitigates the Slice-14 covariance-pessimism finding WHEN an absolute ref is
+    // present (the predict-only no-ref path is unchanged).
+    //
+    // `chi2_threshold` is a single scalar applied REGARDLESS of n. Ideally it would be the
+    // chi-square quantile for n DOF (so a 6-DOF pose fix and a 3-DOF position fix gate at
+    // different magnitudes); the core currently uses one cfg.mahalanobis_chi2 for all n —
+    // documented limitation, not over-engineered here.
+    bool update(const Measurement& m, Scalar chi2_threshold);
+
+    // NIS (d2) of the LAST update() call — set whether the gate accepted or rejected; 0
+    // before any update(). Surfaced by the estimator into Result diagnostics.
+    Scalar last_nis() const { return last_nis_; }
+
     // Const-velocity extrapolation `dt_ahead` seconds past the frontier:
     //   tip.pose  = pose o exp(twist * dt_ahead)
     //   tip.twist = twist (carried)
@@ -66,7 +101,8 @@ public:
     Mat12        cov()   const { return state_.cov; }
 
 private:
-    State state_{};
+    State  state_{};
+    Scalar last_nis_ = Scalar(0);   // NIS of the last update() (accepted or rejected)
 };
 
 } // namespace ofc

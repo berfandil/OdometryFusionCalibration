@@ -12,6 +12,7 @@
 #ifndef OFC_SIM_RIG_HPP
 #define OFC_SIM_RIG_HPP
 
+#include "ofc/core/absolute_ref.hpp"
 #include "ofc/core/config.hpp"
 #include "ofc/core/estimator.hpp"
 #include "ofc/core/result.hpp"
@@ -48,6 +49,10 @@ public:
 
     // Register a synthetic source (pointer owned by the caller; must outlive the rig).
     Status add_source(const SyntheticSource* src);
+
+    // Register an absolute-reference correction (Slice 11; pointer owned by the caller;
+    // must outlive the rig). Forwards to the estimator's add_correction.
+    Status add_correction(const ICorrection* corr);
 
     // Step from `from_s` to `to_s` (trajectory seconds) at `tick_rate_hz`. Records each
     // tick. Clears any previous recording. Returns the number of SUCCESSFUL fuses.

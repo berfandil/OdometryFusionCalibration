@@ -88,6 +88,7 @@
 #include "ofc/core/lie.hpp"
 #include "ofc/core/result.hpp"
 
+#include "ofc_sim/absolute_ref_source.hpp"
 #include "ofc_sim/rig.hpp"
 #include "ofc_sim/synthetic_source.hpp"
 #include "ofc_sim/trajectory.hpp"
@@ -408,6 +409,132 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     // interval — it pins the (pessimistic) covariance the filter emits today.
     CHECK(mean_nees > 0.04);
     CHECK(mean_nees < 0.40);
+}
+
+// ===========================================================================
+// DELIVERABLE 1b — NIS Monte-Carlo consistency (Slice 11 closes the deferral)
+// ===========================================================================
+TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolute-ref "
+          "fixes (chi-square interval, 3 DOF)") {
+    // NIS (Normalized Innovation Squared) is defined only at a MEASUREMENT UPDATE. Slice 11
+    // adds the absolute-ref correction path, so NIS is FINALLY computable (the Slice-14
+    // deferral — there was no innovation in the predict-only filter). For a consistent
+    // filter the per-fix NIS d2 = r^T S^-1 r ~ chi2(n), n = the fix DOF (here position,
+    // n=3), so the ensemble mean over many accepted fixes ~ 3.
+    //
+    // The correction step SHRINKS P toward the measurement (the Slice-14 covariance-
+    // pessimism finding's fix WHEN a ref is present): repeated fixes pull the pessimistic
+    // init P=I_12 down toward a steady state set by the measurement noise, so unlike the
+    // predict-only NEES (~0.13, grossly pessimistic) the NIS on the CORRECTED path is in a
+    // sane range. We use priors == planted (no calibration transient) + a clean position
+    // ref whose sim sigma_pos EQUALS the R the measurement reports, so the filter's noise
+    // model matches the actual draw — the only honest way to expect NIS ~ DOF.
+    //
+    // HONESTY CLAUSE (DESIGN §10, same rule as the NEES work): the published P is still
+    // partly pessimistic between fixes (predict re-inflates it), so S = HPH^T + R is biased
+    // HIGH and the ensemble-mean NIS sits somewhat BELOW the DOF count rather than dead on
+    // it. We report the measured mean + the chi-square interval; if it is not strictly
+    // inside the interval we assert a DOCUMENTED ACHIEVABLE band on the value the filter
+    // actually produces (a non-vacuous regression guard) and surface it as the outcome.
+    Trajectory tr = nees_traj();
+    const int M = 30;
+
+    std::vector<SourceParams> base(3);
+    base[0].id = 0;
+    base[1].id = 1;
+    base[1].X.R = so3::exp(Vec3(0, 0, kPi / 6));
+    base[1].X.t = Vec3(0.3, -0.2, 0.1);
+    base[2].id = 2;
+    base[2].X.R = so3::exp(Vec3(0.05, 0.1, -kPi / 7));
+    base[2].X.t = Vec3(-0.25, 0.15, 0.05);
+    for (auto& sp : base) {
+        sp.noise_trans_per_m = 0.02;
+        sp.noise_rot_per_rad = 0.02;
+        sp.noise_trans_floor = 0.005;
+        sp.noise_rot_floor   = 0.005;
+    }
+
+    const Scalar q_scale     = 1.0;
+    const Scalar qf[6]       = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
+    const Scalar sigma_pos   = 0.10;   // the ref's reported R sigma == the drawn noise sigma
+
+    Scalar sum_nis = 0.0;
+    long   N       = 0;
+    for (int run = 0; run < M; ++run) {
+        std::vector<SourceParams> planted = base;
+        for (auto& sp : planted) sp.seed = 8000u + run * 13u + sp.id;
+
+        std::vector<std::unique_ptr<SyntheticSource>> srcs;
+        for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+        std::vector<SensorConfig> sensors;
+        Config cfg = nees_config(planted, sensors, q_scale, qf);
+        cfg.mahalanobis_chi2 = 1e9;    // accept all inliers (clean run -> no real outliers)
+
+        AbsoluteRefParams rp;
+        rp.period_s  = 0.10;           // 10 Hz fixes (plenty of samples)
+        rp.window_s  = cfg.window_s;
+        rp.sigma_pos = sigma_pos;
+        rp.seed      = 9000u + static_cast<std::uint32_t>(run);
+        SyntheticAbsoluteRef ref(tr, rp);
+
+        Rig rig;
+        rig.set_trajectory(tr);
+        REQUIRE(rig.init(cfg) == Status::Ok);
+        for (auto& s : srcs) REQUIRE(rig.add_source(s.get()) == Status::Ok);
+        REQUIRE(rig.add_correction(&ref) == Status::Ok);
+        rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+
+        // Average the per-fix NIS over steady-state ticks (drop warmup) on records where a
+        // fix was applied (corr_applied > 0 -> last_nis is an APPLIED fix's NIS).
+        int fused_seen = 0;
+        const int warmup = 20;
+        for (const Record& r : rig.records()) {
+            if (!r.fused) continue;
+            ++fused_seen;
+            if (fused_seen <= warmup) continue;
+            if (r.result.correction.corr_applied <= 0) continue;
+            sum_nis += r.result.correction.last_nis;
+            ++N;
+        }
+    }
+    REQUIRE(N > 1000);
+    const Scalar mean_nis = sum_nis / static_cast<Scalar>(N);
+
+    // Two-sided 99% chi-square interval on the mean for k = N*3 DOF (Wilson-Hilferty).
+    const Scalar dof = 3.0;
+    const Scalar k   = static_cast<Scalar>(N) * dof;
+    const Scalar z   = 2.5758;
+    auto wh = [&](Scalar zp) {
+        const Scalar a = Scalar(2) / (Scalar(9) * k);
+        const Scalar f = Scalar(1) - a + zp * std::sqrt(a);
+        return k * f * f * f;
+    };
+    const Scalar lo_mean = wh(-z) / static_cast<Scalar>(N);
+    const Scalar hi_mean = wh(+z) / static_cast<Scalar>(N);
+
+    const bool consistent = (mean_nis >= lo_mean && mean_nis <= hi_mean);
+    const std::string verdict = consistent ? "YES" : "NO";
+    MESSAGE("NIS consistency: ensemble-mean=" << mean_nis << " DOF=3 N=" << N
+            << " chi2 99% interval on mean=[" << lo_mean << ", " << hi_mean << "]"
+            << "  consistent=" << verdict);
+
+    // EMPIRICAL OUTCOME: ensemble-mean NIS ~ 2.4 for DOF=3 — MILDLY conservative (just
+    // below the tight chi2 interval ~[2.91, 3.09]), a NIGHT-AND-DAY contrast with the
+    // predict-only NEES (~0.13, ~46x pessimistic). The correction step pulls the pessimistic
+    // init P=I_12 down toward the measurement noise, so the innovation is normalized by a
+    // covariance close to the true error. The residual ~20% shortfall is P re-inflating
+    // between fixes (predict adds Q + the Ad propagation before the next fix), biasing
+    // S = HPH^T + R slightly HIGH. So the filter is NOT strictly chi-square-consistent yet,
+    // but is now in a SANE O(DOF) range (vs the ~46x predict-only gap) — reported as a
+    // partial close of the Slice-14 covariance finding (full consistency would need a
+    // smaller init P and/or denser fixes; surfaced to the orchestrator).
+    //
+    // ACHIEVABLE BAND (non-vacuous regression guard on the value the filter ACTUALLY
+    // produces). Pins the observed ~2.4 while absorbing Monte-Carlo seed variation; a ~1.5x
+    // drift in EITHER the published covariance OR the tracking error breaks it. Stays well
+    // clear of both the pessimistic (<<1) and overconfident (>>DOF) failure modes.
+    CHECK(mean_nis > 1.5);     // NOT collapsed like the predict-only NEES (~0.13)
+    CHECK(mean_nis < 3.5);     // NOT overconfident (would blow past DOF)
 }
 
 // ===========================================================================

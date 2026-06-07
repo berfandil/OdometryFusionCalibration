@@ -84,6 +84,27 @@ struct SourceHealth {
     bool     turning     = false;
 };
 
+// Absolute-reference correction diagnostics for one step (Slice 11, D22). Summarizes the
+// registered ICorrection plugins evaluated this step and the Mahalanobis-gated ESKF
+// updates they produced. All zero on a step with no corrections registered / none
+// available (so corrections-off reads exactly the Slice-2..9 defaults).
+//   * corr_evaluated — ICorrection::evaluate() returned a measurement this step (a fix was
+//                      available). <= the number of registered corrections.
+//   * corr_applied   — gate PASSED and the ESKF update was applied (the fix corrected the
+//                      pose).
+//   * corr_rejected  — evaluate() yielded a fix but the Mahalanobis gate REJECTED it (NIS >
+//                      mahalanobis_chi2; state left unchanged). corr_applied + corr_rejected
+//                      == corr_evaluated.
+//   * last_nis       — the NIS (Normalized Innovation Squared) of the LAST update() this
+//                      step, accepted OR rejected (0.0 if none evaluated). The quantity the
+//                      Slice-14 NIS-consistency deferral needs to become computable.
+struct CorrectionDiag {
+    int    corr_evaluated = 0;
+    int    corr_applied   = 0;
+    int    corr_rejected  = 0;
+    Scalar last_nis       = 0.0;
+};
+
 struct Result {
     Phase  phase = Phase::Init;
     // Coarse [0,1] readiness exposed alongside `phase` (DESIGN §7/§8). A monotone
@@ -93,6 +114,9 @@ struct Result {
     State  frontier;                    // trustworthy, causal (now - delay)
     State  tip;                         // predict-only extrapolation to now
     bool   tip_valid = false;
+
+    // Absolute-reference correction summary for this step (Slice 11). Zeroed each step.
+    CorrectionDiag correction;
 
     // Calibration + diagnostics (sizes <= max_sources; filled count below).
     CalibSnapshot calib[32];
