@@ -96,11 +96,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: sim with absolute fixes removes pose drift (✓ 0.58→0.20 m tail error); a gross outlier fix is Mahalanobis-rejected (✓ NIS ~3e5).
 **Deps**: Slice 2.
 
-## Slice 11b — Per-source bias states + GPS adapter  `[~]` (Option A done; Option B + per-n gate + GPS adapter deferred)
+## Slice 11b — Per-source bias states + GPS adapter  `[~]` (Option A + per-n gate done; Option B + GPS adapter deferred)
 **Goal**: classic loosely-coupled GPS/INS drift removal via online bias estimation.
 - **Option A DONE** (`48ece29` + `f47b29a`): a SINGLE `bias_states=true` source that drives the predict alone augments the ESKF to **18-DOF** `[pose;twist;bias(6)]`; predict de-biases (`Δ∘exp(-b·dt)`) + builds the pose↔bias cross-cov (`J_pb = -dt·I₆`); the absolute-ref update removes the bias via that cross-cov (sim: planted bias recovered, drift 16 m → 0.06 m; no-ref observability self-test; multi-bias guard → `InvalidConfig`; out-of-regime `predict_aug_frozen` keeps the filter consistent). New knob `SensorConfig::bias_process_noise`; `CalibSnapshot.bias` + `bias_observable`. Default-OFF byte-identical.
-- **Deferred (11b residual)**: Option B (median-coupled multi-source bias — see the DESIGN NOTE), the per-`n` χ² Mahalanobis gate, and the concrete GPS adapter (in `adapters/`, Slice 13 territory).
-- Per-DOF Mahalanobis gate: `mahalanobis_chi2` should become a per-`n` χ² quantile when a 6-DOF/mixed `ICorrection` plugin lands (a 6-entry const table indexed by `Measurement::dim`).
+- **Per-`n` χ² Mahalanobis gate DONE** (`e8491dd`): `Eskf::chi2_gate(base, n)` scales the n=3-tuned `mahalanobis_chi2` base by the χ²-quantile ratio `q[n]/q[3]` (const `kChi2Q95[7]`, 0.95 confidence, DOF 1..6) so every measurement DOF n∈1..6 gates at the same confidence; the estimator passes `chi2_gate(cfg.mahalanobis_chi2, m.dim)` to both `update()`/`update_aug()`. n=3 returns base unchanged (the dim=3 fixes shipping now are behaviorally identical — load-bearing once a 6-DOF/mixed `ICorrection` lands; n=6 ≈ 1.61×base). Signatures unchanged (still take a raw per-n threshold).
+- **Deferred (11b residual)**: Option B (median-coupled multi-source bias — see the DESIGN NOTE) and the concrete GPS adapter (in `adapters/`, Slice 13 territory).
 **Done when**: with `bias_states` on, a raw-IMU source's bias is observed and removed in sim.
 **Deps**: Slice 11.
 

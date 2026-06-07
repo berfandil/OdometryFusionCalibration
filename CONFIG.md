@@ -123,7 +123,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `mahalanobis_chi2` | double | 9.0 | (0, ∞) | Innovation χ² (NIS) gate on absolute-ref updates: reject when `dᵀS⁻¹d > mahalanobis_chi2` (GPS multipath / outliers). `validate()` enforces `> 0` (Slice 11). **Limitation**: a single scalar applied regardless of measurement DOF `n` — ~the 97% quantile for `n=3` but only ~80% for `n=6`. Calibrated for the `dim=3` position fixes shipping now; make it a per-`n` quantile when a 6-DOF/mixed plugin lands (Slice 11b). |
+| `mahalanobis_chi2` | double | 9.0 | (0, ∞) | Innovation χ² (NIS) gate on absolute-ref updates: reject when `dᵀS⁻¹d > threshold` (GPS multipath / outliers). `validate()` enforces `> 0` (Slice 11). **Now per-`n` (Slice 11b, `e8491dd`)**: this value is the **base threshold tuned at the n=3 position-fix DOF**; the estimator scales it by the χ²-quantile ratio `q[n]/q[3]` via `Eskf::chi2_gate(base, m.dim)` (const `kChi2Q95`, 0.95 confidence) so every measurement DOF `n∈1..6` gates at the same confidence — n=3 unchanged, n=6 ≈ 1.61×base. One knob, DOF-invariant confidence. The dim=3 fixes shipping now are behaviorally identical to the old single-scalar gate; this becomes load-bearing once a 6-DOF/mixed `ICorrection` lands. (The `chi2=100` value in the drift-removal test is an unrelated covariance-pessimism test artifact, not a production value.) |
 | Plugin-specific extrinsic / noise | — | — | — | Supplied by the concrete adapter (GPS, map-match). |
 
 ## 11. Lifecycle & persistence (`PersistenceConfig`)
