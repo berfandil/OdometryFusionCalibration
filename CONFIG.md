@@ -115,7 +115,8 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `per_sensor_kf` | bool | false | — | Enable the per-sensor fixed-lag RTS twist smoother feeding calibration (Slice 10, **wired**). On ⇒ calibration runs at the deeper frontier `now − delay − L` with two-sided (zero-phase) smoothed twists; OFF ⇒ byte-identical to no-smoothing. |
 | `kf_process_noise` | double | tuned | ≥0 | Smoothing strength `q` (larger = looser/closer-tracking; only `q/r` shapes smoothing, `r` fixed at 1.0). **Note**: a single shared smoother uses the MAX `q` over enabled sources (not yet per-source). |
 | `scale_calib` | bool | true | — | Calibrate scale; if false, fixed at `prior_scale`. |
-| `bias_states` | bool | false | — | Add nuisance-bias states (GPS/INS-style drift removal); enable for raw-IMU sources. |
+| `bias_states` | bool | false | — | Add nuisance-bias states (GPS/INS-style drift removal); enable for raw-IMU sources. **Slice-11b Option A**: when set on the SINGLE source that drives the predict alone, the ESKF augments to 18-DOF `[pose;twist;bias]` and an absolute-ref update removes the bias via the pose↔bias cross-covariance. `>1` source set → `InvalidConfig`. |
+| `bias_process_noise` | double | 1e-4 | ≥0 | Random-walk process noise for the per-source bias state (Slice-11b; only active when `bias_states` + the source drives the predict). Larger = the bias tracks faster / is trusted less. |
 | `is_reference` | bool | (id==ref) | — | Marks the gauge anchor. |
 
 ## 10. Absolute references (`AbsoluteRefConfig`)

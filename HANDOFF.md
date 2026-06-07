@@ -36,7 +36,7 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: ctest 2/2 — `unit` 195 cases / 8274 assertions + `adapters` 20 cases / 319 assertions.** 57 commits on `main`, working tree clean. Remote synced through the init-P fix (`7c1592c`); the 11b-deferral doc commit is local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
+- **Gate green: ctest 2/2 — `unit` 200 cases / 8322 assertions + `adapters` 20 cases / 319 assertions.** 60 commits on `main`, working tree clean. Remote synced through the init-P fix (`7c1592c`); the 11b-deferral + 11b-Option-A commits are local (not pushed). (The gate now builds the relaxed-edge adapters too — `dev.ps1` configures `OFC_BUILD_ADAPTERS=ON`.)
 - **Done (all green):**
 
 | Unit | What |
@@ -56,13 +56,14 @@ Toolchain facts (this Windows box):
 | Slice 10 | per-sensor fixed-lag RTS twist smoother (`TwistSmoother`, D18): CV forward + backward RTS, deeper calibration frontier `now−delay−L`; variance ↓~0.3×, zero-phase, peaks ~4× sharper, no bias; `per_sensor_kf` OFF byte-identical; dropout time-alignment fixed (push-seq stamping) |
 | Slice 12 | warm-restart persistence (D23): core `serialize`/`deserialize` into fixed buffers (`persistence.hpp`, "OFCP" v1, FNV-1a config-hash + checksum + orthonormality guard, `CorruptData`/`VersionMismatch`); re-anchor-and-refill restore resumes near-NOMINAL (warm ~0.001 m vs cold ~0.256 m); crash-mid-write/config/checksum/version all reject. Bins NOT persisted; file double-buffer is relaxed-edge (production adapter → 13) |
 | Slice 13 (subset) | relaxed-edge `adapters/` (`ofc_adapters`, core PUBLIC API only, no new deps): file-persistence double-buffer (validity-based overwrite target — torn higher-seq can't clobber last-good), threading wrapper (mutex-guarded snapshot), dep-free config loader (subset → Config). ROS node + true fsync → 13b |
+| Slice 11b (Option A) | per-source bias states (augmented 18-DOF ESKF): a SINGLE `bias_states` source driving the predict alone → predict de-biases (`Δ∘exp(-b·dt)`) + builds the pose↔bias cross-cov (`J_pb=-dt·I₆`); absolute-ref update removes the bias (sim: planted recovered, drift 16 m → 0.06 m); no-ref observability self-test; multi-bias guard; `predict_aug_frozen` out-of-regime; default-OFF byte-identical. `bias_process_noise` knob; `CalibSnapshot.bias`/`bias_observable`. Option B + per-n gate + GPS adapter → 11b residual |
 
 The **calibration spine (5–8) is complete** — calibration closes back into fusion and bootstraps from arbitrary priors. **All numbered roadmap slices 0–14 are now addressed** (13 + 14 are partial — see below).
 
 - **Remaining work** (any order):
-  - Slice 11b — per-source bias states (augment the core state) + GPS adapter; deferred from Slice 11. The path to classic GPS/INS bias-removal and to making the Mahalanobis gate per-DOF.
+  - Slice 11b residual — **Option A is DONE** (single-driving-source augmented bias filter). Deferred: **Option B** (median-coupled multi-source bias — design in the ISSUES Slice-11b DESIGN NOTE), the **per-`n` χ² Mahalanobis gate**, and the concrete **GPS adapter**.
   - Slice 13b — real ROS node + recorded-bag round-trip; replace the persistence adapter's `flush`/`close` with a real `fsync` (durability). Deferred from Slice 13 (no ROS on the dev box).
-  - Slice 14 — `[~]` partial: NEES + golden + **NIS** DONE. Remaining: the CONFIG "tuned"-placeholder sweep (and a small **init-P covariance fix** — seed `P` ≪ `I₁₂` — would make the predict-only NEES strictly consistent).
+  - Slice 14 — `[~]` partial: NEES + golden + **NIS** DONE; **init-P covariance fix DONE** (`70c7d38`, NEES ~0.13→~0.35). Remaining: the CONFIG "tuned"-placeholder sweep, and — for strict no-ref NEES consistency — a **distance-aware covariance model** (counter the predict-only translation Ad-inflation).
 
 ---
 
@@ -106,14 +107,15 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 - **Slice-10 smoother scope**: a single shared `TwistSmoother` uses the MAX `kf_process_noise` over enabled sources (not per-source `q`/`r`; `r` fixed 1.0). The refined RTS covariance is computed + exposed but NOT wired into the calibrator vote weight (the deeper path still feeds the raw Σ-confidence) — D18's "refined Σ" is half-wired. Fixed ~7.5 MB footprint (compile-time caps 32×65, paid even when off). The lag `L` is a step count via the nominal tick rate → off-cadence pumping gives an effective time-lag ≠ `calib_lag_s` (rings stay step-aligned regardless). Per-source dropout degrades to a variance loss (no bias) after the push-seq alignment fix.
 - **Slice-12 persistence scope**: histogram BINS are not persisted — restore re-anchors the calibrators to the committed values + holds them via hysteresis (an `offset_restored` latch does the same for the time-offset DOF), so a restored DOF's `committed` flag + value are correct immediately but its confidence reads low until the histogram re-fills. `config_hash` covers rig shape + per-sensor priors/flags + histogram configs + commit/gate thresholds + `phase2_strategy`/`calib_lag_s` (runtime knobs excluded).
 - **Slice-13 adapters scope**: relaxed-edge only (std/heap/exceptions/threads/file IO). The ROS node is a compile-guarded header sketch (not built — no ROS on the dev box) → **13b**. The file-persistence adapter uses `flush`/`close`, NOT `fsync` — an OS-page-cache power-loss window remains even with the crash-safe target selection (durable `fsync` → **13b**). The config loader covers a documented knob SUBSET (not every `Config` field). Adapters are off by default (`OFC_BUILD_ADAPTERS=OFF`); the gate turns them on.
-- Not yet built: per-source bias states + GPS adapter (**11b — deferred, design A/B recorded in ISSUES 11b**), ROS node + durable fsync (13b). Partial: validation (14) — NEES/NIS/golden done + init-P covariance fix DONE (`70c7d38`); remaining = the CONFIG "tuned"-placeholder sweep + (for strict NEES consistency) a distance-aware covariance model / no-ref correction.
+- **Slice-11b bias scope**: **Option A done** — augmented 18-DOF filter for a SINGLE source that drives the predict ALONE (1-source / `ReferenceOnly` dead-reckon). Out-of-regime (a 2nd source joins the median) → `predict_aug_frozen` holds the learned bias + keeps `cov18_` consistent, but de-biases the *consensus* (an approximation; exact per-contribution de-bias is Option-B territory). Deferred: Option B (median-coupled multi-source), the per-`n` χ² gate, the GPS adapter.
+- Not yet built: 11b residual (Option B + per-`n` gate + GPS adapter), ROS node + durable fsync (13b). Partial: validation (14) — NEES/NIS/golden + init-P fix DONE (`70c7d38`); remaining = the CONFIG "tuned"-placeholder sweep + (for strict NEES consistency) a distance-aware covariance model / no-ref correction.
 
 ---
 
 ## 7. Resume in one line
 
-All numbered roadmap slices (0–14) are addressed and the init-P covariance fix has landed. Remaining work is carve-outs + polish:
-- **11b** (per-source bias states + GPS adapter + per-DOF Mahalanobis gate) — **DEFERRED with a design note** (`ISSUES.md` → Slice 11b DESIGN NOTE; DECISIONS D22): the open decision is **A** (clean-regime augmented filter, low risk) vs **B** (full median-coupled bias) — the user wants to revisit + decide after the rest is done (recommendation: A first).
+All numbered roadmap slices (0–14) are addressed; init-P fix + 11b Option A have landed. Remaining work is carve-outs + polish:
+- **11b residual** — Option A (single-driving-source bias) is DONE. Deferred: **Option B** (median-coupled multi-source bias — design in `ISSUES.md` Slice-11b DESIGN NOTE), the **per-`n` χ² Mahalanobis gate**, the concrete **GPS adapter**.
 - **13b** (real ROS node + bag round-trip + durable `fsync`) — env-blocked (no ROS on the dev box).
 - **Slice-14 CONFIG "tuned"-placeholder sweep**.
 - **distance-aware covariance model** (or a no-ref correction) for strict no-ref NEES consistency (counters the predict-only translation Ad-inflation).
