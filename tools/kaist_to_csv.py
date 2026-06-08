@@ -237,7 +237,13 @@ def write_manifest(out_dir, seq, yaw0):
         "[sensor.0]\nid = 0\nis_reference = true\ncsv = %s_wheel.csv\nform = increment\n\n"
         "[sensor.1]\nid = 1\ncsv = %s_wheelfog.csv\nform = increment\n\n"
         "[sensor.2]\nid = 2\ncsv = %s_wheelimu.csv\nform = increment\n\n"
-        "[gps]\ncsv = %s_gps.csv\nodom_from_enu_yaw = %.9f\nlever_x = -0.32\nlever_z = 1.7\ncov_floor_m2 = 0.0\n\n"
+        # lever = 0 (NOT the real ~1.93 m antenna height): the -R*[lever]x term in the GPS H
+        # couples a horizontal position residual into spurious roll/pitch (antenna-height x tilt),
+        # which over-rotates the estimate on LARGE residuals (urban12: tail 1322 m -> 63 m with
+        # lever=0). The cm-scale lever benefit isn't worth the km failure mode for a ground vehicle.
+        # (Deeper: the ESKF position update over-rotates on large innovations -- a core robustness
+        # item, not just this converter.)
+        "[gps]\ncsv = %s_gps.csv\nodom_from_enu_yaw = %.9f\nlever_x = 0.0\nlever_z = 0.0\ncov_floor_m2 = 0.0\n\n"
         "[gt]\ncsv = %s_gt.csv\n\n"
         "[replay]\nwarmup_steps = 20\n"
         % (seq, seq, seq, seq, -yaw0, seq)
