@@ -83,7 +83,7 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | `so3_hist` | HistogramConfig | — | — | Phase-1 direction (3-channel so(3)). |
 | `roll_hist` | HistogramConfig | — | — | Phase-2 roll (circular S¹). |
 | `xyz_hist` | HistogramConfig×3 | — | — | Phase-2 translation (3×1-D ℝ³). |
-| `scale_hist` | HistogramConfig | — | — | Per-source scale (1-D). |
+| `scale_hist` | HistogramConfig | **bins=64, range=[0.5,1.5]** | — | Per-source scale (1-D). **Defaults to `[0.5,1.5]`, NOT the generic `[-1,1]`** (`3bd91e2`): a scale is a positive ratio clustering at 1.0; on `[-1,1]` a unit ratio hits the half-open upper boundary → last-bin clamp → `mode()` returns the boundary-bin center (~0.984) → a true unit scale commits as 0.984 (was a real bug — masked by the old pinning median). The range must strictly contain 1.0; `validate()` now enforces this. |
 
 ## 8. Histogram primitive (`HistogramConfig`)
 
