@@ -130,6 +130,8 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - **File-persistence**: production double-buffer ping-pong on the Slice-12 core serialize/deserialize; **validity-based** overwrite-target selection (preserves the highest-seq blob `load()` accepts; a torn higher-seq file can't clobber the last-good) → crash-mid-write keeps last good.
 - **Threading wrapper** (`ThreadedEstimator`): a worker pumps `step()`, mutex-guarded `Result` snapshot; determinism vs single-thread reference.
 - **Config loader**: dependency-free key=value/INI → `Config` (documented knob subset; owns `vector<SensorConfig>`; duplicate-id + reference cross-check; runs core `validate()`).
+- **GPS correction adapter** (`GpsCorrection`, `4bce8d1`): geodetic GPS → WGS-84 ECEF → ENU → odom dim=3 position `ICorrection` (lever arm; datum/alignment config).
+- **Real-data CSV ingestion + replay** (`ddcf436`): `CsvSource : ISource` (generic CSV, 3 forms: absolute/increment/twist, hand-rolled dep-free parser, backed by `SourceBuffer`), `CsvGtTrack` (interpolated GT lookup), `ReplayHarness` (pumps `Estimator::step()` over a tick timeline; computes drift + 6-DOF NEES + GPS-fix NIS vs GT — the real-data analogue of the sim Rig), and the `ofc_replay` CLI (manifest = extended config-loader INI). Equivalence-tested: CSV ingestion == in-memory to 1e-6. **Unblocks real-dataset testing** (KITTI/KAIST/NCLT/EuRoC → CSV via a one-time conversion script). Schema + manifest in `adapters/README.md`.
 **Deferred → Slice 13b**: real ROS node + recorded-bag round-trip (no ROS on the dev box; a compile-guarded header sketch ships); a true `fsync` (the relaxed-edge adapter uses `flush`/`close`, leaving an OS-page-cache power-loss window).
 **Deps**: Slices 2, 12.
 
