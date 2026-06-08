@@ -128,7 +128,11 @@ def convert(kaist_root, out_dir, seq):
     fog = [(int(r[0]), float(r[1]), float(r[2]), float(r[3])) for r in read_rows(os.path.join(raw, "fog.csv"))]
     imu = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
            for r in read_rows(os.path.join(raw, "xsens_imu.csv"))]   # ts, qx,qy,qz,qw
-    gps = [(int(r[0]), float(r[1]), float(r[2]), float(r[3])) for r in read_rows(os.path.join(raw, "gps.csv"))]
+    # Use the VRS-RTK GPS (cm-level), NOT the consumer gps.csv: the consumer GPS is unreliable in
+    # urban canyons (outages -> frozen/stale fixes, multipath -> 100s-of-m errors) and CORRUPTS the
+    # fused estimate when fed as a position fix (verified: urban12 consumer-GPS tail drift 1863 m vs
+    # VRS-RTK 53 m). vrs_gps.csv cols: t, lat, lon, x_utm, y_utm, alt, fix, sats, ...
+    gps = [(int(r[0]), float(r[1]), float(r[2]), float(r[5])) for r in read_rows(os.path.join(raw, "vrs_gps.csv"))]
     gp = read_rows(os.path.join(raw, "global_pose.csv"))             # ts, 12 (3x4 row-major)
 
     # Align the whole run to the GT (global_pose) span: GT can start well after the encoder
@@ -192,10 +196,10 @@ def convert(kaist_root, out_dir, seq):
 
     # GPS CSV (geodetic -> GpsCorrection). pos var unknown here; use a modest 1 m^2 / 4 m^2 (up).
     with open(base_out + "_gps.csv", "w") as fg:
-        fg.write("# t_ns, lat_deg, lon_deg, alt_m, var_e, var_n, var_u\n")
+        fg.write("# t_ns, lat_deg, lon_deg, alt_m, var_e, var_n, var_u  (VRS-RTK)\n")
         for ts, lat, lon, alt in gps:
             if t0 <= ts <= tend:
-                fg.write("%d,%.10f,%.10f,%.6f,1,1,4\n" % (ts - t0, lat, lon, alt))
+                fg.write("%d,%.10f,%.10f,%.6f,0.25,0.25,1.0\n" % (ts - t0, lat, lon, alt))
 
     # GT: global_pose 3x4 [R|t] (UTM) -> first-relative (t0-vehicle frame).
     R0 = [[float(gp[0][1 + 4 * i + j]) for j in range(3)] for i in range(3)]
