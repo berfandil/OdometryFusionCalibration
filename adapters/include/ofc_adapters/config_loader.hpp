@@ -17,7 +17,8 @@
 //   max_sources, reference_sensor_id, window_s, fusion_delay_s, tick_rate_hz, calib_lag_s,
 //   cold_start (reference_only|median_from_start), commit_concentration, commit_min_votes,
 //   commit_drop, straight_omega_max, straight_trans_min, turn_omega_min, timesync_enabled,
-//   adaptive_q (bool), q_scale (f), q_floor (1 number -> all 6 axes, or 6 numbers [trans;rot]).
+//   adaptive_q (bool), q_scale (f), q_floor (1 number -> all 6 axes, or 6 numbers [trans;rot]),
+//   q_dist_trans (f), q_dist_rot (f) — distance-aware (motion-proportional) dead-reckoning Q; 0=off.
 // SUPPORTED PER-SENSOR KEYS ([sensor.N]):
 //   id, prior_extrinsic (yaw pitch roll x y z — 6 numbers, ZYX euler + translation),
 //   prior_scale, prior_time_offset_s, weight_prior, per_sensor_kf, scale_calib,

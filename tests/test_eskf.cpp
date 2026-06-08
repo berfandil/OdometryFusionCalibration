@@ -202,6 +202,50 @@ TEST_CASE("adaptive_q is exactly q_scale*spread^2 + floor (no /n_eff reduction; 
     CHECK((q_half(0, 0) - floor[0]) == doctest::Approx((q(0, 0) - floor[0]) * 0.5));
 }
 
+TEST_CASE("add_distance_q adds a motion-proportional dead-reckoning term (default off = no-op)") {
+    // A non-identity base q (with off-diagonals) so we can prove the off-diagonals are untouched.
+    Mat6 base = Mat6::Zero();
+    for (int i = 0; i < 6; ++i) base(i, i) = 0.01 * (i + 1);
+    base(0, 3) = 0.5;
+    base(3, 0) = 0.5;   // a non-zero off-diagonal pair
+
+    // A delta that moves ||t|| = 2 m and rotates ||log(R)|| = 0.5 rad about z.
+    SE3 delta;
+    delta.t = Vec3(0.0, 2.0, 0.0);                 // ||t|| = 2
+    delta.R = so3::exp(Vec3(0.0, 0.0, 0.5));       // ||log(R)|| = 0.5 rad
+
+    // k_trans == k_rot == 0 -> byte-identical no-op (the default-off invariant). Compare with
+    // EXACT equality (Eigen ==): the helper returns q unchanged, not merely close.
+    const Mat6 q_off = Eskf::add_distance_q(base, delta, 0.0, 0.0);
+    CHECK(q_off == base);                           // EXACTLY unchanged (byte-identical)
+
+    // Negative coefficients -> also a no-op (guarded), exactly unchanged.
+    const Mat6 q_neg = Eskf::add_distance_q(base, delta, -1.0, -1.0);
+    CHECK(q_neg == base);
+
+    // k_trans = 0.1 with ||t|| = 2 -> each trans diag grows by (0.1*2)^2 = 0.04; rot diags
+    // unchanged (k_rot = 0). Off-diagonals unchanged.
+    const Mat6 q_t = Eskf::add_distance_q(base, delta, 0.1, 0.0);
+    for (int i = 0; i < 3; ++i) CHECK(q_t(i, i) == doctest::Approx(base(i, i) + 0.04));
+    for (int i = 3; i < 6; ++i) CHECK(q_t(i, i) == doctest::Approx(base(i, i)));
+    CHECK(q_t(0, 3) == doctest::Approx(base(0, 3)));   // off-diagonal untouched
+    CHECK(q_t(3, 0) == doctest::Approx(base(3, 0)));
+
+    // k_rot = 0.2 with ||log(R)|| = 0.5 -> each rot diag grows by (0.2*0.5)^2 = 0.01; trans diags
+    // unchanged (k_trans = 0).
+    const Mat6 q_r = Eskf::add_distance_q(base, delta, 0.0, 0.2);
+    for (int i = 0; i < 3; ++i) CHECK(q_r(i, i) == doctest::Approx(base(i, i)));
+    for (int i = 3; i < 6; ++i) CHECK(q_r(i, i) == doctest::Approx(base(i, i) + 0.01));
+    CHECK(q_r(0, 3) == doctest::Approx(base(0, 3)));
+
+    // Both terms together (translation + rotation), off-diagonals still untouched.
+    const Mat6 q_both = Eskf::add_distance_q(base, delta, 0.1, 0.2);
+    for (int i = 0; i < 3; ++i) CHECK(q_both(i, i) == doctest::Approx(base(i, i) + 0.04));
+    for (int i = 3; i < 6; ++i) CHECK(q_both(i, i) == doctest::Approx(base(i, i) + 0.01));
+    CHECK(q_both(0, 3) == doctest::Approx(base(0, 3)));
+    CHECK(q_both(3, 0) == doctest::Approx(base(3, 0)));
+}
+
 // ---------------------------------------------------------------------------
 // Const-velocity tip extrapolation
 // ---------------------------------------------------------------------------

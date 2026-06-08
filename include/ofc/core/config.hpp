@@ -101,6 +101,14 @@ struct Config {
     // covariance grows between fixes and the absolute-fix Kalman gain can actually pull — the
     // adapters/GPS drift tests do exactly this test-locally. Left small here as the no-ref default.
     Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
+    // Motion-proportional (distance-aware) dead-reckoning process noise (CONFIG §3). The spread-
+    // derived adaptive Q cannot see COMMON-MODE drift (sources that agree yet drift together), so
+    // on real data it is overconfident; these grow the per-window pose process noise with the
+    // distance/rotation moved. Eskf::add_distance_q adds (q_dist_trans*||delta.t||)^2 to each
+    // translation diagonal and (q_dist_rot*||log(delta.R)||)^2 to each rotation diagonal. Default
+    // 0 = OFF (byte-identical to the spread-only behavior); a real deployment sets them.
+    Scalar     q_dist_trans   = 0.0;   // std growth per metre of per-window translation (>= 0)
+    Scalar     q_dist_rot     = 0.0;   // std growth per radian of per-window rotation (>= 0)
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;

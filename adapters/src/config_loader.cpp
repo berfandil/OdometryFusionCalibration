@@ -127,6 +127,7 @@ const char* kKnobDoc =
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
+    "  q_dist_trans=<f>   q_dist_rot=<f>   (distance-aware dead-reckoning Q; 0=off)\n"
     "[sensor.N]\n"
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
@@ -269,6 +270,12 @@ Status ConfigLoader::parse(const std::string& text) {
                 if (!parse_q_floor(val, cfg_.q_floor))
                     return fail("q_floor: 1 number (all axes) or 6 numbers [trans;rot]",
                                 line_no, raw);
+            } else if (key == "q_dist_trans") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.q_dist_trans = dv;
+            } else if (key == "q_dist_rot") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.q_dist_rot = dv;
             } else {
                 return fail("unknown global key '" + key + "'", line_no, raw);
             }

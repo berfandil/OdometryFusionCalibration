@@ -137,6 +137,30 @@ TEST_CASE("ConfigLoader: q_scale / q_floor / adaptive_q (the real-data covarianc
     }
 }
 
+TEST_CASE("ConfigLoader: q_dist_trans / q_dist_rot (distance-aware dead-reckoning Q; default 0)") {
+    // Default (unset) -> both 0 = OFF.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().q_dist_trans == doctest::Approx(0.0));
+        CHECK(loader.config().q_dist_rot == doctest::Approx(0.0));
+    }
+    // Explicitly set both keys -> parsed into Config.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "q_dist_trans = 0.05\nq_dist_rot = 0.01\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().q_dist_trans == doctest::Approx(0.05));
+        CHECK(loader.config().q_dist_rot == doctest::Approx(0.01));
+    }
+}
+
 TEST_CASE("ConfigLoader free function: copies sensor storage to the caller-owned vector") {
     const std::string text = "[sensor.0]\nid = 0\nis_reference = true\n";
     Config cfg;
