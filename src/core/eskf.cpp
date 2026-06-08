@@ -380,32 +380,4 @@ Mat6 Eskf::adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor) {
     return Q;
 }
 
-Mat6 Eskf::add_distance_q(const Mat6& q, const SE3& delta, Scalar k_trans, Scalar k_rot) {
-    // Motion-proportional (distance-aware) dead-reckoning term: the per-window common-mode drift
-    // grows with how far/much the window moved, which the inter-source spread (adaptive_q) cannot
-    // see. Adds (k_trans*||delta.t||)^2 to the 3 translation diagonals and (k_rot*||log(delta.R)||)^2
-    // to the 3 rotation diagonals; off-diagonals untouched. k <= 0 -> that term is skipped, so the
-    // default (k_trans=k_rot=0) returns q byte-identical (pre-existing behavior preserved).
-    Mat6 out = q;
-    if (k_trans > Scalar(0)) {
-        // ||delta.t|| is a norm (>= 0); the squared scaled distance is the variance contribution.
-        const Scalar dt = delta.t.norm();
-        const Scalar kd = k_trans * dt;
-        const Scalar qt = kd * kd;
-        out(0, 0) += qt;
-        out(1, 1) += qt;
-        out(2, 2) += qt;
-    }
-    if (k_rot > Scalar(0)) {
-        // ||log(delta.R)|| is the rotation angle of the window (>= 0).
-        const Scalar dth = so3::log(delta.R).norm();
-        const Scalar kr = k_rot * dth;
-        const Scalar qr = kr * kr;
-        out(3, 3) += qr;
-        out(4, 4) += qr;
-        out(5, 5) += qr;
-    }
-    return out;
-}
-
 } // namespace ofc

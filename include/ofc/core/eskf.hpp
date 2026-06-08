@@ -204,15 +204,6 @@ public:
     // median it over-divides Q and makes the filter overconfident.)
     static Mat6 adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor);
 
-    // Add a MOTION-PROPORTIONAL (distance-aware) term to a pose process-noise matrix: the
-    // per-window dead-reckoning uncertainty grows with how far/much the window moved (the
-    // inter-source spread cannot see common-mode drift, so q_scale*spread^2 alone is
-    // overconfident on real data). Adds (k_trans*||delta.t||)^2 to each of the 3 translation
-    // diagonal entries and (k_rot*||log(delta.R)||)^2 to each of the 3 rotation diagonal
-    // entries of q (q is the [trans;rot] pose process noise). k_trans/k_rot <= 0 -> no-op
-    // (returns q unchanged), so the default (0) is byte-identical to the pre-existing behavior.
-    static Mat6 add_distance_q(const Mat6& q, const SE3& delta, Scalar k_trans, Scalar k_rot);
-
     const State& state() const { return state_; }
     Mat12        cov()   const { return state_.cov; }
 

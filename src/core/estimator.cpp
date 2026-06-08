@@ -1293,13 +1293,6 @@ Status Estimator::step(Timestamp now) {
     } else {
         q_pose = Eskf::adaptive_q(Scalar(0), cfg.q_scale, cfg.q_floor);
     }
-    // Add the MOTION-PROPORTIONAL (distance-aware) dead-reckoning term to BOTH branches' q_pose,
-    // BEFORE it is handed to any predict path (predict / predict_aug / predict_aug_frozen), so every
-    // path gets it. The spread-only Q above cannot see common-mode drift (agreeing-yet-drifting
-    // sources -> overconfident P on real data); this grows the pose process noise with the window's
-    // motion (med.value is the fused consensus delta — the per-window motion, NOT med.spread).
-    // Default coeffs are 0 => add_distance_q returns q_pose UNCHANGED (byte-identical to pre-existing).
-    q_pose = Eskf::add_distance_q(q_pose, med.value, cfg.q_dist_trans, cfg.q_dist_rot);
 
     // ESKF predict on the median delta over the integrated interval [q0, t1] (dt is
     // the actual elapsed time, NOT a fixed window). Anchor the odom frame at the
@@ -1764,8 +1757,6 @@ Status validate(const Config& cfg) {
     for (int i = 0; i < 6; ++i) {
         if (cfg.q_floor[i] < 0.0) return Status::OutOfRange;   // each q_floor[i] >= 0
     }
-    if (cfg.q_dist_trans < 0.0 || cfg.q_dist_rot < 0.0)
-        return Status::OutOfRange;                       // distance-aware Q coeffs >= 0 (0 = off)
 
     // Time-sync knob ranges (CONFIG §5). Enforced here (config-standalone) as well as
     // inside TimeSync::configure() — so a caller validating config with timesync OFF
