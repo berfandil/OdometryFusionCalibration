@@ -77,15 +77,22 @@ struct Config {
     Scalar     weiszfeld_eps  = 1e-9;
     Scalar     metric_lambda  = 1.0;
     bool       adaptive_q     = true;
-    // Multiplier on the spread-derived adaptive Q (CONFIG §3). CALIBRATED (Slice-14 covariance
-    // sweep, was the un-calibrated 1.0 placeholder): chosen SAFETY-FIRST against the sim NEES
-    // harness across 4 trajectories (nees_traj, mixed, turning, long straight) x 2 noise levels,
-    // M=30 seeds. At 0.5 the worst-case ensemble-mean pose NEES is ~2.9 (1x noise) / ~3.5 (2x),
-    // i.e. mildly PESSIMISTIC and NEVER overconfident (<6 = DOF) on any trajectory. Lower values
-    // raised NEES toward 6 but broke the never-overconfident constraint under the 2x-noise
-    // model-mismatch proxy (q_scale=0.2 hit ~7 on `turning` at 1x), so 0.5 keeps a conservative
-    // margin (the sim under-states real-world model mismatch; mild pessimism is the safe side).
-    Scalar     q_scale        = 0.5;
+    // Multiplier on the spread-derived adaptive Q (CONFIG §3). RE-CALIBRATED against the TRUE
+    // interior robust median (D3 median fix) with the /n_eff reduction REMOVED (D4). The fixed
+    // median's spread is correctly sized (distance-to-centroid of the participating sources), so
+    // the calibration now targets genuine CONSISTENCY (NEES ~ DOF=6 from below) rather than the
+    // old pinning-median's pessimism. Chosen SAFETY-FIRST against the sim NEES harness across 4
+    // trajectories (nees_traj, mixed, turning, long straight) x 2 noise levels, M=30 seeds:
+    //   q_scale  worst-case ensemble-mean pose NEES (1x / 2x noise)
+    //     0.5      6.77 / 5.44   <- OVERCONFIDENT (>6) at 1x: REJECTED
+    //     0.7      4.85 / 3.89   <- chosen: closest to DOF=6 from below, never overconfident
+    //     1.0      3.40 / 2.73
+    //     1.5      2.27 / 1.82
+    //     2.0      1.71 / 1.36
+    // At 0.7 the worst-case is ~4.85 (1x) — near-consistent (NEES approaching DOF=6) yet NEVER
+    // overconfident on any trajectory at either noise level, keeping a conservative margin below
+    // 6 (the sim under-states real-world model mismatch, so we sit a touch below DOF, not on it).
+    Scalar     q_scale        = 0.7;
     // Per-axis minimum (additive) Q on the pose increment ([trans;rot]). Small by default: the
     // no-ref consistency objective wants the spread term to dominate (Slice-14 sweep showed a
     // larger floor only ADDS no-ref pessimism without helping multi-source rigs). DEPLOYMENT
@@ -94,15 +101,6 @@ struct Config {
     // covariance grows between fixes and the absolute-fix Kalman gain can actually pull — the
     // adapters/GPS drift tests do exactly this test-locally. Left small here as the no-ref default.
     Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
-    // Median-variance reduction of the adaptive Q (Slice 14, approach A; CONFIG §3). When true
-    // the estimator divides the spread-derived (adaptive) Q term by the participating fusion-
-    // median source count n (passed as adaptive_q's n_eff), because the geometric median of n
-    // agreeing sources has ~1/n the per-window variance of a single source — so the spread
-    // (inter-source DISAGREEMENT) over-states the FUSED accuracy by ~n and inflates the predict-
-    // only covariance. When false, n_eff = 1 is passed -> the old (un-reduced) covariance exactly.
-    // The floor and the non-adaptive (spread == 0) path are unaffected. RUNTIME knob (it shapes
-    // covariance magnitude, not the committed-calibration meaning) -> EXCLUDED from config_hash.
-    bool       adaptive_q_source_reduction = true;
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;

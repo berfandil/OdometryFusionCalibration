@@ -191,20 +191,18 @@ public:
     void predict_tip(Scalar dt_ahead, Scalar inflation, State& tip_out) const;
 
     // Build the 6x6 adaptive process noise from the inter-source spread:
-    //   q_pose = (q_scale * spread^2 / max(1, n_eff)) * I6 + diag(q_floor)
+    //   q_pose = (q_scale * spread^2) * I6 + diag(q_floor)
     // tight agreement (small spread) -> near the floor; disagreement -> grows
     // quadratically (DESIGN §4, DECISIONS D4). q_floor is a 6-vector in [trans; rot]
     // order; pass nullptr for no floor.
     //
-    // n_eff = participating fusion-median source count (Slice 14, approach A). The geometric
-    // median of n_eff agreeing sources has ~1/n_eff the per-window variance of a single source,
-    // so the spread-derived process noise (spread = inter-source DISAGREEMENT) is divided by
-    // n_eff to reflect the FUSED median's accuracy, not the raw disagreement (which over-states
-    // the fused error by ~n_eff and inflates the predict-only covariance). Only the SPREAD term
-    // is reduced — the floor is an additive per-axis minimum unaffected by the source count.
-    // n_eff defaults to 1 (no reduction) for back-compat with direct callers (test_eskf) and the
-    // n==1 single-source / bias-driving regime; clamped to >= 1 so it never divides by zero.
-    static Mat6 adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor, int n_eff = 1);
+    // spread is the weighted-RMS split-distance of the fused inputs to the TRUE interior
+    // robust median (median.cpp), i.e. the distance-to-centroid of the participating sources —
+    // already the correctly-sized per-window uncertainty of the fused delta. (The former
+    // /n_eff "median variance reduction" — Slice 14 approach A — was REMOVED in D4: it was a
+    // fudge that compensated for the OLD pinning median's INFLATED spread; with the fixed
+    // median it over-divides Q and makes the filter overconfident.)
+    static Mat6 adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor);
 
     const State& state() const { return state_; }
     Mat12        cov()   const { return state_.cov; }

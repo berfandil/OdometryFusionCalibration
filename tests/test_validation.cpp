@@ -33,12 +33,11 @@
 //   identity T_est o exp(e) == T_gt; that the COVARIANCE lives in this SAME tangent holds by
 //   eskf.cpp's full-SE(3)-Ad propagation (true by inspection of eskf.cpp, not asserted in
 //   this test). We pin the convention this way rather than by an "ensemble-mean NEES ~ DOF"
-//   band: because this filter's covariance is still mildly pessimistic (after the init-P fix
-//   it is ~17x, was ~46x under the old I_12 seed), EVERY sub-block's NEES is well below its
-//   DOF regardless of convention, so a NEES magnitude cannot distinguish right from wrong
-//   here. For a CORRECTLY-CALIBRATED linear-Gaussian filter the ensemble-mean NEES would sit
-//   near the DOF count (6); this one sits at ~0.35 after the init-P fix (was ~0.13 with the
-//   old P = I_12 seed) — see the Monte-Carlo case below for the full diagnosis.
+//   band: it is robust regardless of the filter's calibration. For a CORRECTLY-CALIBRATED
+//   linear-Gaussian filter the ensemble-mean NEES sits near the DOF count (6); after the D3
+//   median fix + the D4 removal of the /n_eff fudge + the q_scale recalibration to 0.7 this
+//   filter is NEAR-CONSISTENT (ensemble-mean pose NEES ~4.8 on nees_traj, approaching DOF=6
+//   from below with a deliberate conservative margin) — see the Monte-Carlo case below.
 //
 // MONTE-CARLO: the SAME scenario is run across an ensemble of M independent seeds (each
 // SyntheticSource's `seed` varies per run) with genuine injected noise so the covariance
@@ -285,7 +284,7 @@ TEST_CASE("validation NEES: e is se3::log's right-error tangent (right-not-left,
 }
 
 TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square interval, 6 "
-          "DOF) — residual PESSIMISM is predict-only Ad-inflation, not init-P") {
+          "DOF) — near-consistent after the D3 median fix + D4 /n_eff removal + q_scale recal") {
     // The non-vacuous consistency test. Ensemble-mean pose NEES over N steady-state samples
     // is compared to a chi-square consistency interval for 6 DOF. For N averaged samples the
     // sum N*nees ~ chi2(N*6) under the consistency hypothesis, so the bound on the MEAN is
@@ -307,52 +306,41 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     //   * INIT-P FIX (estimator.cpp first-fuse seeds P = 0 and lets the first predict() ESTABLISH
     //     P = blkdiag(q_pose, q_pose/dt^2) — the one-window process noise on the gauge-anchored
     //     pose — instead of I_12): raised NEES to ~0.35 (~2.7x; pessimism ~46x -> ~17x).
-    //   * MEDIAN-VARIANCE REDUCTION (Slice 14, approach A, THIS slice). The per-window adaptive Q
-    //     is spread^2 (spread = inter-source DISAGREEMENT), but the FUSED quantity is the geometric
-    //     MEDIAN of the n participating sources, whose per-window variance is ~1/n that of a single
-    //     source (n agreeing sources average down). So the spread-derived Q over-stated the fused
-    //     accuracy by ~n (=3 here) and the right-error Ad transport AMPLIFIED that into the
-    //     translation block. Dividing the spread term by n_eff = n (eskf.cpp adaptive_q, gated by
-    //     cfg.adaptive_q_source_reduction) made Q reflect the median's accuracy: NEES rose ~0.35 ->
-    //     ~1.0 (a further ~3x; pessimism ~17x -> ~6x). This is the parameter-free part of the fix.
-    //   * Q_SCALE CALIBRATION (Slice 14, the COVARIANCE-KNOB SWEEP, THIS slice). The q_scale
-    //     coefficient was the last un-calibrated piece: spread is an order-of-magnitude PROXY for the
-    //     true single-source per-window sigma, so q_scale=1 over-stated it. An offline grid (q_scale
-    //     in {1.0..0.1} x {nees_traj, mixed, turning, straight} x {1x,2x} noise, M=30, since deleted)
-    //     chose q_scale=0.5 SAFETY-FIRST: the largest pessimism cut whose worst-case ensemble-mean
-    //     NEES stays inside [2,4] and NEVER exceeds DOF=6 on ANY trajectory at either noise level
-    //     (q_scale=0.2 hit ~7 on `turning` = overconfident = unsafe). At 0.5 this trajectory's NEES
-    //     rose ~1.0 -> ~2.07 (pessimism ~6x -> ~3x). The remaining gap to 6 is INTENTIONAL: it is the
-    //     conservative pessimistic margin (the sim under-states real model mismatch), NOT a residual
-    //     bug. The cross-trajectory never-overconfident guard is test_cov_calibration.cpp.
-    // The filter is STILL NOT strictly chi-square-consistent (~2.07 < 6) BY DESIGN; the residual gap
-    // is now the deliberate safety margin, no longer an un-calibrated coefficient. The SHAPE is still
-    // the predict-only translation Ad-inflation:
-    //   * The right-error Ad(delta^-1) propagation transports the rotation uncertainty into the
-    //     TRANSLATION block via the [t]x R coupling as |t| grows: with the un-reduced Q the P
-    //     translation diagonal climbed to TENS of m^2 (~77 m^2 by ~32 m of travel — the earlier
-    //     "~2.5..5 m^2 by ~6 s" understated it: it keeps growing the whole run), while the actual
-    //     squared error grows far more slowly. The /n_eff reduction shrinks that runaway by ~n but
-    //     does NOT change its distance-growth SHAPE (that needs a distance-aware covariance model).
-    //     The ROTATION block has no such distance coupling, stays tighter, and is better calibrated.
-    //   * A predict-only filter has NO correction step to pull P back down between windows, so once
-    //     translation P inflates with distance it stays inflated. (Slice 11's absolute-ref
-    //     correction DOES shrink P when a ref is present — see the NIS case below, NIS ~2.83 vs
-    //     DOF 3, near-consistent.)
-    // Tuning the test's q_floor cannot help (it only ADDS to P); q_scale MULTIPLIES the spread term
-    // and is now CALIBRATED to 0.5 (the core default). A strictly chi-square-consistent predict-only
-    // Sigma on THIS trajectory would need q_scale ~0.17 — but that over-fits ONE trajectory and
-    // pushes others overconfident, so the safety-first 0.5 deliberately leaves the filter mildly
-    // pessimistic; a distance-aware covariance model (or denser corrections) is the remaining path
-    // to strict per-trajectory consistency. So per the honesty clause we: (a) compute + report the
-    // actual NEES and the chi-square bound it still (intentionally) sits below, and (b) assert a
-    // DOCUMENTED ACHIEVABLE band TIGHT around the calibrated value, making this a non-vacuous
-    // regression guard (a drift in either P or the tracking error breaks it, AND a regression of the
-    // default back toward q_scale=1 — mean ~1.04 — OR disabling the /n_eff reduction — mean ~0.70 —
-    // re-trips it; the knob-OFF guard is asserted explicitly below). Surfaced to the orchestrator:
-    // the init-P pessimism, the median-variance over-count (approach A), AND the q_scale coefficient
-    // (this sweep) are now all RESOLVED; the remaining gap to DOF is the chosen safety margin, with
-    // a distance-aware covariance model / denser corrections the path to strict consistency.
+    //   * MEDIAN PINNING BUG FIX (D3, THIS slice). The geometric-median solver INITIALIZED at the
+    //     highest-weight data vertex, where d_start=0 gave a self-weight w/eps (~1e9) that PINNED the
+    //     estimate on that vertex and "converged" in one iteration: fusion returned the highest-weight
+    //     INPUT verbatim (no blending) and the spread it reported was the distance-to-VERTEX, which is
+    //     INFLATED relative to a true interior median's distance-to-centroid. The fix initializes
+    //     off-vertex at the weighted mean (every d_i>0, the 1/d reweight engages) with a Vardi-Zhang
+    //     coincident-vertex guard, so the solver is now a TRUE interior robust median whose spread is
+    //     the correctly-sized distance-to-centroid.
+    //   * /n_eff REMOVAL (D4, THIS slice). A prior step divided the spread term by the participating
+    //     source count n ("the median of n agreeing sources has ~1/n the per-window variance"). That
+    //     rationale was FALSE for the OLD pinning median (it returned ONE source, no averaging); the
+    //     /n_eff was an empirical fudge compensating for the pinning median's INFLATED spread. With the
+    //     fixed (correctly-sized) spread the /n_eff OVER-divides Q and makes the filter overconfident
+    //     (it pushed NEES to ~19.8 at the old q_scale=0.5). So /n_eff is REMOVED (eskf.cpp adaptive_q
+    //     is now plain q_scale*spread^2 + floor); steps that calibrated AROUND the pinning bug are
+    //     superseded.
+    //   * Q_SCALE RECALIBRATION (D4 / the COVARIANCE-KNOB SWEEP, THIS slice). Against the TRUE median
+    //     with /n_eff removed, an offline grid (q_scale in {0.5,0.7,1.0,1.5,2.0} x {nees_traj, mixed,
+    //     turning, straight} x {1x,2x} noise, M=30, since deleted) chose q_scale=0.7 SAFETY-FIRST. The
+    //     worst-case ensemble-mean NEES per q_scale at 1x: 0.5->6.77 (OVERCONFIDENT, >6), 0.7->4.85,
+    //     1.0->3.40. 0.7 is the value that gets the worst-case CLOSEST to DOF=6 FROM BELOW while NEVER
+    //     overconfident on any trajectory at either noise level. This trajectory's NEES is ~4.8 at 0.7.
+    // The filter is now NEAR-CONSISTENT (~4.8 approaching DOF=6) rather than the old pessimistic ~2.07.
+    // The residual gap to 6 is INTENTIONAL: the conservative safety margin (the sim under-states real
+    // model mismatch, so we sit a touch below DOF, not on it), NOT a bug. The remaining SHAPE is the
+    // predict-only translation Ad-inflation: the right-error Ad(delta^-1) propagation transports the
+    // rotation uncertainty into the TRANSLATION block via the [t]x R coupling as |t| grows; a predict-
+    // only filter has NO correction step to pull P back down between windows. (Slice 11's absolute-ref
+    // correction DOES shrink P when a ref is present — see the NIS case below.) The cross-trajectory
+    // never-overconfident + near-consistent guard is test_cov_calibration.cpp. So per the honesty
+    // clause we: (a) compute + report the actual NEES and the chi-square interval it now sits just
+    // below, and (b) assert a DOCUMENTED ACHIEVABLE band around the calibrated value, making this a
+    // non-vacuous regression guard (a drift in P or the tracking error breaks it, a regression of the
+    // default back toward q_scale=1 — mean ~3.4 — trips the lower bound, and a return of the /n_eff
+    // fudge or the old pinning median — which would push NEES well past 6 — trips the upper bound).
     Trajectory tr = nees_traj();
     const int M = 30;
 
@@ -371,20 +359,17 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
         sp.noise_rot_floor   = 0.005;
     }
 
-    // Q knobs at the CALIBRATED core default (the Slice-14 covariance sweep, now DONE — see the
-    // diagnosis above): q_scale was lowered from the un-calibrated 1.0 placeholder to 0.5, chosen
-    // safety-first across {nees_traj, mixed, turning, straight} x {1x,2x} noise so the worst-case
-    // ensemble-mean NEES is mildly pessimistic (~2.9 at 1x, ~3.5 at 2x) and NEVER overconfident
-    // (<DOF=6) on any trajectory. We exercise that SAME 0.5 here (matching Config{}.q_scale) so the
-    // band below pins the calibrated value, not the old placeholder. The cross-trajectory never-
-    // overconfident + pessimism-reduced guard lives in test_cov_calibration.cpp.
-    const Scalar q_scale = Config{}.q_scale;   // the calibrated core default (0.5)
+    // Q knobs at the RECALIBRATED core default (D4 sweep, see the diagnosis above): q_scale = 0.7,
+    // chosen safety-first against the TRUE median with /n_eff removed so the worst-case ensemble-mean
+    // NEES approaches DOF=6 from below (~4.85 at 1x, ~3.9 at 2x) and is NEVER overconfident (>6) on
+    // any trajectory. We exercise that SAME 0.7 here (matching Config{}.q_scale) so the band below
+    // pins the calibrated value. The cross-trajectory never-overconfident + near-consistent guard
+    // lives in test_cov_calibration.cpp.
+    const Scalar q_scale = Config{}.q_scale;   // the recalibrated core default (0.7)
     const Scalar qf[6]   = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
 
-    // Run the ensemble once for a given reduction-knob setting and return the ensemble-mean NEES
-    // + N. Factored out so we can measure BOTH the reduction-ON value (the calibrated result) and
-    // the reduction-OFF value (the regression guard proving the knob still gates the /n_eff term).
-    auto run_ensemble = [&](bool source_reduction, long& N_out) -> Scalar {
+    // Run the ensemble once and return the ensemble-mean NEES + N.
+    auto run_ensemble = [&](long& N_out) -> Scalar {
         Scalar sum_nees = 0.0;
         long   N        = 0;
         for (int run = 0; run < M; ++run) {
@@ -395,7 +380,6 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
             for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
             std::vector<SensorConfig> sensors;
             Config cfg = nees_config(planted, sensors, q_scale, qf);
-            cfg.adaptive_q_source_reduction = source_reduction;
 
             Rig rig;
             rig.set_trajectory(tr);
@@ -418,9 +402,8 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
         return (N > 0) ? sum_nees / static_cast<Scalar>(N) : Scalar(0);
     };
 
-    // The slice's result: median-variance reduction ON (n_eff = n = 3 -> spread term / 3).
     long N = 0;
-    const Scalar mean_nees = run_ensemble(/*source_reduction=*/true, N);
+    const Scalar mean_nees = run_ensemble(N);
     REQUIRE(N > 1000);
 
     // Two-sided 99% chi-square interval on the mean for k = N*6 DOF, via Wilson-Hilferty:
@@ -444,47 +427,34 @@ TEST_CASE("validation NEES: Monte-Carlo covariance consistency (chi-square inter
     MESSAGE("NEES consistency: ensemble-mean=" << mean_nees << " DOF=6 N=" << N
             << " chi2 99% interval on mean=[" << lo_mean << ", " << hi_mean << "]"
             << "  truly_consistent=" << verdict
-            << "  (mean < 6 => still mildly PESSIMISTIC by design: init-P + median-variance "
-               "over-count RESOLVED, q_scale now CALIBRATED to 0.5; was ~0.13 (I_12 seed) -> "
-               "~0.35 (init-P fix) -> ~1.0 (/n_eff, q_scale=1) -> ~2.07 (q_scale=0.5 calibrated))");
+            << "  (mean ~4.8 approaches DOF=6 from below: NEAR-CONSISTENT with a conservative "
+               "safety margin after the D3 median fix + D4 /n_eff removal + q_scale recal to 0.7; "
+               "was ~0.13 (I_12 seed) -> ~0.35 (init-P fix) -> ~2.07 (old pinning median, "
+               "q_scale=0.5))");
 
-    // TRUE-CONSISTENCY verdict. THREE fixes have materially improved this in order: ~0.13 -> ~0.35
-    // (init-P fix), ~0.35 -> ~1.0 (the /n_eff median-variance reduction), ~1.0 -> ~2.07 (THIS slice:
-    // q_scale calibrated 1.0 -> 0.5). The remaining gap to strict chi-square consistency (~2.07 vs
-    // 6) is DELIBERATE and SAFETY-FIRST: forcing NEES to 6 on this single trajectory (q_scale ~0.17)
-    // would push OTHER trajectories overconfident (NEES > 6, unsafe) on the optimistic sim, so the
-    // calibration leaves a conservative pessimistic margin (worst-case ~2.9 across the set; see
-    // test_cov_calibration.cpp). So the verdict is INTENTIONALLY still FALSE — mild pessimism is the
-    // chosen safe operating point, not a failure to converge. (A distance-aware covariance model /
-    // denser corrections remain the path to strict per-trajectory consistency.)
-    CHECK_FALSE(truly_consistent);     // mildly PESSIMISTIC BY DESIGN (safety margin, never overconf)
+    // TRUE-CONSISTENCY verdict. The filter is now NEAR-CONSISTENT: ~4.8 on this trajectory,
+    // approaching DOF=6 from below. The chi2 99% interval on the mean for k=N*6 DOF is TIGHT
+    // (N in the thousands) and centered near 6, so ~4.8 lands just BELOW it -> truly_consistent
+    // is FALSE. That FALSE is now BY DESIGN as a deliberate, small SAFETY margin (not the old
+    // gross pessimism): forcing the worst-case trajectory exactly to 6 would push OTHER
+    // trajectories overconfident (NEES > 6, unsafe) on the optimistic sim, so the safety-first
+    // q_scale=0.7 leaves a conservative margin below DOF (worst-case ~4.85 across the set; see
+    // test_cov_calibration.cpp). So the verdict is INTENTIONALLY still FALSE — but now "near-
+    // consistent with a margin", not "pessimistic by design". (A distance-aware covariance model
+    // / denser corrections remain the path to sitting exactly on DOF per-trajectory.)
+    CHECK_FALSE(truly_consistent);     // NEAR-consistent, a hair below the interval (safety margin)
 
     // DOCUMENTED ACHIEVABLE BOUND (non-vacuous regression guard on the value the filter ACTUALLY
-    // produces at the CALIBRATED default q_scale=0.5, after the init-P fix + /n_eff reduction).
-    // Observed ensemble-mean ~2.07 (was ~1.04 at the old un-calibrated q_scale=1, ~0.35 with
-    // reduction OFF, ~0.13 under the old I_12 seed). The band [1.5, 2.7] brackets the calibrated
-    // value with headroom each side: it absorbs Monte-Carlo seed variation, yet a drift in EITHER
-    // the published covariance OR the fused-vs-GT tracking error breaks it — AND a regression of the
-    // default back toward q_scale=1 (mean ~1.04) trips the lower bound, as does disabling the
-    // /n_eff reduction (mean ~0.7 at this q_scale) or the old I_12 seed. It pins the calibrated,
-    // mildly-pessimistic covariance the filter emits today; it stays < DOF (6) -> never overconfident.
-    CHECK(mean_nees > 1.50);     // NOT regressed toward the old un-calibrated q_scale=1 (~1.04)
-    CHECK(mean_nees < 2.70);     // NOT overconfident (consistency would be ~6; safe margin kept)
-
-    // KNOB-OFF REGRESSION GUARD. Re-run the SAME ensemble with the median-variance reduction
-    // DISABLED: n_eff = 1 recovers the un-reduced covariance, so at q_scale=0.5 the mean drops to
-    // ~0.70 (the /n_eff reduction is worth ~n=3x). This proves (a) the knob still gates the /n_eff
-    // reduction, and (b) the reduction is a STRICT improvement (ON ~ n x OFF), independent of the
-    // q_scale calibration.
-    long N_off = 0;
-    const Scalar mean_nees_off = run_ensemble(/*source_reduction=*/false, N_off);
-    REQUIRE(N_off > 1000);
-    MESSAGE("NEES reduction-OFF guard: ensemble-mean=" << mean_nees_off
-            << " (expect ~0.70 at the calibrated q_scale=0.5 with /n_eff disabled)");
-    CHECK(mean_nees_off > 0.45);     // /n_eff disabled at q_scale=0.5 -> ~0.70
-    CHECK(mean_nees_off < 1.00);
-    // The reduction ON is materially LARGER than OFF (the /n_eff gain is real, ~n-fold not noise).
-    CHECK(mean_nees > mean_nees_off * 1.8);
+    // produces at the RECALIBRATED default q_scale=0.7, against the TRUE interior median with
+    // /n_eff removed). Observed ensemble-mean ~4.8 on nees_traj. The band [4.0, 5.6] brackets the
+    // calibrated value with headroom each side: it absorbs Monte-Carlo seed variation, yet a drift
+    // in EITHER the published covariance OR the fused-vs-GT tracking error breaks it — AND a
+    // regression of the default back toward q_scale=1 (mean ~3.4) trips the lower bound, while a
+    // return of the /n_eff fudge or the old pinning median (which inflate NEES well past 6) trips
+    // the upper bound. The upper bound stays just below DOF (6) -> the filter is never overconfident
+    // on this trajectory.
+    CHECK(mean_nees > 4.00);     // NOT regressed toward the un-calibrated q_scale=1 (~3.4)
+    CHECK(mean_nees < 5.60);     // NOT overconfident (< DOF=6; the /n_eff fudge or pinning would blow past)
 }
 
 // ===========================================================================
@@ -500,11 +470,10 @@ TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolu
     //
     // The correction step SHRINKS P toward the measurement (the Slice-14 covariance-
     // pessimism finding's fix WHEN a ref is present): repeated fixes pull P down toward a
-    // steady state set by the measurement noise, so unlike the predict-only NEES (~1.0 after the
-    // init-P fix + this slice's /n_eff median-variance reduction, still mildly pessimistic from
-    // the un-calibrated q_scale amplified by the distance-driven translation Ad-inflation) the NIS
-    // on the CORRECTED path is in a sane range. We use priors == planted (no
-    // calibration transient) + a clean position
+    // steady state set by the measurement noise, so unlike the predict-only NEES (~4.8 after the
+    // D3 median fix + D4 /n_eff removal + q_scale recal to 0.7, near-consistent with a small
+    // safety margin) the NIS on the CORRECTED path is in a sane range. We use priors == planted
+    // (no calibration transient) + a clean position
     // ref whose sim sigma_pos EQUALS the R the measurement reports, so the filter's noise
     // model matches the actual draw — the only honest way to expect NIS ~ DOF.
     //
@@ -532,7 +501,7 @@ TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolu
         sp.noise_rot_floor   = 0.005;
     }
 
-    const Scalar q_scale     = Config{}.q_scale;   // the calibrated core default (0.5), as the NEES case
+    const Scalar q_scale     = Config{}.q_scale;   // the recalibrated core default (0.7), as the NEES case
     const Scalar qf[6]       = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
     const Scalar sigma_pos   = 0.10;   // the ref's reported R sigma == the drawn noise sigma
 
@@ -596,29 +565,24 @@ TEST_CASE("validation NIS: Monte-Carlo innovation consistency of accepted absolu
             << " chi2 99% interval on mean=[" << lo_mean << ", " << hi_mean << "]"
             << "  consistent=" << verdict);
 
-    // EMPIRICAL OUTCOME: ensemble-mean NIS ~ 2.83 for DOF=3 at the CALIBRATED q_scale=0.5 — MILDLY
-    // conservative (just below the tight chi2 interval ~[2.91, 3.09]), a NIGHT-AND-DAY contrast with
-    // the predict-only NEES (~2.07 at the same calibrated default). The correction step pulls P down
-    // toward the measurement noise, so the innovation is normalized by a covariance close to the
-    // true error. The residual ~6% shortfall is P re-inflating between fixes (predict adds Q + the
-    // Ad propagation before the next fix), biasing S = HPH^T + R slightly HIGH. The q_scale
-    // calibration (1.0 -> 0.5, THIS slice) shrinks that between-fix Q further, so the re-inflation is
-    // smaller and the mean NIS moved UP toward DOF 3 (~2.69 at q_scale=1 -> ~2.83 at q_scale=0.5,
-    // LESS conservative) — the same mechanism that raised the predict-only NEES, seen from the
-    // corrected side. So the filter is NOT strictly chi-square-consistent yet, but is now in a SANE
-    // O(DOF) range — reported as a partial close of the Slice-14 covariance finding (full
-    // consistency would need a distance-aware covariance model and/or denser fixes; surfaced to the
-    // orchestrator). The CORRECTED-path NIS is set by the measurement noise + the between-fix
-    // re-inflation, so it is largely insensitive to the init-P seed (the correction dominates P
-    // within a few fixes) but DOES respond to the Q magnitude (the q_scale calibration) as noted.
+    // EMPIRICAL OUTCOME: ensemble-mean NIS ~ 2.73 for DOF=3 at the RECALIBRATED q_scale=0.7 — MILDLY
+    // conservative, just below the tight chi2 interval (~[2.91, 3.09]). The correction step pulls P
+    // down toward the measurement noise, so the innovation is normalized by a covariance close to
+    // the true error. The residual shortfall is P re-inflating between fixes (predict adds Q + the
+    // Ad propagation before the next fix), biasing S = HPH^T + R slightly HIGH. So the filter is in
+    // a sane consistency band on the corrected path — reported as a partial close of the Slice-14
+    // covariance finding (full per-trajectory consistency would need a distance-aware covariance
+    // model and/or denser fixes; surfaced to the orchestrator). The CORRECTED-path NIS is set by the
+    // measurement noise + the between-fix re-inflation, so it is largely insensitive to the init-P
+    // seed (the correction dominates P within a few fixes) but DOES respond to the Q magnitude (the
+    // q_scale recalibration).
     //
-    // ACHIEVABLE BAND (non-vacuous regression guard on the value the filter ACTUALLY
-    // produces). Pins the observed ~2.83 while absorbing Monte-Carlo seed variation; a ~1.3x
-    // drift in EITHER the published covariance OR the tracking error breaks it. Stays well
-    // clear of both the pessimistic (<<1) and overconfident (>>DOF) failure modes. (Band kept at
-    // [1.5, 3.5]: the calibrated ~2.83 still sits comfortably inside it with headroom both
-    // sides, and 3.5 stays below the DOF=3 overconfidence line + the ~3.09 chi2 upper bound.)
-    CHECK(mean_nis > 1.5);     // NOT collapsed like the predict-only NEES
+    // ACHIEVABLE BAND (non-vacuous regression guard on the value the filter ACTUALLY produces).
+    // Pins the observed ~2.9 while absorbing Monte-Carlo seed variation; a drift in EITHER the
+    // published covariance OR the tracking error breaks it. Stays clear of both the pessimistic
+    // (<<1) and overconfident (>>DOF) failure modes. Band kept at [1.5, 3.5]: the value sits inside
+    // it with headroom both sides, and 3.5 stays below the DOF=3 overconfidence line.
+    CHECK(mean_nis > 1.5);     // NOT collapsed
     CHECK(mean_nis < 3.5);     // NOT overconfident (would blow past DOF)
 }
 
