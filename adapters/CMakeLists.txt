@@ -12,6 +12,8 @@ add_library(ofc_adapters STATIC
     src/threaded_estimator.cpp
     src/config_loader.cpp
     src/gps_correction.cpp
+    src/csv_source.cpp
+    src/replay_harness.cpp
 )
 target_include_directories(ofc_adapters PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ofc_adapters PUBLIC ofc_core Eigen3::Eigen)
@@ -44,6 +46,7 @@ if (OFC_BUILD_TESTS)
         tests/test_threaded_estimator.cpp
         tests/test_config_loader.cpp
         tests/test_gps_correction.cpp
+        tests/test_csv_source.cpp
     )
     target_link_libraries(ofc_adapters_tests PRIVATE ofc_core ofc_adapters doctest::doctest)
     set_target_properties(ofc_adapters_tests PROPERTIES
@@ -55,3 +58,12 @@ if (OFC_BUILD_TESTS)
     enable_testing()
     add_test(NAME adapters COMMAND ofc_adapters_tests)
 endif()
+
+# ---- ofc_replay CLI (real-data replay tool) --------------------------------------------
+# A thin standalone CLI the USER runs on real CSVs (see tools/ofc_replay/main.cpp). Built only
+# alongside the adapters (this whole subdir is added only when OFC_BUILD_ADAPTERS is ON), so the
+# default core build is unaffected.
+add_executable(ofc_replay ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ofc_replay/main.cpp)
+target_link_libraries(ofc_replay PRIVATE ofc_core ofc_adapters Eigen3::Eigen)
+set_target_properties(ofc_replay PROPERTIES
+    CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)

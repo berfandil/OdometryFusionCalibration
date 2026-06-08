@@ -41,3 +41,124 @@ frontier time because its "fix" is sampled at the frontier).
 > never re-inflates between fixes, so the Kalman gain collapses and a fix barely pulls. A realistic
 > translation `q_floor` (the odometry-is-uncertain floor) is what lets a GPS fix actually correct
 > the drift — see the end-to-end test.
+
+## Real-data ingestion: CSV source + GT track + replay harness + `ofc_replay` CLI (Slice 13)
+
+Until now the system was exercised only by the **sim rig** (synthetic sources sampled from ground
+truth). This scaffolding lets the sim-validated system run on a **real dataset**: a generic-CSV
+`ISource`, a GT-track reader, an offline replay+eval harness, and a thin CLI. The user converts any
+public dataset (KITTI/EuRoC/…) to the CSV schema below with a small script. Dependency-free (Eigen
++ doctest only — the CSV is parsed by hand, **no csv library**).
+
+### `CsvSource` (`csv_source.hpp`) — a file-backed `ISource`
+
+Loads a CSV into a `SourceBuffer` (the **same** buffer the sim's `SyntheticSource::build_buffer`
+uses) and answers `query(t0,t1)` straight from it — so the CSV ingestion path is **equivalent** to
+the in-memory path (proven by the equivalence test). The native form is chosen by a `# form: <tag>`
+header line **or** the `CsvSourceConfig::form` ctor arg (`force_form=true` makes the arg win and
+rejects a disagreeing tag). Quaternion is **(qw, qx, qy, qz)** w-first, normalized on read.
+
+CSV schema (numbers decimal; `#`/`//`/blank lines skipped; a leading non-numeric header row
+tolerated; whitespace trimmed; **comma OR whitespace** delimited):
+
+```
+# form: absolute        (or: increment, or: twist)
+# absolute / increment:
+t_ns, x, y, z, qw, qx, qy, qz [, var_tx, var_ty, var_tz, var_rx, var_ry, var_rz]
+# twist:
+t_ns, vx, vy, vz, wx, wy, wz [, var_tx, var_ty, var_tz, var_rx, var_ry, var_rz]
+```
+
+* `t_ns` — sample time (ns, int64), strictly increasing.
+* **absolute** — `x,y,z`+quat is the cumulative pose in the source's own integrated frame.
+  **increment** — the per-step relative motion from the previous row (the first row is the identity
+  seed). **twist** — body linear `vx,vy,vz` (m/s) + angular `wx,wy,wz` (rad/s).
+* The optional trailing **6** numbers are the per-step increment covariance **diagonal** in
+  `[trans; rot]` order (for `twist`, the per-**second** twist covariance). Absent → the buffer's
+  modeled-cov path is used (combined per `Config::conf_combine`).
+
+A malformed row (bad number/quaternion, wrong column count, non-increasing stamp) returns a
+`Status` + a human `error()` string with the line number; `< 2` rows → `NoData`.
+
+### `CsvGtTrack` (`csv_source.hpp`) — a GT absolute-pose track (eval only)
+
+```
+t_ns, x, y, z, qw, qx, qy, qz       (no covariance columns; extra columns ignored)
+```
+
+`pose_at(t)` returns the **linearly SE(3)-interpolated** (`se3::interpolate`) pose between the two
+bracketing samples, clamped at the ends.
+
+### `ReplayHarness` (`replay_harness.hpp`) — offline replay + eval
+
+The real-data analogue of the sim `Rig`. Given a `Config` + a set of `CsvSource`s + an optional
+`GpsCorrection` (+ a sorted `std::vector<GpsFix>`) + an optional `CsvGtTrack`, it:
+merges the source spans into a regular tick timeline at `tick_rate_hz` (folding in each GPS-fix
+frontier tick), submits each GPS fix just before the step whose frontier reaches its stamp, calls
+`Estimator::step()` at each tick, and records per published step the frontier pose (t + w-first
+quat) + the 12×12 cov diagonal, tip, per-source `CalibSnapshot`, and `CorrectionDiag`. The GT pose
+is anchored exactly as the sim Rig (at the GT pose at `first_frontier − window_s`, DESIGN §7) so the
+frontier-vs-GT error compares like-for-like.
+
+With a GT track it also computes, per step:
+`trans_err_m = ‖frontier.t − gt.t‖`, `rot_err_rad = ‖so3::log(gt.Rᵀ frontier.R)‖`, and the **6-DOF
+pose NEES** `e = se3::log(T_estⁱⁿᵛ ∘ T_gt)`, `nees = eᵀ (P_pose)⁻¹ e` (P_pose = `frontier.cov(0..5)`)
+— the **exact** convention of `tests/test_validation.cpp pose_nees`. The **NIS** of accepted GPS
+fixes is read from `CorrectionDiag.last_nis` on steps with `corr_applied > 0`. `RunSummary`
+aggregates max/RMS/tail drift, ensemble-mean pose NEES (target ~DOF=6), and mean accepted-GPS NIS
+(target ~DOF=3). `write_results_csv()` emits the per-step CSV + a trailing `# summary:` block.
+
+### `ofc_replay` CLI (`tools/ofc_replay/main.cpp`)
+
+`ofc_replay <manifest.ini> [results_out.csv]` — reads a manifest, loads the CsvSources / GPS fixes /
+GT track, runs the harness, writes the results CSV, and prints the summary to stdout. Built only
+when `OFC_BUILD_ADAPTERS=ON` (so the default core build is unaffected).
+
+The **manifest** is the `config_loader` INI format **extended** with per-source CSV paths, a GPS
+block, a GT block, and replay knobs. Extension keys (`csv`/`form` in `[sensor.N]`; the whole
+`[gps]`/`[gt]`/`[replay]` sections) are consumed by the CLI; every other line is passed through to
+the existing `ConfigLoader` (so the core `Config` is validated normally). Concrete example:
+
+```ini
+[global]
+tick_rate_hz = 50
+fusion_delay_s = 0.05
+window_s = 0.10
+max_sources = 2
+reference_sensor_id = 0
+cold_start = median_from_start
+
+[sensor.0]
+id = 0
+is_reference = true
+csv = data/odom0.csv         ; EXTENSION: the CSV for this source
+form = increment             ; EXTENSION: absolute|increment|twist (else the file's # form: tag)
+
+[sensor.1]
+id = 1
+csv = data/odom1.csv
+form = increment
+
+[gps]                        ; EXTENSION (optional): the absolute ref
+csv = data/gps.csv           ; rows: t_ns, lat_deg, lon_deg, alt_m [, var_e, var_n, var_u]
+datum_lat_deg = 47.0         ; omit the 3 datum_* to lazily latch the first fix
+datum_lon_deg = 8.0
+datum_alt_m = 400.0
+odom_from_enu_yaw = 0.0      ; ENU->odom yaw (rad)
+lever_x = 0.0
+lever_y = 0.0
+lever_z = 0.0                ; antenna lever in the base frame (m)
+cov_floor_m2 = 0.0
+
+[gt]                         ; EXTENSION (optional): GT track (eval only)
+csv = data/gt.csv            ; rows: t_ns, x, y, z, qw, qx, qy, qz
+
+[replay]                     ; EXTENSION (optional): harness knobs
+tail_window_s = 1.0
+warmup_steps = 20
+out = results.csv
+```
+
+GPS fix CSV schema (one fix per row): `t_ns, lat_deg, lon_deg, alt_m [, var_e, var_n, var_u]`
+(ENU position variances in m²; absent → 1 m² isotropic). The CLI submits fixes against the harness
+timeline so `step()` consumes each at the matching frontier.
