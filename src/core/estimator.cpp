@@ -1786,7 +1786,19 @@ Status validate(const Config& cfg) {
         if (bias_sources > 1) return Status::InvalidConfig;   // Option A: single bias source only
     }
 
-    // TODO: per-sensor + histogram range checks.
+    // Scale histogram range check (D19). The SCALE quantity is a strictly-positive RATIO
+    // (bn/ref_mag) whose calibrated value clusters around a UNIT ratio (1.0). A scale_hist
+    // range that does not STRICTLY contain 1.0 cannot represent a unit residual as an interior
+    // bin: 1.0 (or the whole well-mounted cluster) falls on/over a boundary, clamps into an edge
+    // bin, and mode()'s parabolic refine degrades to the edge bin's center — so a unit residual
+    // commits an off-by-a-bin scale that the rising-edge feedback then folds into prior_scale.
+    // Reject such a misconfigured scale histogram here. Kept scale_hist-SPECIFIC: the signed
+    // so(3)/roll/xyz/offset histograms are centered on 0 and intentionally span [-1, 1]-style
+    // ranges, so they are NOT range-checked against 1.0. (The bin-count / aging / gamma bounds
+    // for every histogram are still enforced by Histogram1D::configure at setup.)
+    if (!(cfg.scale_hist.range_min < 1.0 && cfg.scale_hist.range_max > 1.0))
+        return Status::OutOfRange;
+
     return Status::Ok;
 }
 

@@ -146,7 +146,16 @@ struct Config {
     HistogramConfig so3_hist;
     HistogramConfig roll_hist;
     HistogramConfig xyz_hist;
-    HistogramConfig scale_hist;
+    // SCALE is a strictly-positive RATIO (bn/ref_mag) whose calibrated value clusters around a
+    // UNIT ratio (1.0) for a well-mounted source. The generic HistogramConfig default range of
+    // [-1, 1] is WRONG for a scale: 1.0 lands exactly on the (half-open) upper boundary, clamps
+    // into the last bin, and — being a boundary bin with no right neighbor — the parabolic
+    // sub-bin refine in mode() falls back to that bin's CENTER (~0.984 at 64 bins), so a true
+    // unit residual COMMITS ~0.984 instead of 1.0 and the rising-edge feedback folds the error
+    // into prior_scale. Default this field to a positive-ratio range with 1.0 STRICTLY INTERIOR
+    // ([0.5, 1.5] — the convention every dedicated calibration test already uses), keeping the
+    // generic bin-count / aging defaults. The other (signed) histograms keep [-1, 1].
+    HistogramConfig scale_hist{ /*bins=*/64, /*range_min=*/0.5, /*range_max=*/1.5 };
     HistogramConfig offset_hist;
 
     // Absolute refs

@@ -429,23 +429,11 @@ Config make_rig_config(const std::vector<SourceParams>& planted,
         sc.prior_extrinsic = sp.X;          // prior == planted
         sc.prior_scale     = sp.scale;
         sc.weight_prior    = 1.0;
-        // ISOLATE FUSION TRACKING from the scale-calibration FEEDBACK (D3 median-fix follow-up).
-        // These cases test that the FUSED frontier tracks GT with priors == planted — the rig
-        // comment above says "no calibration needed". With scale_calib ON, the Phase-1 scale
-        // calibrator commits a small spurious residual (~0.984 = 63/64, a coarse-histogram /
-        // bootstrap-window artifact, NOT 1.0) on the first feedback step and the rising-edge
-        // re-anchor folds it into prior_scale; the next frame-align then de-scales the MOUNTED
-        // sources by that wrong factor, so their aligned delta drifts ~1.6% from GT. The OLD
-        // PINNING median was IMMUNE — it returned the highest-weight (reference) vertex whose
-        // prior_scale stays 1.0 — so this corruption was masked. The D3 fix makes the median a
-        // TRUE interior blend, which correctly includes the now-mis-scaled sources, so the
-        // consensus drifts and max_te grew to ~0.17 over the run. That blend is the CORRECT robust
-        // behavior; the drift is the calibration feedback, not the fusion. Since calibration is
-        // NOT the property under test here (the dedicated test_calib_* / test_weights cover it),
-        // we turn scale_calib OFF to isolate fusion tracking and keep the TIGHT GT tolerance.
-        // ReferenceOnly cold-start also avoids it (non-reference sources do not join the median
-        // until their extrinsic commits, by which point the prior is trustworthy).
-        sc.scale_calib     = false;
+        // scale_calib stays ON (the SensorConfig default). With the scale_hist default range
+        // fixed to [0.5, 1.5] (1.0 strictly interior), a source whose true residual scale is a
+        // UNIT ratio now COMMITS 1.0 (not the old ~0.984 boundary-bin artifact), so the
+        // rising-edge feedback leaves prior_scale unchanged and the fused frontier tracks GT
+        // tightly. This re-enables the scale-calibration coverage the old workaround removed.
         sensors_out.push_back(sc);
     }
     Config c;

@@ -804,11 +804,17 @@ TEST_CASE("validation golden: committed numeric values (noise-free, portable) â€
     CHECK(max_re < 1e-9);
 
     // Final-tick calib snapshot for source 1 (pins the calibrator's running output: the
-    // scale estimate mid-convergence + the per-DOF confidences, all deterministic here).
+    // scale estimate + the per-DOF confidences, all deterministic here). Source 1 plants
+    // scale 1.1 with prior_scale == 1.1, so the residual scale ratio is a UNIT ratio (1.0)
+    // and the committed scale reads the true planted 1.1. (BEFORE the scale_hist default-range
+    // fix this golden read 1.08281 == 1.1 * 0.984375, where 0.984375 was the LAST-bin center of
+    // the generic [-1, 1] scale histogram onto which a unit ratio clamped â€” the boundary-bin
+    // artifact. golden_config leaves scale_hist at its default, so the fix moves this value to
+    // the correct 1.1; regenerated per the golden-drift policy in this test's header.)
     const Result& last = fused.back()->result;
     const CalibSnapshot* c1 = find_calib(last, 1);
     REQUIRE(c1 != nullptr);
-    CHECK(std::abs(c1->scale - 1.08281) < 1e-4);
+    CHECK(std::abs(c1->scale - 1.1) < 1e-4);
     CHECK(std::abs(c1->extrinsic_confidence   - 1.0) < 1e-4);
     CHECK(std::abs(c1->scale_confidence       - 1.0) < 1e-4);
     CHECK(std::abs(c1->translation_confidence - 1.0) < 1e-4);

@@ -230,6 +230,57 @@ TEST_CASE("phase1 convergence: recovers planted yaw/pitch + scale on straight mo
 }
 
 // ===========================================================================
+// REGRESSION (scale_hist default range): a UNIT residual scale commits ~1.0
+// ===========================================================================
+// Guards the boundary-bin bug: the generic HistogramConfig default range is
+// [-1, 1], on which a unit ratio (1.0) lands on the half-open upper boundary,
+// clamps into the last bin, and — having no right neighbor — mode() falls back
+// to that bin's CENTER (~0.984 at 64 bins), committing 0.984 instead of 1.0.
+// The fix gives Config::scale_hist its OWN default range ([0.5, 1.5], 1.0
+// strictly interior). This test uses the DEFAULT scale_hist (it does NOT
+// override the range) and feeds the calibrator unit-ratio scale votes directly,
+// asserting the committed scale is ~1.0 (not 0.984).
+TEST_CASE("phase1 regression: default scale_hist commits a unit residual at ~1.0") {
+    auto calp = make_calib(); Phase1Calibrator& cal = *calp;
+
+    // A config that LEAVES scale_hist at its struct default (the very field under
+    // test). Only so3_hist is widened so the straight gate behaves; scale_hist is
+    // untouched, so this exercises the default [0.5, 1.5] range introduced by the fix.
+    Config c;
+    c.tick_rate_hz        = 50.0;
+    c.reference_sensor_id = 0;
+    c.straight_omega_max  = 0.05;
+    c.straight_trans_min  = 0.02;
+    c.so3_hist.bins       = 512;
+    c.so3_hist.range_min  = -0.8;
+    c.so3_hist.range_max  =  0.8;
+    // scale_hist: DEFAULT (do not override) — this is the fix under test.
+
+    // Sanity: the default scale range strictly contains a unit ratio (else 1.0 cannot
+    // be represented as an interior bin and the boundary-bin regression returns).
+    REQUIRE(c.scale_hist.range_min < Scalar(1.0));
+    REQUIRE(c.scale_hist.range_max > Scalar(1.0));
+
+    REQUIRE(cal.configure(c, /*reference=*/0) == Status::Ok);
+    REQUIRE(cal.set_prior(0, SE3{}, /*scale_calib=*/true) == Status::Ok);
+    REQUIRE(cal.set_prior(1, SE3{}, /*scale_calib=*/true) == Status::Ok);
+
+    // Reference + a planted source that report the SAME forward magnitude => the scale
+    // vote bn/ref_mag is exactly 1.0 every step. Straight motion (small omega, sizable
+    // translation) so the gate votes.
+    SourceId ids[2] = {0, 1};
+    SE3      rep[2];
+    rep[0].R = Mat3::Identity(); rep[0].t = Vec3(0.1, 0, 0);   // reference: |t| = 0.1
+    rep[1].R = Mat3::Identity(); rep[1].t = Vec3(0.1, 0, 0);   // planted:   |t| = 0.1 -> ratio 1.0
+    for (int k = 0; k < 300; ++k) {
+        REQUIRE(cal.observe(2, ids, rep, Vec3(0, 0, 0.0), Vec3(0.1, 0, 0)) == Status::Ok);
+    }
+
+    // The committed scale is the UNIT ratio, NOT the old ~0.984 boundary-bin artifact.
+    CHECK(near_abs(cal.scale(1), 1.0, 1e-3));
+}
+
+// ===========================================================================
 // Observability self-test (LOAD-BEARING): turning-only -> NO convergence
 // ===========================================================================
 TEST_CASE("phase1 observability: turning-only does NOT converge (stays near prior)") {
