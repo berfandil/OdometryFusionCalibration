@@ -24,3 +24,6 @@ compile_commands.json
 
 # Persistence snapshots (runtime artifacts)
 *.ofc-state
+
+# FetchContent offline cache (local dev workaround; not source)
+/.deps_cache/

@@ -169,9 +169,11 @@ TEST_CASE("cov calibration: at the calibrated default q_scale every trajectory's
     const Scalar dof          = 6.0;
     const Scalar overconf_cap = 5.5;     // hard upper guard (conservative margin below DOF=6)
     // The calibration must keep every trajectory NEAR-CONSISTENT (well above the old gross-pessimism
-    // regime). Observed lowest across the set is `turning` ~2.0 at 1x; 1.6 leaves headroom while
-    // still tripping if the default regresses UP toward q_scale=1 (more pessimistic, ~3.4 worst /
-    // turning ~1.4) or further.
+    // regime). Observed lowest across the set is `turning` ~2.0 at 1x; `pessimism_lo = 1.3` is a
+    // generous per-trajectory FLOOR (it sits below `turning`'s ~2.0 so it does not trip on normal
+    // seed variation). It is NOT the q_scale-regression guard — a regression UP toward q_scale=1
+    // only drops `turning` to ~1.4 (still > 1.3); the real up-regression detector is the
+    // nees_new > nees_old*1.25 ratio CHECK below.
     const Scalar pessimism_lo = 1.3;
 
     for (const Entry& e : trajs) {
