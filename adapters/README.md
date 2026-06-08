@@ -127,6 +127,10 @@ window_s = 0.10
 max_sources = 2
 reference_sensor_id = 0
 cold_start = median_from_start
+; process-noise knobs (covariance tuning for real data, esp. single/low-spread-source runs):
+adaptive_q = true            ; derive Q from inter-source spread
+q_scale = 0.7                ; spread-derived Q multiplier
+q_floor = 0.01               ; per-axis Q floor: 1 number (all 6) OR 6 numbers [trans;rot]
 
 [sensor.0]
 id = 0

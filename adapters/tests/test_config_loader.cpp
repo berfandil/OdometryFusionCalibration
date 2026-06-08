@@ -98,6 +98,45 @@ TEST_CASE("ConfigLoader ownership: the built Config outlives via the loader's ow
     CHECK(loader.config().sensor_count == 2);
 }
 
+TEST_CASE("ConfigLoader: q_scale / q_floor / adaptive_q (the real-data covariance enabler)") {
+    // Scalar q_floor -> applied to ALL 6 axes; adaptive_q + q_scale parsed.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "adaptive_q = false\nq_scale = 0.5\nq_floor = 0.01\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK_FALSE(c.adaptive_q);
+        CHECK(c.q_scale == doctest::Approx(0.5));
+        for (int i = 0; i < 6; ++i) CHECK(c.q_floor[i] == doctest::Approx(0.01));
+    }
+    // 6-number q_floor -> per-axis [trans; rot].
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "q_floor = 0.1 0.2 0.3 0.4 0.5 0.6\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Scalar* qf = loader.config().q_floor;
+        CHECK(qf[0] == doctest::Approx(0.1));
+        CHECK(qf[3] == doctest::Approx(0.4));
+        CHECK(qf[5] == doctest::Approx(0.6));
+    }
+    // Malformed q_floor (2 numbers, neither 1 nor 6) -> clear error, not Ok.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "q_floor = 0.1 0.2\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) != Status::Ok);
+        CHECK(loader.error().find("q_floor") != std::string::npos);
+    }
+}
+
 TEST_CASE("ConfigLoader free function: copies sensor storage to the caller-owned vector") {
     const std::string text = "[sensor.0]\nid = 0\nis_reference = true\n";
     Config cfg;

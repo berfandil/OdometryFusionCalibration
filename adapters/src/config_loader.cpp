@@ -103,6 +103,20 @@ bool parse_extrinsic(const std::string& v, SE3& out) {
     return true;
 }
 
+// q_floor: 1 number (applied to ALL 6 axes) OR 6 numbers (per-axis, [trans; rot] order).
+bool parse_q_floor(const std::string& v, Scalar out[6]) {
+    std::istringstream is(v);
+    double vals[6];
+    int n = 0;
+    double d;
+    while (n < 6 && (is >> d)) vals[n++] = d;
+    double extra;
+    if (is >> extra) return false;                       // > 6 numbers
+    if (n == 1) { for (int i = 0; i < 6; ++i) out[i] = static_cast<Scalar>(vals[0]); return true; }
+    if (n == 6) { for (int i = 0; i < 6; ++i) out[i] = static_cast<Scalar>(vals[i]); return true; }
+    return false;                                        // must be exactly 1 or 6 numbers
+}
+
 const char* kKnobDoc =
     "ofc config (key=value / INI). '#' or ';' comment. Sections: [global], [sensor.N].\n"
     "[global]\n"
@@ -112,6 +126,7 @@ const char* kKnobDoc =
     "  commit_concentration=<f>     commit_min_votes=<int>   commit_drop=<f>\n"
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
+    "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "[sensor.N]\n"
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
@@ -244,6 +259,16 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "timesync_enabled") {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.timesync_enabled = bv;
+            } else if (key == "adaptive_q") {
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.adaptive_q = bv;
+            } else if (key == "q_scale") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.q_scale = dv;
+            } else if (key == "q_floor") {
+                if (!parse_q_floor(val, cfg_.q_floor))
+                    return fail("q_floor: 1 number (all axes) or 6 numbers [trans;rot]",
+                                line_no, raw);
             } else {
                 return fail("unknown global key '" + key + "'", line_no, raw);
             }

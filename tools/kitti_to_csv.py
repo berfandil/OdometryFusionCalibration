@@ -174,7 +174,14 @@ def write_manifests(out_dir, drive, yaw0):
         "max_sources = 1\n"
         "reference_sensor_id = 0\n"
         "cold_start = median_from_start\n"
-        "timesync_enabled = false\n\n"
+        "timesync_enabled = false\n"
+        # predict-only covariance floor (TUNABLE). Single-source => no adaptive-Q spread, so
+        # q_floor dominates P. 6 numbers = trans(m^2) x3, rot(rad^2) x3. A starting point only:
+        # a single floor can't make NEES consistent across drives (error growth is trajectory-
+        # dependent) -- full consistency needs a distance-aware cov model (ISSUES Slice 14).
+        # (NOTE: the ofc_replay manifest parser does not accept full-line comments, so this
+        #  explanation lives here in the generator, not in the emitted .ini.)
+        "q_floor = 0.001 0.001 0.001 0.0001 0.0001 0.0001\n\n"
         "[sensor.0]\n"
         "id = 0\n"
         "is_reference = true\n"
