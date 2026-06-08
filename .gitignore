@@ -27,3 +27,6 @@ compile_commands.json
 
 # FetchContent offline cache (local dev workaround; not source)
 /.deps_cache/
+
+# Real-dataset replay working dir (derived KITTI/etc. CSVs + manifests + results; not source)
+/kitti_run/
