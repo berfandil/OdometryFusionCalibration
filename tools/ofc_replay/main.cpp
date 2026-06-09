@@ -44,6 +44,8 @@
 //   [replay]                      # <-- EXTENSION (optional): harness knobs
 //   tail_window_s = 1.0
 //   warmup_steps = 20
+//   local_batch_len = 0           # GT-anchored relative-pose-error window (num fused-gt records);
+//                                 # 0 = off. Same value across recordings -> length-fair drift.
 //   out = results.csv             # output results-CSV path (default: replay_results.csv)
 //
 // GPS CSV schema (one fix per row; `#`/`//`/blank skipped; whitespace OR comma delimited):
@@ -125,9 +127,10 @@ struct Manifest {
     std::map<int, SourceEntry> source_entries;  // keyed by [sensor.N] slot index
     bool        has_gps = false;  GpsConfig gps_cfg;  std::string gps_csv;
     bool        has_gt  = false;  std::string gt_csv;
-    Scalar      tail_window_s = Scalar(1.0);
-    int         warmup_steps  = 20;
-    std::string out_path      = "replay_results.csv";
+    Scalar      tail_window_s   = Scalar(1.0);
+    int         warmup_steps    = 20;
+    int         local_batch_len = 0;
+    std::string out_path        = "replay_results.csv";
 };
 
 // Parse the manifest text. EXTENSION keys (csv/form inside [sensor.N]; the whole [gps]/[gt]/
@@ -213,6 +216,7 @@ std::string parse_manifest(const std::string& text, Manifest& m) {
             double d; long long iv;
             if (key == "tail_window_s" && to_double(val, d)) { m.tail_window_s = static_cast<Scalar>(d); }
             else if (key == "warmup_steps" && to_i64(val, iv)) { m.warmup_steps = static_cast<int>(iv); }
+            else if (key == "local_batch_len" && to_i64(val, iv)) { m.local_batch_len = static_cast<int>(iv); }
             else if (key == "out") { m.out_path = val; }
             else return err("unknown [replay] key '" + key + "'");
             continue;
@@ -341,8 +345,9 @@ int main(int argc, char** argv) {
     in.sources = source_ptrs;
     if (man.has_gps) { in.gps = &gps; in.gps_fixes = gps_fixes; }
     if (man.has_gt)  { in.gt = &gt; }
-    in.tail_window_s = man.tail_window_s;
-    in.warmup_steps  = man.warmup_steps;
+    in.tail_window_s   = man.tail_window_s;
+    in.warmup_steps    = man.warmup_steps;
+    in.local_batch_len = man.local_batch_len;
 
     ReplayHarness h;
     const Status rs = h.run(in);

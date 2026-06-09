@@ -160,9 +160,21 @@ csv = data/gt.csv            ; rows: t_ns, x, y, z, qw, qx, qy, qz
 [replay]                     ; EXTENSION (optional): harness knobs
 tail_window_s = 1.0
 warmup_steps = 20
+local_batch_len = 0          ; GT-anchored relative-pose-error window (num fused-gt records); 0=off
 out = results.csv
 ```
 
 GPS fix CSV schema (one fix per row): `t_ns, lat_deg, lon_deg, alt_m [, var_e, var_n, var_u]`
 (ENU position variances in m²; absent → 1 m² isotropic). The CLI submits fixes against the harness
 timeline so `step()` consumes each at the matching frontier.
+
+**Local vs global drift.** The summary's `tail_*` drift is the error at the *end* of the whole run,
+so it grows with run length — a 40 min drive is not comparable to a 10 min one. Set
+`local_batch_len = N` (same `N` across recordings) to also get a **GT-anchored relative-pose error**:
+the post-warmup fused-with-GT trajectory is tiled into non-overlapping `N`-record windows, each
+re-anchored to GT at its start (`E = rel_gt⁻¹ ∘ rel_est`), so only *intra-window* drift is measured.
+The summary then adds `# local (GT-anchored N-step windows, …): trans_m mean/p50/max ; rot_rad …` —
+length-independent, so two recordings compare per-window. `max` localizes the worst window (a
+correction-induced spike shows there while `mean`/`p50` stay low). This is the KITTI odometry
+benchmark's segment metric, with a fixed *measurement count* rather than a fixed distance (so windows
+at a standstill vs at speed cover different distance).

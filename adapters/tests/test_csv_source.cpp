@@ -347,6 +347,74 @@ TEST_CASE("Replay GT eval: drift + 6-DOF NEES are finite, correctly signed, hand
 }
 
 // =================================================================================================
+// 6b. Local (GT-anchored fixed-window) relative-pose error: a constant per-step over-scale makes
+//     the GLOBAL drift grow without bound with run length, but each fixed-length window re-anchors
+//     to GT at its start, so the local metric measures only intra-window drift -> it is bounded and
+//     length-independent (the point of the metric). Also asserts it is OFF by default.
+// =================================================================================================
+TEST_CASE("Replay local windows: GT-anchored relative-pose error is bounded vs the global drift") {
+    std::vector<SensorConfig> sensors;
+    Config cfg = make_rig_cfg(sensors);
+
+    Vec6 xi; xi << 2.0, 0.0, 0.0, 0.0, 0.0, 0.3;
+    const Scalar rate = 200.0;
+    const Timestamp step = secs_to_ns(1.0 / rate);
+    const Scalar planted_scale = 1.05;                  // 5% over-scale -> linearly growing global drift
+    const int N = static_cast<int>(4.1 * rate) + 2;     // long run so global drift >> a single window
+
+    const SE3 incr = se3::exp(xi * (1.0 / rate));
+    SE3 incr_scaled = incr; incr_scaled.t *= planted_scale;
+
+    // Two identical over-scale increment sources.
+    auto inc_csv = [&]() {
+        std::string csv = "# form: increment\n";
+        for (int k = 0; k < N; ++k)
+            csv += pose_row(static_cast<Timestamp>(k) * step, (k == 0) ? SE3{} : incr_scaled);
+        return csv;
+    };
+    // GT = the TRUE (scale=1) cumulative trajectory.
+    std::string gt_csv = "# GT t_ns,x,y,z,qw,qx,qy,qz\n";
+    {
+        SE3 cum;
+        for (int k = 0; k < N; ++k) {
+            const Timestamp t = static_cast<Timestamp>(k) * step;
+            if (k > 0) cum = se3::compose(cum, incr);
+            gt_csv += pose_row(t, cum);
+        }
+    }
+
+    CsvSource s0, s1;
+    CsvSourceConfig c0; c0.id = 0; c0.combine = ConfCombine::NativeOnly;
+    CsvSourceConfig c1 = c0; c1.id = 1;
+    REQUIRE(s0.load(inc_csv(), c0) == Status::Ok);
+    REQUIRE(s1.load(inc_csv(), c1) == Status::Ok);
+    CsvGtTrack gt; REQUIRE(gt.load(gt_csv) == Status::Ok);
+
+    // (a) OFF by default (local_batch_len == 0 -> no windows).
+    {
+        ReplayInputs in; in.cfg = &cfg; in.sources = {&s0, &s1}; in.gt = &gt;
+        ReplayHarness h; REQUIRE(h.run(in) == Status::Ok);
+        CHECK(h.summary().local_batch_len == 0);
+        CHECK(h.summary().local_batch_count == 0);
+    }
+    // (b) ON: windows measured; errors finite & positive; the local error is far smaller than the
+    //     global accumulated drift (length-normalization).
+    {
+        const int L = 30;   // harness ticks at cfg.tick_rate_hz (50) -> ~180 post-warmup records
+        ReplayInputs in; in.cfg = &cfg; in.sources = {&s0, &s1}; in.gt = &gt; in.local_batch_len = L;
+        ReplayHarness h; REQUIRE(h.run(in) == Status::Ok);
+        const RunSummary& s = h.summary();
+        CHECK(s.local_batch_len == L);
+        CHECK(s.local_batch_count >= 3);
+        CHECK(std::isfinite(s.local_mean_trans_m));
+        CHECK(s.local_mean_trans_m > 0.0);          // the over-scale leaks into every window
+        CHECK(s.local_med_trans_m  > 0.0);
+        // The whole-run drift accumulates far more than any single GT-anchored window.
+        CHECK(s.local_max_trans_m < s.max_trans_m);
+    }
+}
+
+// =================================================================================================
 // 7. GPS via CSV-driven harness: GPS fixes reduce the drift of a scale-mis-calibrated rig
 //    (mirrors the GPS e2e test, sourced through the harness). The drift-free truth is a scale=1
 //    twin run; the GPS targets the twin's frontier position. With GPS the tail drift halves.

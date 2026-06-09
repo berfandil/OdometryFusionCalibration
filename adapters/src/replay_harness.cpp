@@ -147,6 +147,8 @@ Status ReplayHarness::run(const ReplayInputs& in) {
     Scalar sum_nees = 0; long nees_n = 0;
     Scalar sum_nis  = 0; long nis_n  = 0;
     int    fused_seen = 0;
+    // Post-warmup fused-with-GT poses, in order, for the local relative-pose-error windows.
+    std::vector<SE3> seg_est, seg_gt;
 
     for (const ReplayRecord& r : records_) {
         if (!r.fused) continue;
@@ -165,8 +167,12 @@ Status ReplayHarness::run(const ReplayInputs& in) {
             if (r.trans_err_m > summary_.max_trans_m) summary_.max_trans_m = r.trans_err_m;
             if (r.rot_err_rad > summary_.max_rot_rad)  summary_.max_rot_rad = r.rot_err_rad;
             if (r.now >= tail_start) { tail_te += r.trans_err_m; tail_re += r.rot_err_rad; ++tail_n; }
-            // NEES after the warmup transient (mirrors the sim validation harness).
-            if (fused_seen > in.warmup_steps) { sum_nees += r.pose_nees; ++nees_n; }
+            // NEES + local windows after the warmup transient (mirrors the sim validation harness).
+            if (fused_seen > in.warmup_steps) {
+                sum_nees += r.pose_nees; ++nees_n;
+                seg_est.push_back(r.result.frontier.pose);
+                seg_gt.push_back(r.gt_pose);
+            }
         }
     }
 
@@ -182,6 +188,44 @@ Status ReplayHarness::run(const ReplayInputs& in) {
     summary_.mean_pose_nees = (nees_n > 0) ? sum_nees / static_cast<Scalar>(nees_n) : Scalar(0);
     summary_.nis_count      = nis_n;
     summary_.mean_nis       = (nis_n > 0) ? sum_nis / static_cast<Scalar>(nis_n) : Scalar(0);
+
+    // --- local (GT-anchored fixed-window) relative-pose error ----------------------------------
+    // Tile the post-warmup fused-with-GT poses into non-overlapping windows of local_batch_len.
+    // Per window: rel_est = est0^-1 o estL, rel_gt = gt0^-1 o gtL, error E = rel_gt^-1 o rel_est
+    // (est's windowed motion expressed in the GT-start frame -> the window "starts from GT").
+    // Length-independent: each window measures only intra-window drift, so the aggregate is
+    // comparable across recordings of different total length. (KITTI-style segment metric.)
+    const int L = in.local_batch_len;
+    const int seg_n = static_cast<int>(seg_est.size());
+    if (L > 0 && seg_n >= L) {
+        const int nb = seg_n / L;
+        std::vector<Scalar> wt; wt.reserve(nb);
+        std::vector<Scalar> wr; wr.reserve(nb);
+        Scalar sum_t = 0, sum_r = 0, max_t = 0, max_r = 0;
+        for (int b = 0; b < nb; ++b) {
+            const int i0 = b * L, i1 = b * L + L - 1;
+            const SE3 rel_est = se3::compose(se3::inverse(seg_est[i0]), seg_est[i1]);
+            const SE3 rel_gt  = se3::compose(se3::inverse(seg_gt[i0]),  seg_gt[i1]);
+            const SE3 E       = se3::compose(se3::inverse(rel_gt), rel_est);
+            const Scalar te = E.t.norm();
+            const Scalar re = so3::log(E.R).norm();
+            wt.push_back(te); wr.push_back(re);
+            sum_t += te; sum_r += re;
+            if (te > max_t) max_t = te;
+            if (re > max_r) max_r = re;
+        }
+        std::sort(wt.begin(), wt.end());
+        std::sort(wr.begin(), wr.end());
+        summary_.local_batch_len    = L;
+        summary_.local_batch_count  = nb;
+        summary_.local_dropped      = seg_n - nb * L;
+        summary_.local_mean_trans_m = sum_t / static_cast<Scalar>(nb);
+        summary_.local_mean_rot_rad = sum_r / static_cast<Scalar>(nb);
+        summary_.local_med_trans_m  = wt[nb / 2];
+        summary_.local_med_rot_rad  = wr[nb / 2];
+        summary_.local_max_trans_m  = max_t;
+        summary_.local_max_rot_rad  = max_r;
+    }
 
     if (fuses == 0) { error_ = "no steps fused"; return Status::NoData; }
     return Status::Ok;
@@ -256,6 +300,15 @@ void ReplayHarness::write_summary(std::ostream& os) const {
         if (s.nis_count > 0)
             os << " mean_nis=" << s.mean_nis << " (N=" << s.nis_count << ", target~DOF=3)";
         os << '\n';
+        if (s.local_batch_count > 0) {
+            os << "# local (GT-anchored " << s.local_batch_len << "-step windows, N="
+               << s.local_batch_count;
+            if (s.local_dropped > 0) os << " dropped_tail=" << s.local_dropped;
+            os << "): trans_m mean=" << s.local_mean_trans_m << " p50=" << s.local_med_trans_m
+               << " max=" << s.local_max_trans_m
+               << " ; rot_rad mean=" << s.local_mean_rot_rad << " p50=" << s.local_med_rot_rad
+               << " max=" << s.local_max_rot_rad << '\n';
+        }
     } else {
         os << "# (no GT track: drift/NEES not computed)\n";
         if (s.nis_count > 0)

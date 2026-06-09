@@ -81,6 +81,22 @@ struct RunSummary {
     Scalar mean_pose_nees = Scalar(0);  // ensemble-mean 6-DOF pose NEES (target ~ DOF=6)
     long   nis_count      = 0;
     Scalar mean_nis       = Scalar(0);  // mean accepted-GPS NIS (target ~ DOF=3 position fix)
+
+    // Local (GT-anchored fixed-window) relative-pose error — the KITTI-style segment metric. Each
+    // window of `local_batch_len` consecutive fused-with-GT records is re-anchored to GT at its
+    // start (E = rel_gt^-1 o rel_est), so ONLY intra-window drift is measured. This makes drift
+    // comparable across recordings of different total length (the global tail grows with run
+    // length; the local error does not). Populated only when local_batch_len > 0 and enough
+    // post-warmup fused-with-GT records exist; counts are 0 otherwise.
+    int    local_batch_len    = 0;          // window length (num fused-with-GT records); 0 = off
+    int    local_batch_count  = 0;          // complete windows measured
+    int    local_dropped      = 0;          // trailing fused-gt records not forming a full window
+    Scalar local_mean_trans_m = Scalar(0);
+    Scalar local_med_trans_m  = Scalar(0);  // median window translation error (outlier-robust)
+    Scalar local_max_trans_m  = Scalar(0);  // worst window (localizes a corruption event)
+    Scalar local_mean_rot_rad = Scalar(0);
+    Scalar local_med_rot_rad  = Scalar(0);
+    Scalar local_max_rot_rad  = Scalar(0);
 };
 
 // Inputs to a replay run. The Config + the CsvSources + the optional GPS + GT are all caller-owned
@@ -95,8 +111,13 @@ struct ReplayInputs {
     // Tail window (seconds, trailing the run) for the tail-mean drift metric. Default 1 s.
     Scalar tail_window_s = Scalar(1.0);
     // Warmup steps to skip before accumulating NEES (the calibration/cov transient). Default 20,
-    // matching the sim validation harness.
+    // matching the sim validation harness. The local-window metric uses the SAME warmup gate.
     int    warmup_steps  = 20;
+    // Local relative-pose-error window length (num post-warmup fused-with-GT records per GT-anchored
+    // window). 0 disables the local metric. Same value across recordings -> drift comparable across
+    // runs of different total length (each window re-anchors to GT, so only intra-window drift
+    // counts). See RunSummary::local_* and write_summary().
+    int    local_batch_len = 0;
 };
 
 // The harness. run() owns the Estimator; it is re-init'd on each run().
