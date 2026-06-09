@@ -123,7 +123,29 @@ Distance-windowed metric (discarded). Source-fusion robustness (the median alrea
 gross-outlier *sources* — D3 fix). NHC / `Ad`-shape predict-Q (Slice 14 second-order). The
 `urban12` post-event recovery dynamics beyond bounding the injection.
 
-## 8. Open questions
+## 8. OUTCOME (urban12 sweep, full drives)
+
+| variant | tail m | local max m | NEES | accepted-NIS | gps_applied |
+|---------|--------|-------------|------|--------------|-------------|
+| baseline (kappa 0, floor 0, gate 9) | 4214 | 856 | 59907 | 1.49 | 96 |
+| **D: floor 25, gate 9** (realistic R) | **3075** | **476** | **225** | **0.88** | 188 |
+| A: kappa 3, floor 0, gate 9 | 4214 | 856 | 59907 | — | 96 (inert) |
+| open gate (kappa 0, floor 25, gate 100) | 4605 | 1951 | 66747 | 38.2 | 298 |
+| open gate + Huber (kappa 2, floor 25, gate 100) | 3055 | 2347 | 7534 | 20.8 | 171 |
+
+**D (realistic GPS `R`) works and is the keeper** — config-only, big consistency win (NEES 59907→225),
+local max halved, accepted fixes consistent (NIS 0.88). **A (Huber) is the wrong lever for urban12**:
+under the tight gate its trigger band (`d2 > kappa²·n`) lies *inside* the gate reject band (`d2 > gate`)
+→ inert; opening the gate to let it fire admits genuine multipath (admitted-NIS 38 ≫ 3) → net WORSE.
+**The Mahalanobis gate is correctly rejecting the bad fixes** — they are not good fixes wrongly dropped.
+A is KEPT as an opt-in robustness primitive (loose-gate / non-GPS corrections, helped NEES 66k→7.5k when
+the gate was open), NOT as the urban12 fix. Lever B (rot clamp) NOT built — A's outcome made it moot.
+
+**urban12 remains unsolved** and is reframed as a *localize-the-bad-window* problem (which event makes the
+one 476 m window), not a robust-update gain problem. Lesson: Huber/gain levers were the 4th thing to
+help-but-not-fix urban12 — stop adding gain knobs; instrument the bad window instead.
+
+## 9. Open questions
 
 - `kappa` per-DOF RMS (`sqrt(d2/n)`) vs raw `sqrt(d2)` threshold — RMS makes `kappa` dimension-agnostic; confirm.
 - Should B (rot clamp) ship at all, or is A alone sufficient on `urban12`? Decide empirically after A.
