@@ -127,7 +127,7 @@ const char* kKnobDoc =
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
-    "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>  (0=off)\n"
+    "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
     "[sensor.N]\n"
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
@@ -276,6 +276,9 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "correction_robust_kappa") {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 cfg_.correction_robust_kappa = dv;
+            } else if (key == "correction_rot_suppress_kappa") {
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.correction_rot_suppress_kappa = dv;
             } else {
                 return fail("unknown global key '" + key + "'", line_no, raw);
             }

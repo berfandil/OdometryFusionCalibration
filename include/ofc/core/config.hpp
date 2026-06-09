@@ -167,6 +167,16 @@ struct Config {
     // the pose trans-rot cross-cov) instead of a binary gate. 0 = DISABLED -> the update is
     // bit-identical to the non-robust path. Typical enabled value ~3 (3 sigma per DOF).
     Scalar correction_robust_kappa = 0.0;
+    // Bounded heading injection from position-only corrections (Slice 15b, lever C4). A correction
+    // that does NOT observe rotation (H rotation-error columns ~ 0, e.g. a GPS position fix) can
+    // still rotate the heading through the pose trans-rot cross-covariance in K. Under a LARGE
+    // residual that coupling is outside linear validity and over-rotates (the urban12 t=1929 s 68
+    // deg kick). When dbar = sqrt(NIS/n) > this kappa, the ROTATION rows of the gain are scaled by
+    // kappa/dbar (translation correction untouched), bounding the injected heading. 0 = DISABLED
+    // (bit-identical). Orthogonal to correction_robust_kappa (which scales the WHOLE gain). A
+    // typical enabled value is below the gate's per-DOF dbar ceiling sqrt(mahalanobis_chi2/3)
+    // (~1.73 at the default gate), e.g. ~0.8, so an in-gate-but-large position residual is protected.
+    Scalar correction_rot_suppress_kappa = 0.0;
 
     // Output
     bool   emit_predicted_tip = true;

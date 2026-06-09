@@ -386,6 +386,58 @@ TEST_CASE("update: robust kappa attenuates the yaw kick a large position fix inj
     CHECK(ratioR < ratio0);         // robust grows sub-linearly (bounded)
 }
 
+// Slice 15b (lever C4): residual-gated rotation-row suppression bounds the heading a large
+// position fix injects via the trans-rot cross-cov WHILE KEEPING the translation pull (the property
+// Huber lacks). Only fires for rotation-UNOBSERVING fixes above the residual threshold.
+TEST_CASE("update: rot-suppress (C4) bounds the yaw kick but keeps the translation pull") {
+    // Run a +y position fix into a y<->yaw-coupled P; return (injected yaw magnitude, +y pull).
+    auto run_pos = [](Scalar resid, Scalar rot_kappa) {
+        Eskf f;
+        Mat12 P0 = Mat12::Identity();
+        P0(1, 5) = P0(5, 1) = Scalar(0.5);             // trans-y <-> yaw-z cross-cov
+        f.init(SE3{}, P0);
+        const SE3 p0 = f.state().pose;
+        const Vec3 z = p0.t + Vec3(Scalar(0), resid, Scalar(0));
+        Measurement m = position_fix(p0, z, /*sigma=*/Scalar(0.5));
+        const Mat3 R_before = f.state().pose.R;
+        const Vec3 t_before = f.state().pose.t;
+        REQUIRE(f.update(m, /*chi2=*/Scalar(1e12), /*robust_kappa=*/Scalar(0), rot_kappa));
+        const Scalar yaw  = so3::log(R_before.transpose() * f.state().pose.R).norm();
+        const Scalar pull = f.state().pose.t.y() - t_before.y();   // moved toward z (+y)
+        return std::make_pair(yaw, pull);
+    };
+
+    // Large residual: C4 bounds the heading kick, and (because the un-suppressed over-rotation
+    // corrupts even the translation through the SE(3) exp coupling) C4 also CLEANS the position pull.
+    const auto off = run_pos(Scalar(8.0), Scalar(0.0));     // (yaw, pull) without C4
+    const auto on  = run_pos(Scalar(8.0), Scalar(0.5));     // (yaw, pull) with C4
+    CHECK(off.first  > Scalar(0.5));                // a position fix injected a LARGE yaw (the bug)
+    CHECK(on.first   < Scalar(0.3) * off.first);    // C4 bounds the heading kick (>70% cut)
+    CHECK(on.second  > Scalar(0));                  // C4: translation pulled the RIGHT way (toward z)
+    CHECK(on.second  > off.second);                 // ... vs the over-rotation corrupting it without C4
+
+    // Below the residual threshold (dbar <= kappa): C4 is inert -> rotation still corrected.
+    CHECK(run_pos(Scalar(0.2), Scalar(0.5)).first ==
+          doctest::Approx(run_pos(Scalar(0.2), Scalar(0.0)).first).epsilon(1e-12));
+
+    // A rotation-OBSERVING fix (6-DOF, H observes the rotation error) is NOT suppressed by C4.
+    auto run_pose6 = [](Scalar rot_kappa) {
+        Eskf f;
+        Mat12 P0 = Mat12::Identity();
+        P0(1, 5) = P0(5, 1) = Scalar(0.5);
+        f.init(SE3{}, P0);
+        const Mat3 R_before = f.state().pose.R;
+        Measurement m;
+        m.dim = 6;
+        m.H.setZero();  m.H.block<6, 6>(0, 0) = Mat6::Identity();      // observe pose error directly
+        m.residual.setZero();  m.residual(1) = Scalar(8.0);           // large y-translation residual
+        m.R.setZero();  m.R.block<6, 6>(0, 0) = Scalar(0.25) * Mat6::Identity();
+        REQUIRE(f.update(m, /*chi2=*/Scalar(1e12), /*robust_kappa=*/Scalar(0), rot_kappa));
+        return so3::log(R_before.transpose() * f.state().pose.R).norm();
+    };
+    CHECK(run_pose6(Scalar(0.5)) == doctest::Approx(run_pose6(Scalar(0.0))).epsilon(1e-12));
+}
+
 TEST_CASE("update: Joseph form keeps P symmetric PSD across many accepted updates") {
     Eskf f;
     f.init(SE3{}, Mat12::Identity());

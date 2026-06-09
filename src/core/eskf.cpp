@@ -30,6 +30,10 @@ namespace ofc {
 namespace {
 constexpr Scalar kNanosPerSec = Scalar(1e9);
 constexpr Scalar kMinDt       = Scalar(1e-9);   // guard against dt <= 0
+// A measurement is "rotation-unobserving" (a position fix) when its H rotation-error columns
+// (3..5) are ~ 0. H entries for a rotation observation are O(1) (rotation-matrix scale), so this
+// eps cleanly separates a position fix (exactly 0) from a pose/rotation fix. (Slice 15b, lever C4.)
+constexpr Scalar kRotObsEps   = Scalar(1e-9);
 
 Timestamp secs_to_ns(Scalar s) {
     return static_cast<Timestamp>(std::llround(s * kNanosPerSec));
@@ -136,7 +140,8 @@ void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
     // (review fix — was `state_.stamp += dt_eff`, which was masked but inconsistent).
 }
 
-bool Eskf::update(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa) {
+bool Eskf::update(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa,
+                  Scalar rot_suppress_kappa) {
     const int n = m.dim;
     if (n <= 0 || n > 6) return false;       // empty / out-of-range measurement => no-op
 
@@ -175,25 +180,35 @@ bool Eskf::update(const Measurement& m, Scalar chi2_threshold, Scalar robust_kap
     // and recompute S, so the gain — and the Joseph covariance below, which reuses Reff — shrink
     // consistently. kappa<=0 -> Reff=R, Seff=Sldlt -> EXACT non-robust update (the padded [n..5]
     // block is left as identity). dbar<=kappa -> w=1 -> also untouched.
+    const Scalar dbar = (n > 0) ? std::sqrt(d2 / static_cast<Scalar>(n)) : Scalar(0);
     Mat6 Reff = R;
     Eigen::LDLT<Mat6> Seff = Sldlt;
-    if (robust_kappa > Scalar(0) && n > 0) {
-        const Scalar dbar = std::sqrt(d2 / static_cast<Scalar>(n));
-        if (dbar > robust_kappa) {
-            const Scalar inv_w = dbar / robust_kappa;                 // 1/w (>1)
-            const Mat6 dInfl = (inv_w - Scalar(1)) * R;               // padding row -> r=0,H=0: inert
-            Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
-            Mat6 Snew = S;
-            Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);    // Snew = H P H^T + Reff
-            Seff = Snew.ldlt();
-        }
+    if (robust_kappa > Scalar(0) && dbar > robust_kappa) {
+        const Scalar inv_w = dbar / robust_kappa;                 // 1/w (>1)
+        const Mat6 dInfl = (inv_w - Scalar(1)) * R;               // padding row -> r=0,H=0: inert
+        Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+        Mat6 Snew = S;
+        Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);    // Snew = H P H^T + Reff
+        Seff = Snew.ldlt();
     }
 
     // Kalman gain K = P H^T Seff^-1  (12 x 6 capacity; unused columns are 0 via padded H).
     // Solve Seff K^T = (P H^T)^T column-wise: K^T = Seff^-1 (H P) -> K = (Seff^-1 (H P))^T.
     const Eigen::Matrix<Scalar, 6, 12> HP = H * P;            // 6 x 12
     const Eigen::Matrix<Scalar, 6, 12> Kt = Seff.solve(HP);   // Seff^-1 (H P) = K^T
-    const Eigen::Matrix<Scalar, 12, 6> K  = Kt.transpose();   // 12 x 6
+    Eigen::Matrix<Scalar, 12, 6> K  = Kt.transpose();         // 12 x 6 (mutable: C4 scales rows)
+
+    // Bounded heading injection (Slice 15b, lever C4): if this measurement does NOT observe
+    // rotation (H rotation-error columns 3..5 ~ 0 -> a position fix) and the residual is large
+    // (dbar > kappa), scale ONLY the pose-rotation gain rows (3..5) by kappa/dbar. The heading the
+    // fix injects through the pose trans-rot cross-cov is bounded; the translation rows (0..2) and
+    // twist rows are untouched, so the useful position pull survives. Joseph below reuses this K so
+    // the covariance stays consistent. kappa<=0 (or dbar<=kappa, or a rotation-observing fix) -> K
+    // untouched -> exact non-suppressed update.
+    if (rot_suppress_kappa > Scalar(0) && dbar > rot_suppress_kappa &&
+        H.middleCols(3, 3).norm() < kRotObsEps) {
+        K.middleRows(3, 3) *= (rot_suppress_kappa / dbar);
+    }
 
     // Error state dx = K r (12-vector).
     const Eigen::Matrix<Scalar, 12, 1> dx = K * r;
@@ -322,7 +337,8 @@ void Eskf::predict_aug_frozen(const SE3& delta, Scalar dt, const Mat6& q_pose, S
     // stamp untouched — the estimator owns the frontier clock (as in predict()).
 }
 
-bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa) {
+bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa,
+                      Scalar rot_suppress_kappa) {
     if (!bias_active_) return false;        // caller should use update() when bias is off
     const int n = m.dim;
     if (n <= 0 || n > 6) return false;      // empty / out-of-range measurement => no-op
@@ -351,25 +367,33 @@ bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust
     // Robust (Huber) gain down-weighting (Slice 15) — identical to update(): inflate the active R
     // block by 1/w for an outlier innovation, recompute S, reuse Reff in the Joseph covariance.
     // kappa<=0 (or dbar<=kappa) -> exact non-robust update.
+    const Scalar dbar = (n > 0) ? std::sqrt(d2 / static_cast<Scalar>(n)) : Scalar(0);
     Mat6 Reff = R;
     Eigen::LDLT<Mat6> Seff = Sldlt;
-    if (robust_kappa > Scalar(0) && n > 0) {
-        const Scalar dbar = std::sqrt(d2 / static_cast<Scalar>(n));
-        if (dbar > robust_kappa) {
-            const Scalar inv_w = dbar / robust_kappa;
-            const Mat6 dInfl = (inv_w - Scalar(1)) * R;
-            Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
-            Mat6 Snew = S;
-            Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
-            Seff = Snew.ldlt();
-        }
+    if (robust_kappa > Scalar(0) && dbar > robust_kappa) {
+        const Scalar inv_w = dbar / robust_kappa;
+        const Mat6 dInfl = (inv_w - Scalar(1)) * R;
+        Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+        Mat6 Snew = S;
+        Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+        Seff = Snew.ldlt();
     }
 
     // Kalman gain K = P H^T Seff^-1 (18 x 6 capacity). The bias rows of K are NONZERO via the
     // P_pose,bias cross-covariance the predict built -> the update injects the bias.
     const Eigen::Matrix<Scalar, 6, 18> HP = H * P;       // 6 x 18
     const Eigen::Matrix<Scalar, 6, 18> Kt = Seff.solve(HP);
-    const Eigen::Matrix<Scalar, 18, 6> K  = Kt.transpose();
+    Eigen::Matrix<Scalar, 18, 6> K  = Kt.transpose();    // mutable: C4 scales rotation rows
+
+    // Bounded heading injection (Slice 15b, lever C4) — identical to update(): a position fix
+    // (H rotation-error cols 3..5 ~ 0) with a large residual has its pose-rotation gain rows (3..5)
+    // scaled by kappa/dbar, bounding the heading kick via the trans-rot cross-cov; translation,
+    // twist, and bias rows untouched; Joseph reuses this K. Inert when off / below threshold /
+    // rotation-observing.
+    if (rot_suppress_kappa > Scalar(0) && dbar > rot_suppress_kappa &&
+        H.middleCols(3, 3).norm() < kRotObsEps) {
+        K.middleRows(3, 3) *= (rot_suppress_kappa / dbar);
+    }
 
     const Eigen::Matrix<Scalar, 18, 1> dx = K * r;       // 18-vector error state
 
