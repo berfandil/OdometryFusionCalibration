@@ -314,6 +314,31 @@ void ReplayHarness::write_summary(std::ostream& os) const {
         if (s.nis_count > 0)
             os << "# mean_nis=" << s.mean_nis << " (N=" << s.nis_count << ", target~DOF=3)\n";
     }
+
+    // Final per-source calibration snapshot (the last fused step) — what online calibration
+    // converged to. extrinsic rotation is reported as so3::log(R) = [rx,ry,rz] (rad; rz is yaw),
+    // translation as the lever [x,y,z] (m). Confidences/commit flags expose the observability gate.
+    const ReplayRecord* last = nullptr;
+    for (auto it = records_.rbegin(); it != records_.rend(); ++it)
+        if (it->fused) { last = &(*it); break; }
+    if (last != nullptr && last->result.source_count > 0) {
+        os << "# final calib (per source, at last fused step):\n";
+        for (int i = 0; i < last->result.source_count; ++i) {
+            const CalibSnapshot& c = last->result.calib[i];
+            const Vec3 rlog = so3::log(c.extrinsic.R);
+            os << "#   src" << static_cast<int>(c.id)
+               << " scale=" << c.scale << " (conf " << c.scale_confidence
+               << (c.scale_committed ? ",committed" : "") << ")"
+               << " time_offset_s=" << c.time_offset_s << " (conf " << c.confidence
+               << (c.committed ? ",committed" : "") << ")"
+               << " extr_rot[rx,ry,rz]=[" << rlog.x() << "," << rlog.y() << "," << rlog.z()
+               << "] (conf " << c.extrinsic_confidence
+               << (c.extrinsic_committed ? ",committed" : "") << ")"
+               << " lever[x,y,z]=[" << c.extrinsic.t.x() << "," << c.extrinsic.t.y() << ","
+               << c.extrinsic.t.z() << "] (conf " << c.translation_confidence
+               << (c.translation_committed ? ",committed" : "") << ")\n";
+        }
+    }
 }
 
 } // namespace adapters
