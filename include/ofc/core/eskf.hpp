@@ -109,7 +109,13 @@ public:
     // update()) — so every measurement DOF gates at the SAME confidence (Slice 11b). Passing a
     // raw threshold here keeps this method a thin, testable gate (test_eskf.cpp calls
     // update(m, 9.0) etc. directly with raw thresholds).
-    bool update(const Measurement& m, Scalar chi2_threshold);
+    //
+    // `robust_kappa` (Slice 15): Huber gain down-weighting. 0 (default) = DISABLED, bit-identical
+    // to the non-robust update. When > 0, an outlier innovation (per-DOF RMS Mahalanobis
+    // dbar = sqrt(d2/n) > kappa) inflates the active R block by dbar/kappa, recomputing S so the
+    // gain and the Joseph covariance shrink consistently — bounding the injected correction. The
+    // GATE still tests the TRUE (non-robust) NIS; robustness only attenuates accepted fixes.
+    bool update(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa = Scalar(0));
 
     // Per-DOF Mahalanobis χ² gate threshold (Slice 11b). Scales a base threshold that is
     // tuned at the n=3 position-fix DOF (= cfg.mahalanobis_chi2) by the χ²-quantile ratio so
@@ -176,7 +182,7 @@ public:
     // in update()). Joseph-form 18x18 covariance; gates on the RAW (already-per-n) chi2_threshold
     // exactly as update() does (the estimator pre-scales via chi2_gate); last_nis() updated.
     // Returns true iff applied. No-op (false) when bias is inactive (caller should use update()).
-    bool update_aug(const Measurement& m, Scalar chi2_threshold);
+    bool update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa = Scalar(0));
 
     // NIS (d2) of the LAST update() / update_aug() call — set whether the gate accepted or
     // rejected; 0 before any update. Surfaced by the estimator into Result diagnostics.

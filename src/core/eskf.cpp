@@ -136,7 +136,7 @@ void Eskf::predict(const SE3& delta, Scalar dt, const Mat6& q_pose) {
     // (review fix — was `state_.stamp += dt_eff`, which was masked but inconsistent).
 }
 
-bool Eskf::update(const Measurement& m, Scalar chi2_threshold) {
+bool Eskf::update(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa) {
     const int n = m.dim;
     if (n <= 0 || n > 6) return false;       // empty / out-of-range measurement => no-op
 
@@ -166,13 +166,33 @@ bool Eskf::update(const Measurement& m, Scalar chi2_threshold) {
     const Scalar d2    = r.dot(Sinv_r);
     last_nis_ = d2;                           // exposed even when the gate rejects
 
-    // Mahalanobis gate: reject (state unchanged) when NIS exceeds the threshold.
+    // Mahalanobis gate: reject (state unchanged) when NIS exceeds the threshold. The gate tests
+    // the TRUE (non-robust) NIS; robust down-weighting below only attenuates ACCEPTED fixes.
     if (d2 > chi2_threshold) return false;
 
-    // Kalman gain K = P H^T S^-1  (12 x 6 capacity; unused columns are 0 via padded H).
-    // Solve S K^T = (P H^T)^T column-wise: K^T = S^-1 (H P) -> K = (S^-1 (H P))^T.
+    // Robust (Huber) gain down-weighting (Slice 15). For an outlier innovation (per-DOF RMS
+    // Mahalanobis dbar = sqrt(d2/n) > kappa) inflate the ACTIVE R block by 1/w (w = kappa/dbar)
+    // and recompute S, so the gain — and the Joseph covariance below, which reuses Reff — shrink
+    // consistently. kappa<=0 -> Reff=R, Seff=Sldlt -> EXACT non-robust update (the padded [n..5]
+    // block is left as identity). dbar<=kappa -> w=1 -> also untouched.
+    Mat6 Reff = R;
+    Eigen::LDLT<Mat6> Seff = Sldlt;
+    if (robust_kappa > Scalar(0) && n > 0) {
+        const Scalar dbar = std::sqrt(d2 / static_cast<Scalar>(n));
+        if (dbar > robust_kappa) {
+            const Scalar inv_w = dbar / robust_kappa;                 // 1/w (>1)
+            const Mat6 dInfl = (inv_w - Scalar(1)) * R;               // padding row -> r=0,H=0: inert
+            Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+            Mat6 Snew = S;
+            Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);    // Snew = H P H^T + Reff
+            Seff = Snew.ldlt();
+        }
+    }
+
+    // Kalman gain K = P H^T Seff^-1  (12 x 6 capacity; unused columns are 0 via padded H).
+    // Solve Seff K^T = (P H^T)^T column-wise: K^T = Seff^-1 (H P) -> K = (Seff^-1 (H P))^T.
     const Eigen::Matrix<Scalar, 6, 12> HP = H * P;            // 6 x 12
-    const Eigen::Matrix<Scalar, 6, 12> Kt = Sldlt.solve(HP);  // S^-1 (H P) = K^T
+    const Eigen::Matrix<Scalar, 6, 12> Kt = Seff.solve(HP);   // Seff^-1 (H P) = K^T
     const Eigen::Matrix<Scalar, 12, 6> K  = Kt.transpose();   // 12 x 6
 
     // Error state dx = K r (12-vector).
@@ -192,7 +212,7 @@ bool Eskf::update(const Measurement& m, Scalar chi2_threshold) {
     // step that mitigates the Slice-14 covariance-pessimism finding when an absolute ref
     // is present (the predict-only no-ref path is unchanged).
     const Mat12 IKH = Mat12::Identity() - K * H;
-    state_.cov = symmetrize(IKH * P * IKH.transpose() + K * R * K.transpose());
+    state_.cov = symmetrize(IKH * P * IKH.transpose() + K * Reff * K.transpose());
     state_.twist.cov = state_.cov.block<6, 6>(6, 6);
 
     // NOTE: stamp untouched — the estimator owns the frontier clock (as in predict()).
@@ -302,7 +322,7 @@ void Eskf::predict_aug_frozen(const SE3& delta, Scalar dt, const Mat6& q_pose, S
     // stamp untouched — the estimator owns the frontier clock (as in predict()).
 }
 
-bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold) {
+bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa) {
     if (!bias_active_) return false;        // caller should use update() when bias is off
     const int n = m.dim;
     if (n <= 0 || n > 6) return false;      // empty / out-of-range measurement => no-op
@@ -328,10 +348,27 @@ bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold) {
 
     if (d2 > chi2_threshold) return false;               // gate: reject (state unchanged)
 
-    // Kalman gain K = P H^T S^-1 (18 x 6 capacity). The bias rows of K are NONZERO via the
+    // Robust (Huber) gain down-weighting (Slice 15) — identical to update(): inflate the active R
+    // block by 1/w for an outlier innovation, recompute S, reuse Reff in the Joseph covariance.
+    // kappa<=0 (or dbar<=kappa) -> exact non-robust update.
+    Mat6 Reff = R;
+    Eigen::LDLT<Mat6> Seff = Sldlt;
+    if (robust_kappa > Scalar(0) && n > 0) {
+        const Scalar dbar = std::sqrt(d2 / static_cast<Scalar>(n));
+        if (dbar > robust_kappa) {
+            const Scalar inv_w = dbar / robust_kappa;
+            const Mat6 dInfl = (inv_w - Scalar(1)) * R;
+            Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+            Mat6 Snew = S;
+            Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+            Seff = Snew.ldlt();
+        }
+    }
+
+    // Kalman gain K = P H^T Seff^-1 (18 x 6 capacity). The bias rows of K are NONZERO via the
     // P_pose,bias cross-covariance the predict built -> the update injects the bias.
     const Eigen::Matrix<Scalar, 6, 18> HP = H * P;       // 6 x 18
-    const Eigen::Matrix<Scalar, 6, 18> Kt = Sldlt.solve(HP);
+    const Eigen::Matrix<Scalar, 6, 18> Kt = Seff.solve(HP);
     const Eigen::Matrix<Scalar, 18, 6> K  = Kt.transpose();
 
     const Eigen::Matrix<Scalar, 18, 1> dx = K * r;       // 18-vector error state
@@ -344,7 +381,7 @@ bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold) {
 
     // Joseph-form 18x18 covariance (guaranteed PSD), then symmetrize.
     const Mat18 IKH = Mat18::Identity() - K * H;
-    cov18_ = symmetrize18(IKH * P * IKH.transpose() + K * R * K.transpose());
+    cov18_ = symmetrize18(IKH * P * IKH.transpose() + K * Reff * K.transpose());
 
     // Mirror the published 12x12.
     state_.cov       = cov18_.block<12, 12>(0, 0);

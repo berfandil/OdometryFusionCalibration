@@ -151,6 +151,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Done when**: CI runs unit + observability + consistency + golden; tuned defaults replace the "tuned" placeholders in `CONFIG.md` (the load-bearing `q_scale` is done; the rest are a non-covariance follow-on pass).
 **Deps**: grows alongside Slices 2–11.
 
+## Slice 15 — Robust correction update (large-innovation safety)  `[ ]` DESIGN
+**Goal**: bound the damage a single large-innovation GPS correction can do. The KAIST `urban12` divergence (4214 m global) is NOT pervasive — the local metric (`7c71b63`) shows its median 10 s window is 0.17 m (best of the three drives); the km-scale tail comes from a HANDFUL of catastrophic correction windows (`local max` 856 m). Mechanism: with lever=0, `H` rotation cols are zero but `K`'s rotation rows (fed by the `P` trans↔rot cross-cov) still inject a large heading kick `exp(dx[3..5])` on a large position residual → the continuous filter carries the corruption forever.
+**Approach** (full design in `SLICE15_ROBUST_GPS_UPDATE.md`): Huber-robust gain in core `update()`/`update_aug()` (down-weight gain ∝ `kappa/dbar` for outlier NIS ≡ inflate `R`; `kappa=0` default → bit-identical to today, opt-in) **+** realistic GPS `R` (`cov_floor_m2`, the Slice-14 root-cause lever). Optional hard rot-clamp (lever B) behind its own flag.
+**Done when**: `urban12` `local max` 856 → ≤ ~50 m (toward p50) with urban07/17 `local p50` not regressed (±10%) and sim NEES/GPS-e2e unchanged at `kappa=0`. Acceptance is objective via the local metric (full drives — a slice can't hide a blowup now).
+**Deps**: Slices 13 (local metric), 14 (cov calibration).
+
 ---
 
 ## Suggested order

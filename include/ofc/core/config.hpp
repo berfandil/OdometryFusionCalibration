@@ -160,6 +160,13 @@ struct Config {
 
     // Absolute refs
     Scalar mahalanobis_chi2 = 9.0;
+    // Robust correction update (Slice 15): Huber down-weighting of the absolute-ref Kalman gain
+    // for large innovations. For a per-DOF RMS Mahalanobis distance dbar = sqrt(NIS/n) above
+    // `correction_robust_kappa`, the active measurement-noise block is inflated by dbar/kappa (gain
+    // shrinks ~kappa/dbar), smoothly bounding the injected correction (esp. the heading kick fed by
+    // the pose trans-rot cross-cov) instead of a binary gate. 0 = DISABLED -> the update is
+    // bit-identical to the non-robust path. Typical enabled value ~3 (3 sigma per DOF).
+    Scalar correction_robust_kappa = 0.0;
 
     // Output
     bool   emit_predicted_tip = true;

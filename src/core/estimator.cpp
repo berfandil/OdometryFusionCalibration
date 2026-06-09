@@ -1399,10 +1399,11 @@ Status Estimator::step(Timestamp now) {
             // DOF (m.dim) so a 3-DOF position fix and a 6-DOF pose fix gate at the SAME confidence.
             // n==3 returns the base unchanged, so the dim=3 fixes shipping now are byte-identical to
             // the old single-scalar behavior. The SAME per-`n` gate feeds both update paths.
-            const Scalar gate = Eskf::chi2_gate(cfg.mahalanobis_chi2, m.dim);
+            const Scalar gate  = Eskf::chi2_gate(cfg.mahalanobis_chi2, m.dim);
+            const Scalar kappa = cfg.correction_robust_kappa;   // Slice 15: 0 = non-robust (default)
             const bool applied = use_aug
-                                     ? s.eskf.update_aug(m, gate)
-                                     : s.eskf.update(m, gate);
+                                     ? s.eskf.update_aug(m, gate, kappa)
+                                     : s.eskf.update(m, gate, kappa);
             if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
             cdiag.last_nis = s.eskf.last_nis();     // last NIS, accepted or rejected
         }
@@ -1771,6 +1772,9 @@ Status validate(const Config& cfg) {
     // positive — a non-positive threshold would reject EVERY measurement (NIS >= 0 always),
     // silently disabling the correction path.
     if (cfg.mahalanobis_chi2 <= 0.0)                     return Status::OutOfRange;
+    // Robust correction down-weighting (Slice 15): kappa must be >= 0 (0 disables; negative is
+    // meaningless — it would inflate every accepted fix toward zero gain).
+    if (cfg.correction_robust_kappa < 0.0)               return Status::OutOfRange;
 
     // Per-source bias states (Slice 11b, Option A, D22). Option A supports EXACTLY ONE bias
     // source (the single driving source whose de-biased delta IS the predict). More than one

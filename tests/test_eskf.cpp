@@ -344,6 +344,48 @@ TEST_CASE("update: a wildly-off measurement is gated out (state unchanged, NIS r
     CHECK(f.last_nis() > 9.0);
 }
 
+// Slice 15: Huber-robust gain down-weighting bounds the heading kick a large position innovation
+// injects through the pose trans-rot cross-covariance (the urban12 over-rotation mode). A lateral
+// (y) position fix, with a y<->yaw(z) cross-cov in P, rotates the heading via K's rotation row.
+TEST_CASE("update: robust kappa attenuates the yaw kick a large position fix injects via cross-cov") {
+    // Inject a +y position residual into a filter whose P couples trans-y with yaw-z; return the
+    // magnitude of the yaw the update injects. sigma chosen so R is comparable to HPH^T (the
+    // realistic-R regime where Huber bites); huge gate so the fix is always accepted (we test the
+    // injection magnitude, not the gate). All injected angles stay < pi (so3::log unambiguous).
+    auto inj_yaw = [](Scalar resid, Scalar kappa) {
+        Eskf f;
+        Mat12 P0 = Mat12::Identity();
+        P0(1, 5) = P0(5, 1) = Scalar(0.2);             // trans-y <-> yaw-z cross-cov (PSD: 1,0.2;0.2,1)
+        f.init(SE3{}, P0);
+        const SE3 p0 = f.state().pose;
+        const Vec3 z = p0.t + Vec3(Scalar(0), resid, Scalar(0));
+        Measurement m = position_fix(p0, z, /*sigma=*/Scalar(0.5));
+        const Mat3 R_before = f.state().pose.R;
+        const bool ok = f.update(m, /*chi2=*/Scalar(1e12), kappa);   // huge gate -> accepted
+        REQUIRE(ok);
+        return so3::log(R_before.transpose() * f.state().pose.R).norm();
+    };
+
+    // The mechanism: a pure-translation fix injects yaw through the cross-cov.
+    CHECK(inj_yaw(Scalar(3.0), Scalar(0)) > Scalar(0));
+
+    // Below threshold (dbar <= kappa): robust is bit-identical to non-robust (w == 1).
+    CHECK(inj_yaw(Scalar(0.3), Scalar(0.3)) ==
+          doctest::Approx(inj_yaw(Scalar(0.3), Scalar(0))).epsilon(1e-12));
+
+    // Large innovation: robust cuts the injected yaw by more than half vs non-robust.
+    const Scalar big0 = inj_yaw(Scalar(9.0), Scalar(0));
+    const Scalar bigR = inj_yaw(Scalar(9.0), Scalar(0.3));
+    CHECK(bigR < Scalar(0.5) * big0);
+
+    // Huber compresses outliers: the non-robust kick grows ~linearly with the residual, the robust
+    // kick grows much slower (sub-linear) -> the robust/non-robust ratio shrinks as residual grows.
+    const Scalar ratio0 = inj_yaw(Scalar(9.0), Scalar(0))   / inj_yaw(Scalar(3.0), Scalar(0));
+    const Scalar ratioR = inj_yaw(Scalar(9.0), Scalar(0.3)) / inj_yaw(Scalar(3.0), Scalar(0.3));
+    CHECK(ratio0 > Scalar(2.5));    // non-robust ~linear (3x residual -> ~3x kick)
+    CHECK(ratioR < ratio0);         // robust grows sub-linearly (bounded)
+}
+
 TEST_CASE("update: Joseph form keeps P symmetric PSD across many accepted updates") {
     Eskf f;
     f.init(SE3{}, Mat12::Identity());
