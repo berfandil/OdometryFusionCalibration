@@ -112,7 +112,35 @@ selectively protects heading on in-gate-but-large position residuals. They compo
 - Huber (A, Slice 15) — kept as-is; C4 composes with it.
 - Lever B (hard rot clamp) — superseded by C4's smooth residual-gated form.
 
-## 8. Open questions
+## 8. OUTCOME — ACCEPTANCE MET (`ba895b6`)
+
+Full-drive sweep, keeper base (realistic R `cov_floor_m2=25`, default gate). C4 = `correction_rot_suppress_kappa`.
+
+| urban12 | tail m | max m | rms m | local max m | NEES | gps_applied |
+|---------|--------|-------|-------|-------------|------|-------------|
+| baseline (no R, no C4) | 4214 | 4596 | 2648 | 856 | 59907 | 96 |
+| D only (cov25) | 3075 | — | — | 476 | 225 | 188 |
+| **D + C4 kappa=0.8** | **1.99** | 409 | 120 | 422 | 371 | **1375** |
+| D + C4 kappa=0.5 | 1.99 | 304 | 106 | 313 | 367 | 1383 |
+
+**C4 is the first lever that fixes urban12.** Tail 4214 -> **1.99 m**; the death spiral is averted
+(gps_applied 96 -> 1375 — heading no longer runs away, so fixes stay in-gate and keep correcting).
+`diagnose_window.py` confirms the t=1929 s 68 deg kick is GONE (rot_err there 2.0 -> 0.08) and the
+whole arc recovers to ~2 m by the end. A mid-drive transient excursion remains (max ~300-400 m, one
+window) but now RECOVERS instead of carrying forever — fully flattening it needs the upstream 522 s
+GPS-coast heading drift (Sec. 7, out of scope).
+
+**No regression on urban07/17** — C4 is *inert* there: their accepted fixes have dbar ~0.18-0.55,
+below kappa=0.8, so C4 never fires. (urban07 cov25+C4: local p50 4.68->2.37, NEES 388->28; urban17:
+NEES 4438->321, local p50 0.23->0.35 — the latter a `cov_floor` (D) tradeoff, not C4.) Sim
+bit-identical at kappa=0 (full suite green). Validated on FULL drives — the local metric guards
+against a hidden blowup, so no truncated-slice over-claim.
+
+**Recommended config**: `cov_floor_m2=25` + `correction_rot_suppress_kappa=0.8` (safe default, clear
+of urban07/17 dbar). kappa=0.5 lowers the urban12 transient max (304 vs 409) but risks touching
+urban07 (dbar 0.55). `cov_floor_m2` is an independent per-deploy consistency/accuracy knob.
+
+## 9. Open questions
 
 - `rot_suppress_kappa` value: start ~0.8 (just below the in-gate dbar ceiling 1.73) and sweep down.
 - Detect "rotation-unobserving" by `H` rotation-column norm vs a config flag on the correction type?
