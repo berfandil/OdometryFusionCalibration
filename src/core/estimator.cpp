@@ -151,6 +151,9 @@ void hash_histogram(persist::Writer& w, const HistogramConfig& h) {
     w.put_i32(h.sliding_k);
     w.put_bool(h.vote_split);
     w.put_bool(h.subbin);
+    // Slice 16: the centroid readout changes what a committed mode MEANS (a different sub-bin
+    // estimator) -> calibration-shaping, hashed. Flipping it rejects a cross-flag restore.
+    w.put_bool(h.subbin_centroid);
 }
 
 std::uint64_t config_hash(const Config& cfg) {

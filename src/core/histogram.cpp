@@ -25,7 +25,10 @@
 //       offset = 0.5*(h[i-1]-h[i+1]) / (h[i-1]-2 h[i]+h[i+1])  (guarded denom),
 //       mode = bin_center(i) + offset*width, wrapped into range if circular. For a
 //     non-circular boundary bin (a neighbor missing) we fall back to the bin
-//     center. subbin==false always returns the bin center.
+//     center. subbin==false always returns the bin center. subbin_centroid==true
+//     (Slice 16, opt-in) replaces the parabola with the mass-weighted centroid
+//     over peak+-1 — exact for a vote-split point mass at any sub-bin position,
+//     graceful one-sided read at a non-circular boundary (no center cliff).
 //   * Confidence = peak concentration = (peak bin + its two immediate neighbors) /
 //     total, clamped to [0,1]; 0 when empty.
 #include "ofc/core/histogram.hpp"
@@ -64,6 +67,7 @@ Status Histogram1D::configure(const HistogramConfig& cfg) {
     sliding_k_   = cfg.sliding_k;
     vote_split_  = cfg.vote_split;
     subbin_      = cfg.subbin;
+    subbin_centroid_ = cfg.subbin_centroid;
     configured_  = true;
 
     reset();
@@ -254,6 +258,26 @@ Scalar Histogram1D::mode() const {
     const Scalar center = bin_center(i);
 
     if (!subbin_) return center;
+
+    if (subbin_centroid_) {
+        // Slice 16: mass-weighted centroid over the peak bin and its two immediate
+        // neighbors — exact for a vote-split point mass at any sub-bin position
+        // (the parabola pulls toward the peak-bin center). Neighbor MASS is
+        // wrap-aware via mass_at (0 outside a non-circular boundary -> a graceful
+        // one-sided centroid, no fall-back-to-center cliff); neighbor CENTERS are
+        // the UNWRAPPED center(p) +- width so a seam-straddling peak reads
+        // continuously, then the result folds back into range.
+        //   centroid = (hm*(c-w) + h0*c + hp*(c+w)) / (hm+h0+hp)
+        //            = c + (hp - hm)/(hm+h0+hp) * w
+        const Scalar hm = mass_at(i - 1);
+        const Scalar h0 = mass_at(i);
+        const Scalar hp = mass_at(i + 1);
+        const Scalar msum = hm + h0 + hp;
+        if (msum <= kEmptyEps) return center;   // degenerate guard (non-empty => h0 > 0)
+        Scalar m = center + (hp - hm) / msum * width();
+        if (circular_) m = fold(m);             // a seam peak can read past range_max
+        return m;
+    }
 
     // Parabolic interpolation needs both neighbors. Non-circular boundary bins
     // miss one -> fall back to the bin center.

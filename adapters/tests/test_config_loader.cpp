@@ -139,6 +139,57 @@ TEST_CASE("ConfigLoader: q_scale / q_floor / adaptive_q (the real-data covarianc
     }
 }
 
+TEST_CASE("ConfigLoader: subbin_centroid round-trips into all five calibration histograms") {
+    // Slice 16: one [global] key switches the centroid sub-bin readout on for
+    // every calibration histogram (so3/roll/xyz/scale/offset).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "subbin_centroid = true\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK(c.so3_hist.subbin_centroid);
+        CHECK(c.roll_hist.subbin_centroid);
+        CHECK(c.xyz_hist.subbin_centroid);
+        CHECK(c.scale_hist.subbin_centroid);
+        CHECK(c.offset_hist.subbin_centroid);
+    }
+    // Explicit false parses too (and matches the default).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "subbin_centroid = false\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK_FALSE(c.so3_hist.subbin_centroid);
+        CHECK_FALSE(c.offset_hist.subbin_centroid);
+    }
+    // Key absent -> default OFF everywhere (bit-identical legacy behavior).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK_FALSE(c.so3_hist.subbin_centroid);
+        CHECK_FALSE(c.roll_hist.subbin_centroid);
+        CHECK_FALSE(c.xyz_hist.subbin_centroid);
+        CHECK_FALSE(c.scale_hist.subbin_centroid);
+        CHECK_FALSE(c.offset_hist.subbin_centroid);
+    }
+    // Malformed value -> clear error.
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nsubbin_centroid = maybe\n") == Status::InvalidConfig);
+        CHECK_FALSE(loader.error().empty());
+    }
+}
+
 TEST_CASE("ConfigLoader free function: copies sensor storage to the caller-owned vector") {
     const std::string text = "[sensor.0]\nid = 0\nis_reference = true\n";
     Config cfg;

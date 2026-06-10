@@ -430,6 +430,42 @@ TEST_CASE("persistence config-hash guard: a changed rig rejects stale state") {
 }
 
 // ===========================================================================
+// Slice 16: subbin_centroid is calibration-shaping -> it joins the config-hash
+// stream. A blob written under subbin_centroid=false (the default) must be
+// REJECTED by a rig that flips the flag on any histogram (cross-flag restore),
+// because the persisted committed calibration was read with a different
+// sub-bin estimator.
+// ===========================================================================
+TEST_CASE("persistence config-hash guard: flipping subbin_centroid rejects a cross-flag restore") {
+    std::vector<unsigned char> blob;
+    converge_and_serialize_scale(blob);    // written with subbin_centroid = false everywhere
+
+    static const Trajectory tr = bootstrap_traj();
+
+    // (a) Flip the flag on ONE histogram (scale_hist) -> different hash -> reject.
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.scale_hist.subbin_centroid = true;
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (b) Flip it on a DIFFERENT histogram (so3_hist) -> also rejected (every
+    // histogram's flag is hashed, not just the scale channel's).
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.so3_hist.subbin_centroid = true;
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+}
+
+// ===========================================================================
 // Framing rejections: checksum (flipped byte), version, magic, capacity, NotInitialized.
 // ===========================================================================
 TEST_CASE("persistence framing: checksum / version / magic / capacity / not-initialized") {

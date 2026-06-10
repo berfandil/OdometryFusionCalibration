@@ -526,6 +526,209 @@ TEST_CASE("confidence stays within [0,1] and reset clears state") {
     CHECK(h.mode() == doctest::Approx(0.0));   // midpoint of [-3, 3]
 }
 
+// ===========================================================================
+// Slice 16 — opt-in centroid sub-bin readout (subbin_centroid).
+// mode() returns the mass-weighted centroid over the peak bin and its two
+// immediate neighbors instead of the parabolic interpolation. Default OFF
+// keeps every existing path byte-identical.
+// ===========================================================================
+
+namespace {
+// Same linear/circular helpers with the centroid readout switched on.
+HistogramConfig linear_centroid(int n, Scalar lo, Scalar hi, bool split = true,
+                                bool sub = true) {
+    HistogramConfig c = linear(n, lo, hi, split, sub);
+    c.subbin_centroid = true;
+    return c;
+}
+
+HistogramConfig circular_centroid(int n, Scalar lo, Scalar hi, bool split = true,
+                                  bool sub = true) {
+    HistogramConfig c = circular(n, lo, hi, split, sub);
+    c.subbin_centroid = true;
+    return c;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Acceptance 1: a SINGLE vote at value v with vote_split lands as a linear
+// split across two bins; the 3-bin centroid reconstructs v EXACTLY (<= 1e-12
+// of width) at ANY sub-bin position. The parabola does not — pin its >= 0.1-bin
+// error at the quarter-bin position (the documented Slice-16 rationale).
+// ---------------------------------------------------------------------------
+TEST_CASE("centroid readout reconstructs a single split vote exactly at any sub-bin position") {
+    // 10 bins over [0, 10): width 1, bin 4 center at 4.5. Sub-bin fractions f
+    // measured from the bin-4 center toward the bin-5 center.
+    const Scalar fractions[] = {0.0, 0.1, 0.25, 0.4, 0.5};
+    for (const Scalar f : fractions) {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0)) == Status::Ok);
+        const Scalar v = 4.5 + f;          // f bins above the bin-4 center
+        h.add(v);
+        CHECK(std::abs(h.mode() - v) <= 1e-12);   // exact (width = 1)
+    }
+
+    // The parabola at the SAME quarter-bin vote reads ~0.1 bins instead of
+    // 0.25 — a systematic pull toward the peak-bin center of >= 0.1 bins.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear(10, 0.0, 10.0)) == Status::Ok);   // parabolic (default)
+        const Scalar v = 4.75;             // quarter-bin position
+        h.add(v);
+        const Scalar err_bins = std::abs(h.mode() - v) / 1.0;        // width = 1
+        CHECK(err_bins >= 0.1);            // pinned bias (analytic: reads 0.1, true 0.25)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance 2: a symmetric multi-vote spread -> centroid == the true mean
+// (votes split linearly, the centroid is linear in mass, all mass within
+// peak±1); the parabola misreads the same spread by >> the centroid error.
+// ---------------------------------------------------------------------------
+TEST_CASE("centroid reads a symmetric vote spread at its true mean; parabola does not") {
+    const Scalar mu = 4.75;                // quarter-bin position inside bin 4
+    const Scalar d  = 0.3;                 // spread stays within bins 3..5
+
+    // SlidingK (window > vote count) -> exact accumulation, no decay between
+    // the votes, so the analytic mean recovery holds to round-off.
+    HistogramConfig cc = linear_centroid(10, 0.0, 10.0);
+    cc.aging = Aging::SlidingK;
+    cc.sliding_k = 100;
+    Histogram1D hc;
+    REQUIRE(hc.configure(cc) == Status::Ok);
+    hc.add(mu - d);
+    hc.add(mu + d);
+    hc.add(mu);
+    CHECK(std::abs(hc.mode() - mu) <= 1e-12);   // exact mean recovery
+
+    HistogramConfig cp = linear(10, 0.0, 10.0);
+    cp.aging = Aging::SlidingK;
+    cp.sliding_k = 100;
+    Histogram1D hp;
+    REQUIRE(hp.configure(cp) == Status::Ok);    // parabolic
+    hp.add(mu - d);
+    hp.add(mu + d);
+    hp.add(mu);
+    CHECK(std::abs(hp.mode() - mu) > 0.1);      // the parabola's pull-to-center bias
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance 3: circular seam — a peak straddling the wrap reads continuously.
+// Neighbor MASS wraps; neighbor CENTERS unwrap (center(p) ± width); the
+// centroid folds back into range.
+// ---------------------------------------------------------------------------
+TEST_CASE("centroid reads continuously across the circular wrap seam") {
+    // 8 bins over [0, 8), width 1, seam between bin 7 (center 7.5) and bin 0
+    // (center 0.5 == unwrapped 8.5). Single split votes at sub-bin positions on
+    // BOTH sides of the seam must read back exactly (modulo the fold).
+    const Scalar votes[] = {7.6, 7.75, 7.95, 8.05, 0.1, 0.4};
+    for (const Scalar v : votes) {
+        Histogram1D h;
+        REQUIRE(h.configure(circular_centroid(8, 0.0, 8.0)) == Status::Ok);
+        h.add(v);
+        const Scalar m = h.mode();
+        // In range...
+        CHECK(m >= 0.0);
+        CHECK(m < 8.0);
+        // ...and circularly exact: distance to the folded vote ~ 0.
+        Scalar dist = std::fmod(std::abs(m - v), 8.0);
+        if (dist > 4.0) dist = 8.0 - dist;
+        CHECK(dist <= 1e-12);
+    }
+
+    // A 50/50 seam-straddling pair (vote exactly AT the seam value 0 == 8):
+    // mass splits bin 7 / bin 0 equally; the centroid must read the seam (0.0),
+    // not a mid-range value.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(circular_centroid(8, 0.0, 8.0)) == Status::Ok);
+        h.add(0.0);                        // folds: 0.5 to bin 7, 0.5 to bin 0
+        const Scalar m = h.mode();
+        Scalar dist = std::fmod(std::abs(m - 0.0), 8.0);
+        if (dist > 4.0) dist = 8.0 - dist;
+        CHECK(dist <= 1e-12);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance 4: non-circular boundary peak — the missing neighbor contributes
+// 0 mass (and its unwrapped center to nothing); the one-sided centroid is
+// still exact for an in-range split pair, with NO fall-back-to-center cliff
+// (the parabola falls back to the bin center there). No NaN ever.
+// ---------------------------------------------------------------------------
+TEST_CASE("centroid at a non-circular boundary peak degrades gracefully (no cliff, no NaN)") {
+    // (a) Split vote near the LOWER boundary, pair fully in range: exact.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0)) == Status::Ok);
+        h.add(0.7);                        // splits bins 0/1; peak = boundary bin 0
+        CHECK(h.peak_bin() == 0);
+        CHECK(std::abs(h.mode() - 0.7) <= 1e-12);   // graceful one-sided centroid
+
+        // The parabolic path at the same vote falls back to the bin center 0.5
+        // (missing left neighbor) — the cliff the centroid removes.
+        Histogram1D hp;
+        REQUIRE(hp.configure(linear(10, 0.0, 10.0)) == Status::Ok);
+        hp.add(0.7);
+        CHECK(hp.mode() == doctest::Approx(0.5));
+    }
+    // (b) Split vote near the UPPER boundary: exact from the other side.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0)) == Status::Ok);
+        h.add(9.3);                        // splits bins 8/9; peak = boundary bin 9
+        CHECK(h.peak_bin() == 9);
+        CHECK(std::abs(h.mode() - 9.3) <= 1e-12);
+    }
+    // (c) ALL mass in the boundary bin (a clamped out-of-range vote): the
+    // centroid is the bin center; finite, no NaN.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0)) == Status::Ok);
+        h.add(-5.0);                       // clamps wholly into bin 0
+        const Scalar m = h.mode();
+        CHECK(std::isfinite(m));
+        CHECK(m == doctest::Approx(0.5));  // one-sided centroid of a point mass
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance 5 (default-off): subbin_centroid == false leaves the parabolic
+// path bit-identical; subbin == false still returns the bin center even with
+// the centroid flag set; an empty histogram still reads the midpoint.
+// ---------------------------------------------------------------------------
+TEST_CASE("subbin_centroid honors the existing switches: default-off, subbin=false, empty") {
+    // Default-off: the planted (2, 8, 6) triple reads the EXACT analytic
+    // parabola value — bitwise the same expression as before the flag existed.
+    {
+        Histogram1D h;
+        HistogramConfig c = linear(10, 0.0, 10.0, /*split=*/false, /*sub=*/true);
+        c.aging = Aging::SlidingK;
+        c.sliding_k = 100;
+        REQUIRE(h.configure(c) == Status::Ok);
+        for (int k = 0; k < 2; ++k) h.add(3.5);
+        for (int k = 0; k < 8; ++k) h.add(4.5);
+        for (int k = 0; k < 6; ++k) h.add(5.5);
+        const Scalar expected_offset = 0.5 * (2.0 - 6.0) / (2.0 - 2.0 * 8.0 + 6.0);
+        CHECK(h.mode() == 4.5 + expected_offset * 1.0);   // EXACT equality, not Approx
+    }
+    // subbin == false dominates: the centroid flag alone must not enable a
+    // sub-bin readout.
+    {
+        Histogram1D h;
+        HistogramConfig c = linear_centroid(10, 0.0, 10.0, /*split=*/true, /*sub=*/false);
+        REQUIRE(h.configure(c) == Status::Ok);
+        h.add(4.75);
+        CHECK(h.mode() == doctest::Approx(4.5));   // bin center
+    }
+    // Empty: unchanged midpoint.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(64, 2.0, 6.0)) == Status::Ok);
+        CHECK(h.mode() == doctest::Approx(4.0));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // add() on an unconfigured histogram is a safe no-op.
 // ---------------------------------------------------------------------------

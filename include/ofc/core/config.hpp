@@ -27,6 +27,12 @@ struct HistogramConfig {
     int    sliding_k  = 1000;
     bool   vote_split = true;
     bool   subbin     = true;
+    // Opt-in centroid sub-bin readout (Slice 16; honored only when subbin == true). The
+    // parabolic interpolation systematically pulls toward the peak-bin center (a quarter-bin
+    // offset reads ~0.1 bins instead of 0.25); the mass-weighted centroid over peak+-1 is
+    // exact for a vote-split point mass at any sub-bin position. Default OFF = byte-identical
+    // legacy behavior.
+    bool   subbin_centroid = false;
 };
 
 struct SensorConfig {

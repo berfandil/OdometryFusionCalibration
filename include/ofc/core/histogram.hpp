@@ -123,6 +123,7 @@ private:
     int    sliding_k_  = 1000;
     bool   vote_split_ = true;
     bool   subbin_     = true;
+    bool   subbin_centroid_ = false;   // Slice 16: centroid readout over peak+-1
     bool   configured_ = false;
 
     // Fixed-capacity storage (no heap).
