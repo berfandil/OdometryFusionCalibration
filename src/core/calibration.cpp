@@ -11,6 +11,7 @@
 
 #include <Eigen/Cholesky>     // LDLT (lever-arm normal-equation solve)
 #include <Eigen/Eigenvalues>  // SelfAdjointEigenSolver (conditioning guard)
+#include <Eigen/SVD>          // JacobiSVD (rot3d Wahba/Kabsch solve, Slice 17)
 
 #include <algorithm>
 #include <cmath>
@@ -406,6 +407,17 @@ constexpr Scalar kAxisInfoMin = Scalar(1e-2);
 // Ridge for the per-window voting solve (relative to the largest AᵀA diagonal). Small
 // enough not to bias observable axes; large enough to pin an unobservable axis at prior.
 constexpr Scalar kVoteRidgeRel = Scalar(1e-3);
+// rot3d two-axis observability floor (Slice 17): the Wahba solve is votable only when the
+// MIDDLE eigenvalue of the axis Gram BBw clears this fraction of the largest (two distinct
+// rotation axes excited; Kabsch needs only two correspondences — gate λ_mid, NOT λ_min).
+// FIXED namespace constant like kAxisInfoMin (not a config knob — it governs the
+// rank-deficiency behaviour the slice is judged on). 1e-2 chosen to sit decisively between
+// the two regimes the prototype measured (euroc_run/proto_rot_handeye.py): genuine
+// multi-axis excitation reads λ_mid/λ_max ≳ 5e-2 (EuRoC drone: 0.30/5.3 ≈ 0.057), while
+// planar yaw-only motion reads ~0 (KAIST ground: 0/19.05), and realistic per-window axis
+// noise (≈20 mrad off-axis vs ≈0.5 rad about-axis) contributes only ~(0.02/0.5)² ≈ 1.6e-3
+// — a >6× margin on both sides at 1e-2.
+constexpr Scalar kAxisPairMin = Scalar(1e-2);
 
 // Strip the roll DOF from a rotation, returning its yaw/pitch part (the minimal rotation
 // taking e_x -> the rotation's forward axis R·e_x). Roll is rotation about the forward
@@ -497,6 +509,31 @@ Scalar Phase2Calibrator::best_roll(const Mat3& R_yp, const Mat3& R_A, const Mat3
     return r;
 }
 
+bool Phase2Calibrator::axis_pair_observable(const Mat3& BBw) {
+    // Two-axis gate (Slice 17): λ_mid ≥ kAxisPairMin · λ_max on the symmetric-PSD axis
+    // Gram. Rank-1 (planar) motion has λ_mid ≈ 0 and never clears the floor.
+    Eigen::SelfAdjointEigenSolver<Mat3> es(BBw);
+    if (es.info() != Eigen::Success) return false;
+    const Vec3 ev = es.eigenvalues();                // ascending: ev(1) = λ_mid
+    if (!(ev(2) > Scalar(0))) return false;          // no information at all
+    return ev(1) >= kAxisPairMin * ev(2);
+}
+
+bool Phase2Calibrator::wahba_solve(const Mat3& Mw, Mat3& R_out) {
+    // Kabsch: R̂ = U·diag(1, 1, det(U Vᵀ))·Vᵀ from SVD(Mw) — the LS rotation maximizing
+    // tr(Rᵀ Mw), i.e. minimizing Σ w‖a − R b‖² over the accumulated axis correspondences.
+    Eigen::JacobiSVD<Mat3> svd(Mw, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    const Mat3 U = svd.matrixU();
+    const Mat3 V = svd.matrixV();
+    const Scalar d = (U * V.transpose()).determinant();
+    Mat3 D = Mat3::Identity();
+    D(2, 2) = (d < Scalar(0)) ? Scalar(-1) : Scalar(1);
+    const Mat3 R = U * D * V.transpose();
+    if (!R.allFinite()) return false;
+    R_out = R;
+    return true;
+}
+
 Vec3 Phase2Calibrator::solve_ridge(const Mat3& AtA, const Vec3& Atb,
                                    const Vec3& t_prior, Scalar ridge, bool obs[3]) {
     // Largest diagonal (the information scale). Pure PSD normal matrix -> diagonals >= 0.
@@ -519,8 +556,9 @@ Vec3 Phase2Calibrator::solve_ridge(const Mat3& AtA, const Vec3& Atb,
 Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
     if (static_cast<int>(reference_id) >= kMaxSources) return Status::OutOfRange;
 
-    roll_cfg_ = cfg.roll_hist;
-    xyz_cfg_  = cfg.xyz_hist;
+    roll_cfg_  = cfg.roll_hist;
+    xyz_cfg_   = cfg.xyz_hist;
+    rot3d_cfg_ = cfg.so3_hist;   // rot3d channels reuse the Phase-1 so(3) shape (Slice 17)
 
     for (int i = 0; i < kMaxSources; ++i) {
         const Status hs = roll_[i].configure(roll_cfg_);
@@ -530,11 +568,23 @@ Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
         const Status hs = xyz_[i].configure(xyz_cfg_);
         if (!ok(hs)) return hs;
     }
+    for (int i = 0; i < 3 * kMaxSources; ++i) {
+        const Status hs = rot3d_[i].configure(rot3d_cfg_);
+        if (!ok(hs)) return hs;
+    }
 
     reference_id_   = reference_id;
     turn_omega_min_ = std::max(Scalar(0), cfg.turn_omega_min);
     strategy_       = cfg.phase2_strategy;
     vote_weight_    = cfg.vote_weight;
+    rot3d_enabled_  = cfg.rot3d_enabled;
+    // Mw/BBw decay per ACCEPTED window = the so(3) histogram's decay_gamma (Slice 17),
+    // independent of the histogram aging MODE (a SlidingK ring cannot evict from a rank
+    // accumulator). Defensive clamp: under SlidingK the knob is unvalidated by the
+    // histogram configure, so an out-of-(0,1] value falls back to 1 (no decay).
+    rot3d_gamma_ = (cfg.so3_hist.decay_gamma > Scalar(0) &&
+                    cfg.so3_hist.decay_gamma <= Scalar(1))
+                       ? cfg.so3_hist.decay_gamma : Scalar(1);
     last_gate_turning_ = false;
 
     configured_ = true;
@@ -552,8 +602,12 @@ void Phase2Calibrator::reset() {
         rows_[i]    = Scalar(0);
         ryp_set_[i] = false;
         ids_[i]     = 0;
+        mw_[i]       = Mat3::Zero();
+        bbw_[i]      = Mat3::Zero();
+        rot3d_bp_[i] = Mat3::Identity();
     }
     for (int i = 0; i < 3 * kMaxSources; ++i) xyz_[i].reset();
+    for (int i = 0; i < 3 * kMaxSources; ++i) rot3d_[i].reset();
     source_count_      = 0;
     last_gate_turning_ = false;
 }
@@ -577,6 +631,9 @@ int Phase2Calibrator::ensure_slot(SourceId id) {
     atb_[slot]     = Vec3::Zero();
     rows_[slot]    = Scalar(0);
     ryp_set_[slot] = false;
+    mw_[slot]       = Mat3::Zero();
+    bbw_[slot]      = Mat3::Zero();
+    rot3d_bp_[slot] = Mat3::Identity();
     return slot;
 }
 
@@ -586,6 +643,10 @@ Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic) {
     const int slot = ensure_slot(id);
     if (slot < 0)                            return Status::CapacityExceeded;
     prior_[slot] = prior_extrinsic;
+    // The rot3d basepoint starts at the registered prior's rotation (Slice 17). set_prior
+    // is the per-source REGISTRATION call (once, before observe()); the later every-step
+    // set_basepoint value sync deliberately does NOT move it (see set_rot3d_basepoint).
+    rot3d_bp_[slot] = prior_extrinsic.R;
     return Status::Ok;
 }
 
@@ -617,6 +678,28 @@ void Phase2Calibrator::reset_lever(SourceId id) {
     xyz_[3 * s + 0].reset();
     xyz_[3 * s + 1].reset();
     xyz_[3 * s + 2].reset();
+}
+
+Status Phase2Calibrator::set_rot3d_basepoint(SourceId id, const Mat3& R_bp) {
+    // Re-anchor the rot3d so(3) basepoint to a committed rotation (Slice 17). Same
+    // validation / slot semantics as set_basepoint; only the rot3d basepoint moves —
+    // the caller pairs this with reset_rot3d (the stale δφ votes were cast @ the old
+    // basepoint). Mw/BBw are basepoint-independent and are NOT touched.
+    if (!configured_)                        return Status::NotInitialized;
+    if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
+    const int slot = ensure_slot(id);
+    if (slot < 0)                            return Status::CapacityExceeded;
+    rot3d_bp_[slot] = R_bp;
+    return Status::Ok;
+}
+
+void Phase2Calibrator::reset_rot3d(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    rot3d_[3 * s + 0].reset();
+    rot3d_[3 * s + 1].reset();
+    rot3d_[3 * s + 2].reset();
 }
 
 Status Phase2Calibrator::set_yaw_pitch(SourceId id, const Mat3& R_yp) {
@@ -665,7 +748,10 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
 
     const Mat3& R_A = A_base.R;
     const Vec3& t_A = A_base.t;
-    const Scalar rotA = so3::log(R_A).norm();
+    // a = so3::log(R_A): the per-window guard operand AND the rot3d axis row (Slice 17 —
+    // unnormalized, so |angle| bakes the excitation weight into the Wahba accumulation).
+    const Vec3 a_axis = so3::log(R_A);
+    const Scalar rotA = a_axis.norm();
     // Per-window near-singular guard: a low-rotation A is the ω×r→0 regime — its
     // translation row is near-zero and ill-conditioned. Skip the whole window's votes.
     if (rotA < kRotRowMin) return Status::NotReady;
@@ -728,6 +814,38 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
         if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
         if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
+
+        // --- rot3d: axis-correspondence Wahba accumulation + vote (Slice 17) -----
+        // a = log(R_A), b = log(R_B); the hand-eye rotation identity R_A R_X = R_X R_B is
+        // equivalently a = R_X·b per window. Accumulate Mw += w·a bᵀ / BBw += w·b bᵀ (both
+        // decay-aged per ACCEPTED window), then — only when TWO distinct rotation axes have
+        // been excited (the BBw λ_mid gate, the observability spine) — solve the running
+        // Kabsch R̂ and vote the basepoint-relative residual δφ = log(R̂·R_bpᵀ) into the 3
+        // so(3) channels. Rank-1 (planar yaw-only) never clears the gate: channels stay
+        // empty -> conf 0 -> never commits -> planar behavior unchanged. Disabled entirely
+        // (no state touched) when rot3d_enabled is off — the byte-identical default.
+        if (rot3d_enabled_) {
+            const Vec3 b_axis = so3::log(R_B);
+            // ‖a‖ ≥ kRotRowMin is already guaranteed by the per-window guard above; require
+            // the same floor on ‖b‖ (a degenerate/noise-only sensor rotation row).
+            if (b_axis.norm() >= kRotRowMin) {
+                mw_[slot]  = rot3d_gamma_ * mw_[slot]  + w * (a_axis * b_axis.transpose());
+                bbw_[slot] = rot3d_gamma_ * bbw_[slot] + w * (b_axis * b_axis.transpose());
+                if (axis_pair_observable(bbw_[slot])) {
+                    Mat3 Rhat;
+                    if (wahba_solve(mw_[slot], Rhat)) {
+                        const Vec3 dphi = so3::log(Rhat * rot3d_bp_[slot].transpose());
+                        // A basepoint ~π off the solve sits at the so3::log singularity —
+                        // skip the (non-finite / unstable) vote rather than deposit it.
+                        if (dphi.allFinite()) {
+                            rot3d_[3 * slot + 0].add(dphi.x(), w);
+                            rot3d_[3 * slot + 1].add(dphi.y(), w);
+                            rot3d_[3 * slot + 2].add(dphi.z(), w);
+                        }
+                    }
+                }
+            }
+        }
 
         any = true;
     }
@@ -826,6 +944,46 @@ Scalar Phase2Calibrator::xyz_vote_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return rows_[s];
+}
+
+// --- rot3d readouts (Slice 17) ----------------------------------------------
+
+Mat3 Phase2Calibrator::rot3d(SourceId id) const {
+    if (!configured_) return Mat3::Identity();
+    const int s = slot_for(id);
+    if (s < 0) return Mat3::Identity();
+    if (rot3d_[3 * s + 0].empty()) return rot3d_bp_[s];   // unvoted -> basepoint
+    Vec3 phi;
+    phi << rot3d_[3 * s + 0].mode(), rot3d_[3 * s + 1].mode(), rot3d_[3 * s + 2].mode();
+    // exp(φ_mode)·R_bp — the basepoint-relative composition the votes were cast in
+    // (δφ = log(R̂·R_bpᵀ) ⇒ exp(δφ)·R_bp = R̂). Contractive under re-anchor: moving the
+    // basepoint onto a committed rot3d makes subsequent residuals re-vote ≈ 0 (R̂ is
+    // data-driven from Mw, basepoint-independent).
+    return so3::exp(phi) * rot3d_bp_[s];
+}
+
+Scalar Phase2Calibrator::rot3d_confidence(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    const Scalar cx = rot3d_[3 * s + 0].confidence();
+    const Scalar cy = rot3d_[3 * s + 1].confidence();
+    const Scalar cz = rot3d_[3 * s + 2].confidence();
+    return std::min(cx, std::min(cy, cz));   // weakest channel bounds the joint reliability
+}
+
+Scalar Phase2Calibrator::rot3d_vote_count(SourceId id) const {
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return rot3d_[3 * s + 0].total();
+}
+
+bool Phase2Calibrator::rot3d_observable(SourceId id) const {
+    if (!configured_) return false;
+    const int s = slot_for(id);
+    if (s < 0) return false;
+    return axis_pair_observable(bbw_[s]);
 }
 
 } // namespace ofc

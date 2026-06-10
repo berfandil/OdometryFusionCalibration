@@ -17,6 +17,7 @@ add_executable(ofc_tests
     test_timesync.cpp
     test_calib_phase1.cpp
     test_calib_phase2.cpp
+    test_calib_rot3d.cpp
     test_calib_feedback.cpp
     test_smoother.cpp
     test_smoother_calib.cpp

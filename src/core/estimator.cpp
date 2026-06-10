@@ -181,6 +181,10 @@ std::uint64_t config_hash(const Config& cfg) {
     w.put_bool(cfg.reverse_fold);
     w.put_bool(cfg.ref_cross_check);
     w.put_i32(static_cast<std::int32_t>(cfg.phase2_strategy));
+    // Slice 17: the rot3d flag changes WHICH estimator drives the published rotation (the
+    // full Wahba solve vs yaw/pitch ∘ roll) -> calibration-shaping, hashed. Flipping it
+    // rejects a cross-flag restore.
+    w.put_bool(cfg.rot3d_enabled);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -377,6 +381,11 @@ struct Estimator::Impl {
     bool     roll_committed[kMaxSourcesCap]  = {};   // roll about forward
     bool     lever_committed[kMaxSourcesCap] = {};   // xyz lever arm
     bool     scale_committed[kMaxSourcesCap] = {};   // per-source scale
+    // Turn-regime FULL rotation extrinsic (Slice 17, only when cfg.rot3d_enabled). Same
+    // commit_gate_reanchor machinery; on commit the published prior_extrinsic.R is driven
+    // by calib2.rot3d() (SUPERSEDING the yaw/pitch ∘ roll composition — rot3d only ever
+    // commits under multi-axis excitation where the full 3-DOF solve strictly dominates).
+    bool     rot3d_committed[kMaxSourcesCap] = {};   // full rotation (axis hand-eye)
 
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
@@ -578,6 +587,7 @@ struct Estimator::Impl {
             if (id == cfg.reference_sensor_id) {
                 ext_committed[i] = roll_committed[i] = false;
                 lever_committed[i] = scale_committed[i] = false;
+                rot3d_committed[i] = false;
                 continue;
             }
 
@@ -611,6 +621,20 @@ struct Estimator::Impl {
             scale_committed[i] = commit_gate_reanchor(
                 was_scale, calib1.scale_confidence(id), calib1.vote_count(id),
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+
+            // --- rot3d: full rotation extrinsic (Slice 17, opt-in) --------------------
+            // Same N_min + hysteresis + re-fill gate on the rot3d channels' confidence /
+            // vote mass. Entirely inert (flag pinned false, zero calls) when the knob is
+            // off — the byte-identical default. On planar (yaw-only) motion the BBw rank
+            // gate keeps the channels empty, so this can never commit there.
+            const bool was_rot3d = rot3d_committed[i];
+            if (cfg.rot3d_enabled) {
+                rot3d_committed[i] = commit_gate_reanchor(
+                    was_rot3d, calib2.rot3d_confidence(id), calib2.rot3d_vote_count(id),
+                    cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+            } else {
+                rot3d_committed[i] = false;
+            }
 
             // === ROTATION + LEVER feedback (yaw/pitch ∘ roll, xyz) ===================
             // CONTRACTIVE EXTRINSIC RE-ANCHOR (Slice 8). calib1 recovers the forward AXIS as
@@ -648,6 +672,25 @@ struct Estimator::Impl {
             if (lever_committed[i]) {
                 prior_extrinsic[i].t = calib2.lever_arm(id);
             }
+            // === ROT3D publish precedence (Slice 17) =================================
+            // A committed rot3d SUPERSEDES the yaw/pitch ∘ roll rotation published above:
+            // it only ever commits under multi-axis excitation, where the full 3-DOF Wahba
+            // solve strictly dominates the partial composition. Placed AFTER the ext/roll
+            // publish so it wins every committed step; the existing path publishes as
+            // today whenever rot3d is uncommitted (planar motion / knob off). Phase-1's
+            // own commit/re-anchor (below) stays untouched.
+            if (rot3d_committed[i]) {
+                prior_extrinsic[i].R = calib2.rot3d(id);
+            }
+            // Rot3d RISING-EDGE RE-ANCHOR (the contractive iterate, mirroring the yaw/
+            // pitch re-anchor below): move the rot3d basepoint onto the just-committed
+            // rotation and drop the stale δφ votes (cast @ the old basepoint) so the
+            // residual re-votes ≈ 0 around it. Mw/BBw are basepoint-INDEPENDENT and keep
+            // accumulating — the running Wahba solve is unaffected by the re-anchor.
+            if (rot3d_committed[i] && !was_rot3d) {
+                calib2.set_rot3d_basepoint(id, prior_extrinsic[i].R);
+                calib2.reset_rot3d(id);
+            }
             // (2) Yaw/pitch RE-ANCHOR (rising edge of the yaw/pitch commit): move calib1's
             // so(3) basepoint to the recovered MINIMAL rotation (extrinsic().R — the gauge that
             // satisfies X.R·dir_B = e_x, so this composition is CONTRACTIVE) and drop the
@@ -668,7 +711,8 @@ struct Estimator::Impl {
             // Keep calib2's prior (lever-arm fallback for an unobservable axis + the
             // PairwisePinnedRef gauge) tracking the committed extrinsic — value sync only,
             // NOT a histogram reset.
-            if (ext_committed[i] || roll_committed[i] || lever_committed[i]) {
+            if (ext_committed[i] || roll_committed[i] || lever_committed[i] ||
+                rot3d_committed[i]) {
                 calib2.set_basepoint(id, prior_extrinsic[i]);
             }
 
@@ -734,6 +778,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->roll_committed[i]    = false;
         impl_->lever_committed[i]   = false;
         impl_->scale_committed[i]   = false;
+        impl_->rot3d_committed[i]   = false;
         impl_->med_slot[i]          = -1;
         // Variance-EMA reliability reset (Slice 9, D17): clean EMA state + neutral
         // multiplier so the first kRelWarmup steps weight exactly as Slice 2.
@@ -1246,6 +1291,13 @@ Status Estimator::step(Timestamp now) {
         // with the recovered roll, and uses the LS-mode lever arm (the prior until a turn
         // regime is observed — so before any turning this equals the Phase-1 extrinsic).
         cs.extrinsic     = s.calib2.extrinsic(id);
+        // rot3d precedence (Slice 17): when the full-rotation hand-eye has committed, the
+        // published prior rotation is the rot3d solve — surface the SAME rotation in the
+        // snapshot (it supersedes the yaw/pitch ∘ roll composition; the harness's extr_rot
+        // print then reports it with no extra wiring). Inert (flag pinned false) by default.
+        if (cfg.rot3d_enabled && s.rot3d_committed[i]) {
+            cs.extrinsic.R = s.calib2.rot3d(id);
+        }
         cs.scale         = s.prior_scale[i] * s.calib1.scale(id);
         cs.time_offset_s = s.effective_offset(i);
         // confidence stays the TIME-OFFSET confidence (Slice 5); per-DOF confidences are
@@ -1469,6 +1521,19 @@ Status Estimator::step(Timestamp now) {
 
 const Result& Estimator::latest() const { return impl_->result; }
 
+bool Estimator::rot3d_committed(SourceId id) const {
+    // Diagnostic readout (Slice 17): the latched per-source rot3d commit state from the
+    // last apply_calib_feedback(). Always false when uninited / unknown id / knob off
+    // (the flag is pinned false in that case). Bounded linear scan; no heap.
+    if (impl_ == nullptr || !impl_->inited) return false;
+    for (int i = 0; i < impl_->source_count; ++i) {
+        if (impl_->sources[i] != nullptr && impl_->sources[i]->id() == id) {
+            return impl_->rot3d_committed[i];
+        }
+    }
+    return false;
+}
+
 // ---- Warm-restart persistence (Slice 12, D23) ------------------------------------------
 // serialize()/deserialize() of the COMMITTED CALIBRATION STATE into a caller-owned FIXED
 // buffer, versioned + checksummed + config-hash-guarded, so a fresh estimator with the SAME
@@ -1500,6 +1565,11 @@ const Result& Estimator::latest() const { return impl_->result; }
 //     f64    effective_time_offset_s   (the committed offset value, folded into the prior on
 //                                        restore — the offset DOF's re-anchor: see below)
 //     uint8  ext_committed, roll_committed, lever_committed, scale_committed, offset_committed
+//     uint8  rot3d_committed            (Slice 17 — the committed rot3d VALUE itself lives in
+//                                        prior_extrinsic.R above; this flag drives the re-fill
+//                                        hold + re-anchors the rot3d basepoint on restore.
+//                                        Mw/BBw are NOT persisted — they re-fill, mirroring
+//                                        the histogram bins. Schema change -> format v2.)
 //     f64    resid_mean, resid_var, reliability
 //     int32  resid_n
 Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
@@ -1531,6 +1601,7 @@ Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
         pw.put_bool(s.lever_committed[i]);
         pw.put_bool(s.scale_committed[i]);
         pw.put_bool(s.offset_committed[i]);
+        pw.put_bool(s.rot3d_committed[i]);   // Slice 17 (format v2)
         pw.put_f64(s.resid_mean[i]);
         pw.put_f64(s.resid_var[i]);
         pw.put_f64(s.reliability[i]);
@@ -1608,7 +1679,7 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         SE3      prior_extrinsic;
         Scalar   prior_scale;
         Scalar   time_offset;
-        bool     ext_c, roll_c, lever_c, scale_c, offset_c;
+        bool     ext_c, roll_c, lever_c, scale_c, offset_c, rot3d_c;
         Scalar   resid_mean, resid_var, reliability;
         int      resid_n;
     };
@@ -1624,6 +1695,7 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         rc.lever_c         = pr.get_bool();
         rc.scale_c         = pr.get_bool();
         rc.offset_c        = pr.get_bool();
+        rc.rot3d_c         = pr.get_bool();   // Slice 17 (format v2)
         rc.resid_mean      = pr.get_f64();
         rc.resid_var       = pr.get_f64();
         rc.reliability     = pr.get_f64();
@@ -1677,6 +1749,13 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         s.lever_committed[slot]  = rc.lever_c;
         s.scale_committed[slot]  = rc.scale_c;
         s.offset_committed[slot] = rc.offset_c;
+        // Slice 17: the restored rot3d flag drives apply_calib_feedback()'s re-fill
+        // hysteresis exactly like ext/roll/lever/scale (the empty post-restore channels
+        // hold it committed through refill); the committed rot3d VALUE is the restored
+        // prior_extrinsic.R, which rot3d() reads back as the re-anchored basepoint below.
+        // Only meaningful when cfg.rot3d_enabled (the config-hash guarantees the blob and
+        // this run agree on the flag).
+        s.rot3d_committed[slot]  = rc.rot3d_c;
         s.offset_restored[slot]  = rc.offset_c;   // hold restored-committed offset through refill
         // Restore the variance-EMA reliability track (Slice 9) so the source's quality weight
         // resumes rather than re-warming for kRelWarmup steps.
@@ -1698,6 +1777,12 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         s.calib2.set_basepoint(rc.id, Xr);
         s.calib2.reset_roll(rc.id);
         s.calib2.reset_lever(rc.id);
+        // Slice 17: re-anchor the rot3d basepoint onto the restored rotation (rot3d() then
+        // reads the restored mount immediately — its channels are empty post-restore, so it
+        // falls back to this basepoint) and drop any votes (none — fresh estimator; kept for
+        // the API's pair-with-reset contract). Mw/BBw re-fill from live turning windows.
+        s.calib2.set_rot3d_basepoint(rc.id, Xr.R);
+        s.calib2.reset_rot3d(rc.id);
         // Keep Phase-2's roll basepoint (R_yp) tracking the restored yaw/pitch (calib2 composes
         // roll on top of the R_yp it is fed each step; seed it from the restored extrinsic so a
         // pre-first-step read is consistent).

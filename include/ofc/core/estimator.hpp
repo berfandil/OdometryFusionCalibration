@@ -35,6 +35,14 @@ public:
     // Latest result (valid after a successful step).
     const Result& latest() const;
 
+    // Diagnostic readout (Slice 17): whether the source's turn-regime FULL rotation
+    // extrinsic (rot3d) is currently committed — i.e. prior_extrinsic.R is being driven by
+    // the axis-correspondence Wahba solve, superseding the Phase-1 yaw/pitch ∘ roll
+    // composition. Always false when Config::rot3d_enabled is off / id unknown. (Kept a
+    // facade accessor rather than a CalibSnapshot field — the snapshot's extrinsic already
+    // carries the rot3d rotation when committed.)
+    bool rot3d_committed(SourceId id) const;
+
     // Warm-restart persistence (D23): serialize/deserialize into a fixed buffer.
     // File I/O + double-buffering live in an adapter.
     Expected<int> serialize(unsigned char* buf, int cap) const;  // bytes written

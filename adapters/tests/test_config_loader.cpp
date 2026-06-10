@@ -139,6 +139,38 @@ TEST_CASE("ConfigLoader: q_scale / q_floor / adaptive_q (the real-data covarianc
     }
 }
 
+TEST_CASE("ConfigLoader: rot3d_enabled parses (Slice 17); default off; bad value rejects") {
+    // Enabled.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "rot3d_enabled = true\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().rot3d_enabled);
+    }
+    // Key absent -> default OFF (byte-identical legacy behavior).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK_FALSE(loader.config().rot3d_enabled);
+    }
+    // Non-bool value -> loud error naming the line.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "rot3d_enabled = banana\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) == Status::InvalidConfig);
+        CHECK(loader.error().find("rot3d_enabled") != std::string::npos);
+    }
+}
+
 TEST_CASE("ConfigLoader: subbin_centroid round-trips into all five calibration histograms") {
     // Slice 16: one [global] key switches the centroid sub-bin readout on for
     // every calibration histogram (so3/roll/xyz/scale/offset).

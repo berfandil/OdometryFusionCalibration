@@ -259,6 +259,25 @@ private:
 // no rotation — the same singularity that gates Phase 2). The minimizer is voted into a
 // CIRCULAR S¹ Histogram1D (cfg.roll_hist); estimate = its mode.
 //
+// ROT3D (Slice 17, opt-in via Config::rot3d_enabled) — the FULL rotation extrinsic from
+// the ROTATION half of the hand-eye, R_A R_X = R_X R_B, equivalently the rotation-AXIS
+// correspondence  a = R_X · b  with  a = so3::log(R_A), b = so3::log(R_B)  per turn-gated
+// window. Accumulate the per-slot Wahba problem  Mw = Σ w·a bᵀ  and the axis Gram
+// BBw = Σ w·b bᵀ (both decay-aged by so3_hist.decay_gamma per ACCEPTED window — a fixed
+// per-window decay independent of the histogram aging mode, since a SlidingK ring cannot
+// evict from a rank accumulator). The LS rotation is the running Kabsch solve
+//   R̂ = U·diag(1, 1, det(U Vᵀ))·Vᵀ,  U S Vᵀ = SVD(Mw).
+// OBSERVABILITY lives in BBw: rank ≥ 2 (two non-parallel rotation axes) fully determines
+// R_X; rank 1 (ground, yaw-only) leaves the rotation ABOUT the common axis blind — exactly
+// the DOF Phase-1's straight-regime direction method covers (complementary by construction).
+// The votable gate is λ_mid ≥ kAxisPairMin·λ_max on BBw (NOT λ_min — Kabsch needs only two
+// axes). When votable, the basepoint-relative residual  δφ = so3::log(R̂ · R_bpᵀ)  is voted
+// into 3 so(3) channels (cfg.so3_hist shape, basepoint re-anchorable — the contractive
+// parametrization mirroring Phase-1); readout  rot3d() = exp(φ_mode)·R_bp. On clean
+// conjugated data (B = X⁻¹∘A∘X) the recovered rotation satisfies a = rot3d()·b exactly.
+// Rank-1 motion NEVER votes (channels stay empty, confidence 0, never commits) — planar
+// behavior unchanged; no partial-subspace voting (covered by Phase 1 + roll).
+//
 // xyz (3 linear DOF given rotation). Stack the translation row-block over accepted
 // (turning) windows and solve LEAST-SQUARES for t_X:
 //      Stack  (R_A − I) t_X = (R_X t_B − t_A)  =>  normal equations  AᵀA t_X = Aᵀb,
@@ -340,6 +359,18 @@ public:
     // were accumulated against the OLD base/extrinsic frame, so they are stale — drop them
     // and re-accumulate around the new basepoint. lever_arm() falls back to prior_.t.
     void reset_lever(SourceId id);
+    // RE-ANCHOR the rot3d so(3) basepoint to a NEW committed rotation (Slice 17). The rot3d
+    // votes are δφ = log(R̂·R_bpᵀ), so moving the basepoint onto a freshly-committed rot3d
+    // makes the residual re-vote ≈ 0 around it (the contractive iterate, mirroring Phase-1's
+    // set_basepoint). NOTE: deliberately SEPARATE from set_basepoint/set_prior's every-step
+    // value sync — the rot3d basepoint must only move together with a reset_rot3d (moving it
+    // under live votes would shift what the accumulated δφ mode means). The Mw/BBw
+    // accumulators are basepoint-INDEPENDENT and are intentionally NOT touched here.
+    Status set_rot3d_basepoint(SourceId id, const Mat3& R_bp);
+    // Drop only the 3 rot3d so(3) channels for `id` (keeps Mw/BBw — they are basepoint-
+    // independent rank/solve state and keep accumulating across re-anchors). The post-reset
+    // rot3d() falls back to the basepoint until new votes land.
+    void reset_rot3d(SourceId id);
 
     // Provide the Phase-1-recovered yaw/pitch rotation R_yp for each source (the roll
     // basepoint: R_X(roll) = R_yp · Rx(roll)). Call whenever Phase 1 updates (cheap; the
@@ -386,6 +417,23 @@ public:
     // recovered roll), translation = lever_arm(). The prior for an unvoted source.
     SE3  extrinsic(SourceId id) const;
 
+    // --- rot3d readouts (Slice 17; meaningful only when cfg.rot3d_enabled) ----
+    // Full recovered extrinsic ROTATION from the axis-correspondence Wahba solve:
+    //   rot3d() = exp(φ_mode) · R_bp   (φ_mode = the 3 rot3d channel modes, R_bp = the
+    // rot3d basepoint). Falls back to the basepoint (= the prior rotation until re-anchored)
+    // for an unvoted / unknown source. CONVENTION (pinned by tests): on clean conjugated
+    // data B = X⁻¹∘A∘X the returned R satisfies  log(R_A) = R · log(R_B)  exactly, i.e. it
+    // IS the sensor->base R_X (a planted +yaw reads +yaw, matching config_loader's
+    // "yaw pitch roll" parse and tools/inject_calib.py).
+    Mat3   rot3d(SourceId id) const;
+    // MIN concentration over the 3 rot3d channels in [0,1]; 0 unvoted / unknown.
+    Scalar rot3d_confidence(SourceId id) const;
+    // Total rot3d channel vote mass (the N_min driver; 0 if none).
+    Scalar rot3d_vote_count(SourceId id) const;
+    // Whether the slot's BBw currently clears the two-axis gate (λ_mid ≥ kAxisPairMin·λ_max).
+    // Diagnostics / observability self-tests; rank-1 (planar) motion never clears it.
+    bool   rot3d_observable(SourceId id) const;
+
     // Roll-histogram concentration in [0,1] — the roll (extrinsic) confidence. 0 unvoted.
     Scalar extrinsic_confidence(SourceId id) const;
     // Translation confidence: MIN of the 3 xyz-channel concentrations in [0,1]. The
@@ -424,6 +472,17 @@ private:
     // confidence; Combo -> Rotation × Confidence. Always strictly positive.
     Scalar vote_weight_factor(Scalar omega_norm, Scalar confidence) const;
 
+    // Two-axis observability gate on the axis Gram (Slice 17): true iff the MIDDLE
+    // eigenvalue clears kAxisPairMin × the largest (two non-parallel rotation axes have
+    // been excited — Kabsch needs only two correspondences, so the gate reads λ_mid, NOT
+    // λ_min). Rank-1 (planar yaw-only) stays below the floor forever. Heap-free (Eigen 3×3
+    // SelfAdjointEigenSolver, precedented by the lever conditioning guard).
+    static bool axis_pair_observable(const Mat3& BBw);
+    // Running Wahba/Kabsch solve of Mw = Σ w·a bᵀ (Slice 17): R̂ = U·diag(1,1,det(U Vᵀ))·Vᵀ
+    // from SVD(Mw). Returns false (R_out untouched) on a non-finite result. Heap-free
+    // (Eigen 3×3 JacobiSVD, bounded).
+    static bool wahba_solve(const Mat3& Mw, Mat3& R_out);
+
     // The rotation hand-eye residual norm for a candidate roll (see header math).
     static Scalar rot_residual(const Mat3& R_yp, Scalar roll,
                                const Mat3& R_A, const Mat3& R_B);
@@ -436,8 +495,11 @@ private:
     Phase2Strat strategy_        = Phase2Strat::VsFusedBase;
     VoteWeight vote_weight_      = VoteWeight::Combo;
     bool     last_gate_turning_  = false;
+    bool     rot3d_enabled_      = false;            // Config::rot3d_enabled (Slice 17)
+    Scalar   rot3d_gamma_        = Scalar(0.999);    // Mw/BBw per-window decay (so3 gamma)
     HistogramConfig roll_cfg_{};
     HistogramConfig xyz_cfg_{};
+    HistogramConfig rot3d_cfg_{};                    // = cfg.so3_hist (Slice 17)
 
     // Per-source state. roll_[slot] is the circular roll histogram; xyz_[3*slot + c] is
     // channel c (0=x,1=y,2=z) of the lever-arm histogram. prior_[slot] is the full SE3
@@ -454,6 +516,14 @@ private:
     bool        ryp_set_[kMaxSources] = {};
     SourceId    ids_[kMaxSources] = {};
     int         source_count_ = 0;
+
+    // rot3d state (Slice 17). rot3d_[3*slot + c] is channel c of the basepoint-relative
+    // so(3)-residual histogram; mw_/bbw_ the decay-aged Wahba / axis-Gram accumulators;
+    // rot3d_bp_ the re-anchorable rotation basepoint (init = the slot prior's rotation).
+    Histogram1D rot3d_[3 * kMaxSources];
+    Mat3        mw_[kMaxSources];
+    Mat3        bbw_[kMaxSources];
+    Mat3        rot3d_bp_[kMaxSources];
 };
 
 } // namespace ofc

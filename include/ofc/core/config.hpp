@@ -147,6 +147,15 @@ struct Config {
     int         commit_min_votes  = 200;
     Scalar      commit_drop       = 0.4;
     VoteWeight  vote_weight       = VoteWeight::Combo;
+    // Turn-regime FULL rotation-extrinsic via axis-correspondence hand-eye (Slice 17).
+    // When enabled, Phase 2 additionally accumulates a per-source Wahba problem over the
+    // turn-gated windowed rotation axes (a = log R_A, b = log R_B; a = R_X·b) and, once TWO
+    // distinct rotation axes have been excited (the BBw rank gate), votes the full recovered
+    // R_X into 3 so(3) channels; a committed rot3d SUPERSEDES the Phase-1 yaw/pitch ∘ roll
+    // composition in the published prior_extrinsic rotation. On planar (yaw-only) motion the
+    // rank gate never opens, so behavior is unchanged. Default OFF = byte-identical (sim +
+    // every existing config); in the persistence config-hash (a flip rejects stale restores).
+    bool        rot3d_enabled     = false;
 
     // Histograms (per quantity)
     HistogramConfig so3_hist;

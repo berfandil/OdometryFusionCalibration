@@ -37,8 +37,12 @@ namespace persist {
 
 // On-the-wire format identity. Bump kFormatVersion on any incompatible payload-schema change
 // (deserialize rejects a mismatch with Status::VersionMismatch).
+//   v1 — Slice 12 original payload.
+//   v2 — Slice 17: per-source `rot3d_committed` flag appended to the commit-flag block
+//        (old v1 blobs reject -> cold start; consistent with the Slice-16 hash-change
+//        precedent — no cross-version migration shim).
 constexpr unsigned char kMagic[4]      = { 'O', 'F', 'C', 'P' };
-constexpr std::uint32_t kFormatVersion = 1u;
+constexpr std::uint32_t kFormatVersion = 2u;
 
 // FNV-1a (64-bit) over a byte span — the config_hash hash family. Deterministic, no deps,
 // strict-core (a plain loop, no heap). Stream more bytes by threading the returned state back

@@ -127,6 +127,7 @@ const char* kKnobDoc =
     "  commit_concentration=<f>     commit_min_votes=<int>   commit_drop=<f>\n"
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
+    "  rot3d_enabled=<bool>     (turn-regime FULL rotation extrinsic, Slice 17; default off)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
@@ -269,6 +270,11 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "timesync_enabled") {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.timesync_enabled = bv;
+            } else if (key == "rot3d_enabled") {
+                // Slice 17: turn-regime FULL rotation extrinsic (axis-correspondence
+                // hand-eye). Default off = byte-identical legacy behavior.
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.rot3d_enabled = bv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
