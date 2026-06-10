@@ -1,4 +1,4 @@
-# Implementation Roadmap
+﻿# Implementation Roadmap
 
 Independently-grabbable work items as **tracer-bullet vertical slices** — thinnest end-to-end thing first, then layer capability. Each slice ships something runnable + tested. References: [`DESIGN.md`](./DESIGN.md), [`DECISIONS.md`](./DECISIONS.md), [`CONFIG.md`](./CONFIG.md).
 
@@ -160,6 +160,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 
 ## Slice 15b — Bounded heading injection from position-only corrections (lever C)  `[x]` DONE — fixes urban12
 **Goal**: stop a position fix from over-rotating heading via the `P` trans-rot cross-cov when its residual is large (the pinned urban12 t=1929 s 68° kick). **Shipped** (`ba895b6`): **C4 — residual-gated rotation-row suppression**. For a rotation-unobserving correction (`H` rotation cols ≈ 0) with `dbar > correction_rot_suppress_kappa`, scale ONLY `K`'s pose-rotation rows (3..5) by `kappa/dbar` (translation/twist/bias untouched, Joseph reuses the modified K → consistent + PSD). `correction_rot_suppress_kappa=0` default → opt-in/inert; orthogonal to Slice-15 Huber. ConfigLoader key added; unit-tested (yaw cut >70%, translation kept, inert below threshold + for rotation-observing fixes). **OUTCOME — first lever that FIXES urban12**: D+C4(κ=0.8) tail **4214→1.99 m**, death spiral averted (gps_applied 96→1375), t=1929 kick eliminated (rot 2.0→0.08), arc recovers to ~2 m. NO regression on urban07/17 (C4 inert there — their dbar 0.18–0.55 < κ=0.8); sim bit-identical at κ=0; validated on FULL drives via the local metric. Residual: a mid-drive transient (max ~300–400 m) that now RECOVERS (full flattening needs the upstream 522 s GPS-coast heading-drift, out of scope). Recommended: `cov_floor_m2=25` + `correction_rot_suppress_kappa=0.8`. Full sweep in `SLICE15B_BOUNDED_HEADING_INJECTION.md`. **Deps**: Slices 13, 15.
+
+## Slice 16 — Centroid sub-bin readout (calib precision floor)  `[x]` DONE — committed yaw 0.229°→0.0102°
+**Goal**: the user precision target (rotation < 0.1°) on the committed calibration. Investigation (2026-06-10) discriminated the Slice-15c committed-yaw gap: NOT vote weighting (one ≈ combo to 3e-5 rad), NOT commit dynamics — `Histogram1D::mode()`'s parabolic sub-bin interpolation pulls the read ~70–80% toward the peak-bin center (probes: truth at a bin center reads +0.0045°, at quarter-bin reads −0.264°; same pull visible in scale + time-offset of the same run). The historical "0.10°" was luck (10° ≈ a bin center); real floor ~0.3–0.45° at the so3 bin width 1.79°.
+**Shipped** (`c237bfb` + review fixes `00978c8`): `HistogramConfig::subbin_centroid` (default false) — mass-weighted centroid over peak±1, EXACT for split votes at any sub-bin position; wrap-aware, one-sided at boundaries; in the persistence config-hash (pre-16 blobs cold-start, intentional); loader `[global] subbin_centroid` fans out to all five calib histograms. Default-off bit-identical (pinned by exact equality); sim/trust apparatus untouched.
+**Validated (KAIST urban07 calib_test, flag ON)**: yaw err sub-bin-phase-INDEPENDENT +0.015° across all probes; **committed yaw 0.0102°** (target <0.1°), committed scale err ~8e-5, time-offset err **2.6 µs** (was 2.2 ms), committed lever ~2.5 mm. Design doc `SLICE16_CENTROID_SUBBIN_READOUT.md`; review `reviews/slice-16-findings.md`; DECISIONS D25.
+**Deps**: Slices 8 (commit/re-anchor), 15c (`vote_weight=one` commit enabler).
 
 ---
 

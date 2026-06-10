@@ -100,7 +100,7 @@ Every gate, vote weight, and reliability term derives from this table.
   - Fixed global bins. so(3) (Phase-1 direction) 3-channel; roll = circular S¹; xyz/scale = 1-D.
   - **Aging**: config **exponential decay** *or* **sliding window of K** (forced by bootstrap — early votes are computed with wrong priors and must wash out; also tracks re-mount/thermal drift).
   - Voting: +1, linear-split between nearest bins, or confidence/rotation-magnitude weighted (configurable).
-  - Peak: sub-bin via parabolic interpolation. **Confidence** = peak concentration — (peak bin + its two immediate neighbours) ÷ total (a linear-split peak spans ~2 bins, so peak-bin-only under-reports) — drives commit + cold-start.
+  - Peak: sub-bin via parabolic interpolation, or the opt-in **3-bin mass-weighted centroid** (`subbin_centroid`, D25) — exact for split votes, removing the parabola's pull-toward-bin-center bias that floored calib precision at ~0.1–0.45° (Slice 16). **Confidence** = peak concentration — (peak bin + its two immediate neighbours) ÷ total (a linear-split peak spans ~2 bins, so peak-bin-only under-reports) — drives commit + cold-start.
   - Binning: 1-D bins are half-open `[range_min, range_max)`; non-circular values clamp, circular values wrap. SlidingK aging clamps tiny-negative bin residuals and rebuilds the running total on eviction (float-drift guard).
 
 ---

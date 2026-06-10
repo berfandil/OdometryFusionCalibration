@@ -99,6 +99,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `sliding_k` | int | 1000 | [1, 4096] | Window size (when `aging_mode = sliding_k`). Upper bound = the fixed-capacity ring (`Histogram1D::kMaxSlidingK`). |
 | `vote_split` | bool | true | — | Linear-split a vote between the two nearest bins. |
 | `subbin` | bool | true | — | Parabolic sub-bin peak interpolation. |
+| `subbin_centroid` | bool | false | — | Opt-in (honored only when `subbin`): replace the parabola with the mass-weighted centroid over peak±1 — exact for split votes at any sub-bin position, removing the parabola's pull-toward-bin-center bias (~70–80% of the sub-bin offset; D25, Slice 16). In the persistence config-hash (a flip rejects stale restores). Loader: `[global] subbin_centroid` sets it on all five calib histograms. |
 
 ## 9. Per-sensor (`SensorConfig`, one per source)
 
