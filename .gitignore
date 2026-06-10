@@ -31,3 +31,4 @@ compile_commands.json
 # Real-dataset replay working dirs (derived CSVs + manifests + results; not source)
 /kitti_run/
 /kaist_run/
+/euroc_run/
