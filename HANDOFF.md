@@ -36,7 +36,24 @@ Toolchain facts (this Windows box):
 
 ## 3. Current state (as of this handoff)
 
-- **Gate green: ctest 2/2 — `unit` 212 cases / 9301 assertions + `adapters` 36 cases / 635 assertions.** Pushed through `c4644c8` (median-pinning fix `1142e41` + `q_scale=0.7` recalibration; `scale_hist` boundary-bug fix `3bd91e2`). Locally ahead by the **real-data CSV ingestion scaffolding** (`ddcf436` — `CsvSource`/`CsvGtTrack`/`ReplayHarness` + the `ofc_replay` CLI; equivalence-tested CSV==in-memory) + this doc commit — unpushed. (The gate also builds the relaxed-edge adapters — `dev.ps1` sets `OFC_BUILD_ADAPTERS=ON`, so CTest runs both `unit` and `adapters`. **Use `dev.ps1 -Task clean` before A/B covariance/median measurements — stale ninja artifacts gave misleading NEES numbers during this work.**)
+- **Gate green: ctest 2/2 — `unit` 214 cases + `adapters`.** Pushed through **`4ca0c6c`** (HEAD). Since the last handoff, ALL the real-data validation + a new **Slice 15 series** landed (see the "Real-data + Slice 15" block below). (The gate also builds the relaxed-edge adapters — `dev.ps1` sets `OFC_BUILD_ADAPTERS=ON`, so CTest runs both `unit` and `adapters`. **Use `dev.ps1 -Task clean` before A/B covariance/median measurements — stale ninja artifacts gave misleading NEES numbers.**)
+- **USER PRECISION TARGETS (north-star, 2026-06-09):** rotation error **< 0.1°** (1.745e-3 rad), translation error **< 1 cm** — **rotation precision takes priority** over translation when they trade off (heading error is what makes position diverge). Judge drift/calib results against these, not just "better than before." NOT yet met (closest: KAIST yaw calib ~0.1–0.23°, EuRoC lever ~4 cm).
+
+### Real-data validation + Slice 15 series (this session — all pushed)
+
+Real-data path is the `ofc_replay` CLI on a manifest → drift / 6-DOF NEES / NIS + (NEW) a local metric + final per-source calib. Datasets converted by `tools/{kitti,kaist,euroc}_to_csv.py` (read source archives IN MEMORY, pull only the needed CSVs, never unzip; run dirs `*_run/` are gitignored). Data at `C:\workspace\data\{KITTI,KAIST,EuRoC}`.
+
+| What | Outcome |
+|---|---|
+| **KITTI** (28 drives, smoke test) | pipeline works on real data; single-source → covariance overconfident (q_floor lever); `ConfigLoader` exposes `q_scale`/`q_floor`/`adaptive_q` |
+| **KAIST** urban07/12/17 (3-source + GPS + GT) | median-fix robustness CONFIRMED (×3 outlier rejected); urban07/17 bounded; **urban12 was the hard case** |
+| **Local metric** (`7c71b63`) | GT-anchored fixed-window relative-pose error (`local_batch_len`): length-FAIR drift (global tail grows with run length; local windows don't). Eval-only, no filter reset. `diagnose_window.py` localizes the worst window. |
+| **Slice 15 — robust GPS update** (`44e0711`) | Huber gain down-weight (`correction_robust_kappa`, 0=off). Opt-in primitive; did NOT fix urban12 (gate pre-empts it); kept. Realistic GPS R (`cov_floor_m2`) is the consistency keeper. |
+| **Slice 15b — bounded heading injection (lever C4)** (`ba895b6`) | **FIXED urban12**: tail 4214→**1.99 m**. `correction_rot_suppress_kappa` scales ONLY the rotation gain rows of a position fix with a large residual (kills the t=1929 s 68° heading kick via the trans-rot cross-cov; keeps the translation pull). 0=off. Recommended urban cfg: `cov_floor_m2=25`+`correction_rot_suppress_kappa=0.8`. |
+| **Online calibration validated on real data** (`a530deb`) | `tools/inject_calib.py` injects a KNOWN extrinsic/scale/time-offset into a source → calibrator recovers it on real motion. KAIST (ground): yaw 0.103° + scale recovered. EuRoC (drone, 3D): **full xyz lever recovered** (KAIST couldn't — planar). Gap: scale/rotation-extrinsic NOT recovered on drone (excitation-regime-sensitive). |
+| **Slice 15c — calib-commit on real data** (`4ca0c6c`) | The accurate yaw/scale calib NEVER COMMITTED on real data (conf~1, uncommitted): `commit_min_votes`(200) is a vote-MASS threshold but Combo weight (ω-floored 1e-3 in straight) keeps mass ≪200. **FAILED approach** (reverted): global obs-COUNT commit gate broke the sim's tuned feedback (cov-cal NEES 4.99→0.8 — the sim relies on commit+publish firing). **WORKING fix = config**: exposed `vote_weight` as a manifest key; `vote_weight=one` makes mass==count → commit reachable → yaw/scale/time COMMIT + feed back. Sim untouched (Config{} default=Combo). |
+
+**Slice-15 design docs**: `SLICE15_ROBUST_GPS_UPDATE.md`, `SLICE15B_BOUNDED_HEADING_INJECTION.md` (full sweeps + acceptance). Memory `real-dataset-testing` has the blow-by-blow.
 - **Done (all green):**
 
 | Unit | What |
@@ -116,10 +133,13 @@ Use a full-capability agent (`general-purpose`/`claude`) for implement + fix; `c
 
 ## 7. Resume in one line
 
-All numbered roadmap slices (0–14) are addressed; init-P fix + 11b Option A + the per-`n` χ² gate + the GPS adapter + the Slice-14 covariance work + the **median-pinning fix + `q_scale` recalibration** (`1142e41`) have landed (the median fix made fusion a true robust interior median + the published covariance near-consistent). Remaining work is carve-outs + polish:
-- **11b Option B** — now RECONSIDERABLE (the median fix makes the per-source median weights `ωᵢ` real, so the deferred ω-coupled multi-source bias is viable; ISSUES Slice-11b UPDATE). Per-`n` χ² gate (`e8491dd`) + GPS adapter (`4bce8d1`) already done.
-- **13b** (real ROS node + bag round-trip + durable `fsync`) — env-blocked (no ROS on the dev box).
-- **Latent calibration bugs the median fix exposed — RESOLVED** (`3bd91e2`): 1(a) scale_hist boundary-commit FIXED (default `[-1,1]`→`[0.5,1.5]`); 1(b) partial scale recovery is NOT a bug (sparse-vote/noise artifact, documented known-limitation). Nothing left here.
-- **Slice-14 remaining placeholders** — the NON-covariance knobs (`excitation_min_var`, `kf_process_noise`, `match_metric`, straight/turn calibration gates); the load-bearing `q_scale` is done (`1142e41`, 0.7, recalibrated vs the true median).
-- **`Ad` distance-shape covariance model and/or an NHC no-ref correction** for strict per-trajectory no-ref NEES consistency to exactly DOF=6 (the filter is near-consistent ~4.82 now; the gap is the deliberate safety margin / the `Ad` shape).
-Pick one, author the brief from `WORKFLOW.md`'s template, run the cycle in §4. Verify with §2. Done.
+Slices 0–14 + the median-pinning fix + the real-data validation + the Slice-15 series are all landed and pushed (`4ca0c6c`). The system fuses + self-calibrates + survives real urban/drone data; urban12 divergence is FIXED. The active frontier is now the **USER PRECISION GOAL** (rotation < 0.1°, rotation-priority — see §3). Open work, roughly priority-ordered:
+
+- **🎯 Committed-yaw under 0.1°** (rotation goal). `vote_weight=one` now makes yaw COMMIT + feed back on real data (`4ca0c6c`), but the *committed* estimate is ~0.23° (vs the 0.10° uncommitted Combo estimate) — committing engages the feedback (the win) but loosened the value. Tighten it: commit-time re-anchor dynamics / vote weighting that keeps both commit AND precision / more excitation.
+- **scale + rotation-extrinsic calib on non-ground (3D) motion** — EuRoC exposed these don't recover on a drone (conf 0): scale needs straight/low-ω windows (a drone has few); the rotation-extrinsic estimator is yaw-dominant-ground-tuned. A turn-regime yaw/pitch path would generalize calibration off the ground plane.
+- **urban12 residual** — the mid-drive transient (max ~300–400 m, RECOVERS) is the upstream **522 s GPS-coast heading-drift** (DR/FOG-IMU heading-hold over long GPS gaps). Rotation-relevant.
+- **q_scale ↔ calib-engagement coupling** — the cov-cal `q_scale=0.7` was tuned with calib effectively frozen; once calib commits + corrects (smaller error), it may want re-tuning. Watch when calib engagement changes the accuracy regime.
+- **predict-side `q_floor` recalibration on real data** — D (GPS R↑) done; predict side still sim-tuned. Motivates the deferred distance/motion-aware predict-Q (`Ad` shape).
+- **Carve-outs**: 11b Option B (median-coupled multi-source bias — reconsiderable); non-cov CONFIG placeholders (`excitation_min_var`, `kf_process_noise`, `match_metric`, calib gates); 13b ROS node + durable `fsync` (env-blocked).
+
+Pick one; for a core change, design-first (the Slice-15 series shows the pattern: investigate → design doc → implement → validate full-drive via the local metric, and **never weaken the trust apparatus** — verify cov-cal NEES stays ~4.82 + sim green). Verify with §2.
