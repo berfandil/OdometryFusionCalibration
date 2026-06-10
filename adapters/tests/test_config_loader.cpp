@@ -28,6 +28,7 @@ TEST_CASE("ConfigLoader: a sample config parses to the expected fields and valid
         "tick_rate_hz = 100\n"
         "calib_lag_s = 0.25\n"
         "cold_start = median_from_start    ; per-DOF cold start\n"
+        "vote_weight = one\n"
         "commit_concentration = 0.7\n"
         "commit_min_votes = 150\n"
         "commit_drop = 0.4\n"
@@ -62,6 +63,7 @@ TEST_CASE("ConfigLoader: a sample config parses to the expected fields and valid
     CHECK(c.tick_rate_hz == doctest::Approx(100.0));
     CHECK(c.calib_lag_s == doctest::Approx(0.25));
     CHECK(c.cold_start == ColdStart::MedianFromStart);
+    CHECK(c.vote_weight == VoteWeight::One);
     CHECK(c.commit_concentration == doctest::Approx(0.7));
     CHECK(c.commit_min_votes == 150);
     CHECK(c.commit_drop == doctest::Approx(0.4));

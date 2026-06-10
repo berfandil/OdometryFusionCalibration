@@ -123,6 +123,7 @@ const char* kKnobDoc =
     "  max_sources=<int>            reference_sensor_id=<int>\n"
     "  window_s=<f>   fusion_delay_s=<f>   tick_rate_hz=<f>   calib_lag_s=<f>\n"
     "  cold_start=reference_only|median_from_start\n"
+    "  vote_weight=one|confidence|rotation|combo\n"
     "  commit_concentration=<f>     commit_min_votes=<int>   commit_drop=<f>\n"
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
@@ -239,6 +240,13 @@ Status ConfigLoader::parse(const std::string& text) {
                 if (lv == "reference_only")       cfg_.cold_start = ColdStart::ReferenceOnly;
                 else if (lv == "median_from_start") cfg_.cold_start = ColdStart::MedianFromStart;
                 else return fail("cold_start: reference_only|median_from_start", line_no, raw);
+            } else if (key == "vote_weight") {
+                const std::string lv = lower(val);
+                if (lv == "one")             cfg_.vote_weight = VoteWeight::One;
+                else if (lv == "confidence") cfg_.vote_weight = VoteWeight::Confidence;
+                else if (lv == "rotation")   cfg_.vote_weight = VoteWeight::Rotation;
+                else if (lv == "combo")      cfg_.vote_weight = VoteWeight::Combo;
+                else return fail("vote_weight: one|confidence|rotation|combo", line_no, raw);
             } else if (key == "commit_concentration") {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 cfg_.commit_concentration = dv;
