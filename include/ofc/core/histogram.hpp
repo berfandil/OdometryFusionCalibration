@@ -1,12 +1,13 @@
 // ofc/core/histogram.hpp — the shared 1-D robustness primitive (Slice 4).
 //
 // A reusable 1-D histogram that votes values with weights, ages old votes, and
-// extracts a sub-bin peak (parabolic interpolation) plus a peak-concentration
-// confidence. This is the single robustness estimator reused throughout
-// calibration (DESIGN §6, DECISIONS D9/D10/D11): Phase-1 so(3) channels, Phase-2
-// roll (circular) + xyz (linear), per-source scale, and time-offset. Slice 4 is
-// the 1-D primitive only — multi-channel composition belongs to the calibration
-// slices.
+// extracts a sub-bin peak (parabolic interpolation, or the opt-in mass-weighted
+// centroid over peak+-1 — HistogramConfig::subbin_centroid, Slice 16) plus a
+// peak-concentration confidence. This is the single robustness estimator reused
+// throughout calibration (DESIGN §6, DECISIONS D9/D10/D11): Phase-1 so(3)
+// channels, Phase-2 roll (circular) + xyz (linear), per-source scale, and
+// time-offset. Slice 4 is the 1-D primitive only — multi-channel composition
+// belongs to the calibration slices.
 //
 // STRICT CORE: storage is fixed-capacity with compile-time maxima; configure()
 // binds the active sizes and clears state; add()/mode()/confidence() allocate
@@ -100,8 +101,8 @@ private:
     Scalar fold(Scalar value) const;
     // Wrap-or-clamp a bin index to the active range.
     int    wrap_bin(int i) const;
-    // Bin mass for the parabola / confidence: wraps when circular, returns 0 for
-    // an out-of-range index when non-circular.
+    // Bin mass for the sub-bin readouts (parabola / centroid) and confidence:
+    // wraps when circular, returns 0 for an out-of-range index when non-circular.
     Scalar mass_at(int i) const;
 
     // Deposit a vote of `weight` at `value` into `out` (one or two bins); fills

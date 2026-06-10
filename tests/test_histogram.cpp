@@ -558,12 +558,15 @@ HistogramConfig circular_centroid(int n, Scalar lo, Scalar hi, bool split = true
 // ---------------------------------------------------------------------------
 TEST_CASE("centroid readout reconstructs a single split vote exactly at any sub-bin position") {
     // 10 bins over [0, 10): width 1, bin 4 center at 4.5. Sub-bin fractions f
-    // measured from the bin-4 center toward the bin-5 center.
-    const Scalar fractions[] = {0.0, 0.1, 0.25, 0.4, 0.5};
+    // measured from the bin-4 center: POSITIVE toward bin 5 (split mass in the
+    // RIGHT neighbor, the hp-path) and NEGATIVE toward bin 3 (split mass in the
+    // LEFT neighbor, the hm-path), so a sign error in the (hp - hm) numerator
+    // is caught by this headline acceptance sweep itself.
+    const Scalar fractions[] = {-0.4, -0.25, -0.1, 0.0, 0.1, 0.25, 0.4, 0.5};
     for (const Scalar f : fractions) {
         Histogram1D h;
         REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0)) == Status::Ok);
-        const Scalar v = 4.5 + f;          // f bins above the bin-4 center
+        const Scalar v = 4.5 + f;          // f bins above/below the bin-4 center
         h.add(v);
         CHECK(std::abs(h.mode() - v) <= 1e-12);   // exact (width = 1)
     }
@@ -726,6 +729,58 @@ TEST_CASE("subbin_centroid honors the existing switches: default-off, subbin=fal
         Histogram1D h;
         REQUIRE(h.configure(linear_centroid(64, 2.0, 6.0)) == Status::Ok);
         CHECK(h.mode() == doctest::Approx(4.0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config-space interactions of subbin_centroid (Slice 16 review NITs):
+//   (a) vote_split == false + centroid: a single UNSPLIT vote carries no
+//       sub-bin encoding in the masses (the whole weight lands in the nearest
+//       bin), so the centroid must read the BIN CENTER — not invent an offset.
+//   (b) Decay aging: gamma scales every bin UNIFORMLY, so it cancels in the
+//       centroid's mass ratio — two identical decayed votes still read the
+//       vote value exactly (decay-invariance), and a heterogeneous two-vote
+//       history reads the analytic DECAY-WEIGHTED mean. All five production
+//       histograms may run Decay, so this invariance is pinned here.
+// ---------------------------------------------------------------------------
+TEST_CASE("centroid with vote_split=false reads the bin center; centroid under Decay is gamma-invariant") {
+    // (a) split=false + centroid: vote at 4.75 lands wholly in bin 4 (nearest);
+    // both neighbors carry 0 mass -> centroid == bin center 4.5.
+    {
+        Histogram1D h;
+        REQUIRE(h.configure(linear_centroid(10, 0.0, 10.0, /*split=*/false,
+                                            /*sub=*/true)) == Status::Ok);
+        h.add(4.75);
+        CHECK(h.mode() == doctest::Approx(4.5));   // bin center, no sub-bin offset
+    }
+    // (b1) Decay invariance: two IDENTICAL split votes — the older one is
+    // gamma-scaled before the second deposit, but gamma scales BOTH of its bin
+    // deposits, so the (hp - hm)/sum ratio (and hence the centroid) is
+    // unchanged: still exactly the vote value, independent of gamma.
+    {
+        HistogramConfig c = linear_centroid(10, 0.0, 10.0);
+        c.aging = Aging::Decay;
+        c.decay_gamma = 0.5;               // aggressive gamma: invariance, not luck
+        Histogram1D h;
+        REQUIRE(h.configure(c) == Status::Ok);
+        h.add(4.75);
+        h.add(4.75);                       // decays the first vote by 0.5 first
+        CHECK(std::abs(h.mode() - 4.75) <= 1e-12);
+    }
+    // (b2) Heterogeneous decayed history: votes v1 = 4.6 then v2 = 4.9 under
+    // gamma = 0.5. Masses: bin4 = 0.9*g + 0.6, bin5 = 0.1*g + 0.4 (both votes
+    // split bins 4/5, all mass within peak+-1), so the centroid is the analytic
+    // decay-weighted mean (g*v1 + v2)/(g + 1) = (0.5*4.6 + 4.9)/1.5 = 4.8.
+    {
+        HistogramConfig c = linear_centroid(10, 0.0, 10.0);
+        c.aging = Aging::Decay;
+        c.decay_gamma = 0.5;
+        Histogram1D h;
+        REQUIRE(h.configure(c) == Status::Ok);
+        h.add(4.6);
+        h.add(4.9);
+        const Scalar expected = (0.5 * 4.6 + 4.9) / 1.5;   // 4.8
+        CHECK(std::abs(h.mode() - expected) <= 1e-12);
     }
 }
 

@@ -180,11 +180,14 @@ void prep_restore(Estimator& est, const void* arg) {
 }
 
 // Run the scale capstone rig to convergence and serialize the converged estimator into `out`.
-// Returns the serialized byte count.
-int converge_and_serialize_scale(std::vector<unsigned char>& out) {
+// `mutate` (optional) tweaks the converge config before init — used by the Slice-16 positive
+// control to write a blob under subbin_centroid=true. Returns the serialized byte count.
+int converge_and_serialize_scale(std::vector<unsigned char>& out,
+                                 void (*mutate)(Config&) = nullptr) {
     static const Trajectory tr = bootstrap_traj();
     std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
-    const Config cfg = make_scale_cfg(sensors);
+    Config cfg = make_scale_cfg(sensors);
+    if (mutate != nullptr) mutate(cfg);
     std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
 
     Rig rig; rig.set_trajectory(tr);
@@ -434,7 +437,8 @@ TEST_CASE("persistence config-hash guard: a changed rig rejects stale state") {
 // stream. A blob written under subbin_centroid=false (the default) must be
 // REJECTED by a rig that flips the flag on any histogram (cross-flag restore),
 // because the persisted committed calibration was read with a different
-// sub-bin estimator.
+// sub-bin estimator. Positive control: a blob written WITH the flag set is
+// ACCEPTED by an identical true-flag rig (the hash is stable, not just different).
 // ===========================================================================
 TEST_CASE("persistence config-hash guard: flipping subbin_centroid rejects a cross-flag restore") {
     std::vector<unsigned char> blob;
@@ -462,6 +466,21 @@ TEST_CASE("persistence config-hash guard: flipping subbin_centroid rejects a cro
         Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
         for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
         CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (c) POSITIVE CONTROL: a blob written WITH subbin_centroid=true restores into an
+    // identical true-flag rig (same-flag hash EQUALITY on the new field) — guards against
+    // a hash that rejects everything or encodes the flag unstably between runs.
+    {
+        std::vector<unsigned char> blob_c;
+        converge_and_serialize_scale(blob_c, [](Config& c) { c.scale_hist.subbin_centroid = true; });
+
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.scale_hist.subbin_centroid = true;   // SAME flag on the restoring rig
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob_c.data(), static_cast<int>(blob_c.size())) == Status::Ok);
     }
 }
 
