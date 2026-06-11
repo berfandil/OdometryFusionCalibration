@@ -189,6 +189,11 @@ std::uint64_t config_hash(const Config& cfg) {
     // second scale estimator -> calibration-shaping, hashed. Flipping it rejects a
     // cross-flag restore.
     w.put_bool(cfg.joint_lever_scale);
+    // Slice 18: the multi-bias flag changes WHICH filter integrates the consensus (the
+    // median-coupled augmented ESKF vs the 12-DOF/Option-A path) and what the per-sensor
+    // bias_states flags MEAN -> calibration-shaping, hashed. Flipping it rejects a
+    // cross-flag restore.
+    w.put_bool(cfg.multi_bias_enabled);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -472,6 +477,44 @@ struct Estimator::Impl {
     // prior). Sized so the bias is observable but does not dominate; a fixed sensible default
     // keeps Option A knob-light (only bias_process_noise is exposed in Config).
     static constexpr Scalar kBiasCov0 = Scalar(1.0);
+    // Multi-bias prior (Slice 18): sigma ~ 0.32 m/s / rad/s — DELIBERATELY between Option
+    // A's uninformative 1.0 and a tight informative prior, chosen empirically against the
+    // separation sim. Both extremes fail concretely:
+    //   * 1.0 (Option-A parity): the per-window coupling linearizes a heavily NONLINEAR
+    //     median response (radial projectors fluctuate window to window), so the large prior
+    //     gain injects spurious corrections along the weakly-observable bias DIFFERENCES —
+    //     co-source biases blow up to ~0.5 garbage while the planted one overshoots.
+    //   * 0.01: the prior is INFORMATIVE against any real bias — the estimate is shrunk by
+    //     exactly the unresolved-variance fraction (the separation sim measured
+    //     recovered/planted == bias_observable to two digits), so the de-bias plateaus at
+    //     ~60% of the planted value over minutes of GPS.
+    // 0.04 (sigma = 0.2 m/s / rad/s) keeps every bias estimate INSIDE the coupling's
+    // linearization radius (the per-window bias displacement sigma*dt must stay below the
+    // window noise scale d_i, or the EKF's first-order median influence systematically
+    // mis-models the response and the junk self-sustains) while letting the observable
+    // combinations resolve >90% within a realistic GPS-rich learn phase. Pair with a SMALL
+    // per-sensor bias_process_noise (near-constant bias: 1e-6..1e-5); a fast walk (1e-3)
+    // re-inflates the weakly-observable subspace every step and the estimates wander at the
+    // prior scale instead of separating.
+    static constexpr Scalar kMultiBiasCov0 = Scalar(0.04);
+
+    // ---- Median-coupled multi-source bias states (Slice 18, 11b Option B) -------------------
+    // Active when cfg.multi_bias_enabled AND >= 1 registered source has bias_states. Each such
+    // source's SOURCE-FRAME delta is de-biased (B_corr <- B_corr o exp(-b_i*dt)) at the SINGLE
+    // de-bias site in step() — BEFORE the frame-align, the median, AND the calibration capture
+    // (fusion + calibrators consume the SAME de-biased deltas). The pose<->bias coupling per
+    // participating biased source is the exact FD-verified median-influence block
+    // (Eskf::median_influence + Eskf::bias_coupling), built from THIS step's actual median
+    // inputs/weights; an absent source gets a ZERO block (its bias random-walks frozen).
+    // Routing then goes through the generalized predict_multi/update_multi. Mutually exclusive
+    // with the Option-A path: when multi_bias_enabled, bias_slot stays -1 (Option A inert).
+    int    mb_count = 0;                            // registered bias sources (<= cap)
+    int    mb_slot[Eskf::kMaxBiasSources];          // registered slot per bias index
+    Scalar mb_pn[Eskf::kMaxBiasSources];            // per-bias random-walk process noise
+    int    slot_mb[kMaxSourcesCap];                 // registered slot -> bias index (or -1)
+    // Per-step scratch (no heap in step()): per-median-entry influence + per-bias coupling.
+    Mat6   mb_omega[kMaxSourcesCap];
+    Mat6   mb_J[Eskf::kMaxBiasSources];
 
     // End of the last successfully-fused window. The next predict integrates the
     // actual motion over [last_t1, t1] (dt = t1 - last_t1), so integration is
@@ -833,6 +876,13 @@ Status Estimator::init(const Config& cfg) {
     impl_->bias_slot          = -1;
     impl_->bias_src_id        = 0;
     impl_->bias_process_noise = Scalar(0);
+    // Multi-bias states (Slice 18): no bias sources until add_source registers them.
+    impl_->mb_count = 0;
+    for (int j = 0; j < Eskf::kMaxBiasSources; ++j) {
+        impl_->mb_slot[j] = -1;
+        impl_->mb_pn[j]   = Scalar(0);
+        impl_->mb_J[j]    = Mat6::Zero();
+    }
     for (int i = 0; i < kMaxSourcesCap; ++i) {
         impl_->sources[i]           = nullptr;
         impl_->prior_extrinsic[i]   = SE3{};
@@ -848,6 +898,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->rot3d_committed[i]   = false;
         impl_->scale2_committed[i]  = false;
         impl_->med_slot[i]          = -1;
+        impl_->slot_mb[i]           = -1;   // Slice 18: no bias index bound to this slot yet
         // Variance-EMA reliability reset (Slice 9, D17): clean EMA state + neutral
         // multiplier so the first kRelWarmup steps weight exactly as Slice 2.
         impl_->resid_mean[i]        = Scalar(0);
@@ -951,15 +1002,29 @@ Status Estimator::add_source(const ISource* src) {
     // calibrators iff its SensorConfig::per_sensor_kf is set (else its raw delayed B_corr
     // is used on the deeper path; off entirely if no source enables it).
     impl_->smooth_source[slot] = (sc != nullptr) ? sc->per_sensor_kf : false;
-    // Per-source bias states (Slice 11b, Option A): record the single bias source's slot +
-    // process-noise rate. validate() guarantees at most one source has bias_states, so the
-    // first match is THE bias source. The augmented filter is enabled lazily in step() only
-    // when this source drives the predict alone.
+    // Per-source bias states. Option A (Slice 11b, multi_bias_enabled OFF): record the single
+    // bias source's slot + process-noise rate — validate() guarantees at most one, so the
+    // first match is THE bias source; the augmented filter is enabled lazily in step() only
+    // when this source drives the predict alone. Option B (Slice 18, multi_bias_enabled ON):
+    // register EVERY bias_states source (validate() bounds the count by Eskf::kMaxBiasSources)
+    // into the multi-bias tables; the Option-A bias_slot stays -1 (the two paths are mutually
+    // exclusive — routing in step() goes through predict_multi/update_multi).
     if (sc != nullptr && sc->bias_states) {
-        impl_->bias_slot          = slot;
-        impl_->bias_src_id        = src->id();
-        impl_->bias_process_noise = (sc->bias_process_noise >= Scalar(0))
+        if (impl_->cfg.multi_bias_enabled) {
+            if (impl_->mb_count < Eskf::kMaxBiasSources) {
+                const int j = impl_->mb_count;
+                impl_->mb_slot[j] = slot;
+                impl_->mb_pn[j]   = (sc->bias_process_noise >= Scalar(0))
                                         ? sc->bias_process_noise : Scalar(0);
+                impl_->slot_mb[slot] = j;
+                ++impl_->mb_count;
+            }
+        } else {
+            impl_->bias_slot          = slot;
+            impl_->bias_src_id        = src->id();
+            impl_->bias_process_noise = (sc->bias_process_noise >= Scalar(0))
+                                            ? sc->bias_process_noise : Scalar(0);
+        }
     }
     // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
     {
@@ -1091,6 +1156,17 @@ Status Estimator::step(Timestamp now) {
         // prior_scale is guaranteed > 0 by add_source (guarded), so this never /0.
         SE3 B_corr = d.motion;
         B_corr.t   = d.motion.t / s.prior_scale[i];
+        // ---- SINGLE DE-BIAS SITE (Slice 18, Option B) ---------------------------------
+        // De-bias this biased source's SOURCE-FRAME delta with its current bias estimate:
+        // B_i' = B_i o exp(-b_i*dt), BEFORE the frame-align AND before the calibration
+        // capture below — fusion and the calibrators consume the SAME de-biased delta
+        // (the design's single-de-bias-site consistency requirement). Before the filter is
+        // enabled (first fuse) multi_bias() reads zero, so this is the identity then. Inert
+        // (slot_mb == -1 everywhere) when multi_bias_enabled is off.
+        if (s.mb_count > 0 && s.slot_mb[i] >= 0) {
+            const Vec6 b_i = s.eskf.multi_bias(s.slot_mb[i]);
+            B_corr = se3::compose(B_corr, se3::exp(-b_i * dt));
+        }
         // Frame-align: A = X o B_corr o X^-1  (X = sensor->base prior extrinsic).
         const SE3& X = s.prior_extrinsic[i];
         const SE3 A  = se3::compose(se3::compose(X, B_corr), se3::inverse(X));
@@ -1488,9 +1564,54 @@ Status Estimator::step(Timestamp now) {
     //     drives-alone resume restarts from a clean prior — NOT a stale/corrupt one. Multi-
     //     source-median bias COUPLING (Option B) is still deferred (the bias mean is held while
     //     out of regime), but the de-bias is no longer silently dropped and resume is safe.
+    // ---- Median-coupled multi-bias routing (Slice 18, Option B) -----------------
+    // Takes precedence over — and is mutually exclusive with — the Option-A path below
+    // (bias_slot stays -1 when multi_bias_enabled, so bias_drives_alone is false). The
+    // consensus med.value is ALREADY de-biased (the single de-bias site above ran before
+    // the median), so predict_multi composes it directly; the bias error enters through
+    // the per-source coupling blocks built HERE from THIS step's actual median inputs:
+    // the exact influence Omega_i over the n participants (computed with the SAME
+    // post-reliability weights the median consumed + the solver's lambda/eps conventions)
+    // and J_j = bias_coupling(...) per PARTICIPATING biased source. A biased source
+    // absent from this window keeps a ZERO block — its bias is frozen (random walk only),
+    // exactly the Omega_i = 0 limit of the influence (FD-pinned regimes: sole driver ->
+    // Omega = I == Option A; n == 2 -> fixed interpolation weights; vertex -> no blow-up).
+    const bool use_multi = (s.mb_count > 0);
     const bool bias_drives_alone =
         (s.bias_slot >= 0) && (n == 1) && (s.med_slot[0] == s.bias_slot);
-    if (bias_drives_alone) {
+    if (use_multi) {
+        // Enable the generalized augmented filter on the first fuse (biases start at zero
+        // with the kBiasCov0 prior — the de-bias site above already read those zeros).
+        if (!s.eskf.multi_bias_active()) {
+            s.eskf.enable_multi_bias(s.mb_count, Impl::kMultiBiasCov0);
+        }
+        int  mb_med[Eskf::kMaxBiasSources];     // median entry index of bias j, or -1
+        bool any_bias_in_median = false;
+        for (int j = 0; j < s.mb_count; ++j) {
+            mb_med[j] = -1;
+            for (int k = 0; k < n; ++k) {
+                if (s.med_slot[k] == s.mb_slot[j]) {
+                    mb_med[j] = k;
+                    any_bias_in_median = true;
+                    break;
+                }
+            }
+        }
+        if (any_bias_in_median) {
+            Eskf::median_influence(med.value, s.aligned, s.weights, n,
+                                   cfg.metric_lambda, cfg.weiszfeld_eps, s.mb_omega);
+        }
+        for (int j = 0; j < s.mb_count; ++j) {
+            if (mb_med[j] >= 0) {
+                const int k = mb_med[j];
+                s.mb_J[j] = Eskf::bias_coupling(med.value, s.aligned[k], s.mb_omega[k],
+                                                s.prior_extrinsic[s.mb_slot[j]], dt);
+            } else {
+                s.mb_J[j] = Mat6::Zero();       // absent this window -> no coupling
+            }
+        }
+        s.eskf.predict_multi(med.value, dt, q_pose, s.mb_J, s.mb_pn);
+    } else if (bias_drives_alone) {
         if (!s.eskf.bias_active()) s.eskf.enable_bias(Impl::kBiasCov0);
         s.eskf.predict_aug(med.value, dt, q_pose, s.bias_process_noise);
     } else if (s.eskf.bias_active()) {
@@ -1548,9 +1669,10 @@ Status Estimator::step(Timestamp now) {
             const Scalar gate     = Eskf::chi2_gate(cfg.mahalanobis_chi2, m.dim);
             const Scalar kappa     = cfg.correction_robust_kappa;        // Slice 15: 0 = non-robust
             const Scalar rot_kappa = cfg.correction_rot_suppress_kappa;  // Slice 15b: 0 = no suppress
-            const bool applied = use_aug
-                                     ? s.eskf.update_aug(m, gate, kappa, rot_kappa)
-                                     : s.eskf.update(m, gate, kappa, rot_kappa);
+            const bool applied =
+                use_multi ? s.eskf.update_multi(m, gate, kappa, rot_kappa)
+                          : (use_aug ? s.eskf.update_aug(m, gate, kappa, rot_kappa)
+                                     : s.eskf.update(m, gate, kappa, rot_kappa));
             if (applied) ++cdiag.corr_applied; else ++cdiag.corr_rejected;
             cdiag.last_nis = s.eskf.last_nis();     // last NIS, accepted or rejected
         }
@@ -1569,6 +1691,16 @@ Status Estimator::step(Timestamp now) {
     // (1 - trace(P_bias)/trace(P_bias_prior), the reduction of the bias-block variance below its
     // prior): ~0 with no absolute ref (the bias never becomes observable, the self-test), rising
     // toward 1 once the predict couples the bias to the pose AND fixes start shrinking it.
+    // Multi-bias snapshot (Slice 18): every registered bias source surfaces its CURRENT bias
+    // estimate + the per-bias observability confidence (the same bounded 1 - P/P_prior signal
+    // the Option-A path publishes; ~0 with no absolute ref — the self-test reads this).
+    if (use_multi && s.eskf.multi_bias_active()) {
+        for (int j = 0; j < s.mb_count; ++j) {
+            CalibSnapshot& mcs  = s.result.calib[s.mb_slot[j]];
+            mcs.bias            = s.eskf.multi_bias(j);
+            mcs.bias_observable = s.eskf.multi_bias_confidence(j);
+        }
+    }
     if (s.bias_slot >= 0 && s.eskf.bias_active()) {
         CalibSnapshot& bcs   = s.result.calib[s.bias_slot];
         bcs.bias             = s.eskf.bias();
@@ -1990,18 +2122,24 @@ Status validate(const Config& cfg) {
     // Bounded heading injection (Slice 15b): rot-suppress kappa must be >= 0 (0 disables).
     if (cfg.correction_rot_suppress_kappa < 0.0)         return Status::OutOfRange;
 
-    // Per-source bias states (Slice 11b, Option A, D22). Option A supports EXACTLY ONE bias
-    // source (the single driving source whose de-biased delta IS the predict). More than one
-    // bias_states=true source is the DEFERRED Option-B (median-coupled) regime -> reject here
-    // so the limitation is surfaced at init, not silently mis-modeled. Each bias source's
-    // random-walk process-noise rate must be non-negative.
+    // Per-source bias states (Slice 11b Option A / Slice 18 Option B, D22). With
+    // multi_bias_enabled OFF (the default), Option A supports EXACTLY ONE bias source (the
+    // single driving source whose de-biased delta IS the predict) — more than one
+    // bias_states=true source rejects here so the limitation is surfaced at init, not
+    // silently mis-modeled. With multi_bias_enabled ON (Slice 18), up to
+    // Eskf::kMaxBiasSources sources may carry bias states (the median-coupled augmented
+    // filter); beyond the compile-time cap rejects. Each bias source's random-walk
+    // process-noise rate must be non-negative either way.
     if (cfg.sensors != nullptr) {
         int bias_sources = 0;
         for (int i = 0; i < cfg.sensor_count; ++i) {
             if (cfg.sensors[i].bias_states) ++bias_sources;
             if (cfg.sensors[i].bias_process_noise < 0.0) return Status::OutOfRange;
         }
-        if (bias_sources > 1) return Status::InvalidConfig;   // Option A: single bias source only
+        if (!cfg.multi_bias_enabled && bias_sources > 1)
+            return Status::InvalidConfig;   // Option A: single bias source only
+        if (cfg.multi_bias_enabled && bias_sources > Eskf::kMaxBiasSources)
+            return Status::InvalidConfig;   // Option B: bounded by the compile-time cap
     }
 
     // Scale histogram range check (D19). The SCALE quantity is a strictly-positive RATIO

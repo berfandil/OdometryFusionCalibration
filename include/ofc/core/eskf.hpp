@@ -24,6 +24,12 @@
 
 namespace ofc {
 
+// Generalized multi-bias augmented error-state capacity (Slice 18, 11b Option B):
+// [pose(6); twist(6); bias_1(6) .. bias_k(6)] with k <= Eskf::kMaxBiasSources = 4.
+// Fixed worst-case size (strict core: allocated once, no heap); the ACTIVE dimension is
+// 12 + 6k, the padding rows/cols are kept exactly zero by construction.
+using Mat36 = Eigen::Matrix<Scalar, 36, 36>;
+
 class Eskf {
 public:
     Eskf() = default;
@@ -192,8 +198,78 @@ public:
     bool update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa = Scalar(0),
                     Scalar rot_suppress_kappa = Scalar(0));
 
-    // NIS (d2) of the LAST update() / update_aug() call — set whether the gate accepted or
-    // rejected; 0 before any update. Surfaced by the estimator into Result diagnostics.
+    // ---- Generalized multi-bias mode — Slice 18 (11b Option B, median-coupled) ----------
+    //
+    // The k-source generalization of the Option-A machinery above. The estimator de-biases
+    // each biased source's SOURCE-FRAME delta B_i' = B_i o exp(-b_i*dt) BEFORE the frame-align
+    // and the median; the consensus med is therefore already de-biased, and the bias error of
+    // source i enters the consensus tangent through the MEDIAN'S INPUT SENSITIVITY. The exact
+    // first-order coupling block (FD-verified, tests/test_multi_bias.cpp — the spike-5a scalar
+    // form -dt*omega_i*Ad(X_i) is FALSIFIED there) is
+    //
+    //     J_i = blkdiag(R_m^T, I) * Omega_i * blkdiag(R_{A_i}, I) * (-dt * Ad(X_i))
+    //     Omega_i = M^-1 u_i P_i,  P_i = I6 - xi_i (W xi_i)^T / d_i^2,  M = sum_j u_j P_j,
+    //     u_i = w_i/d_i,  xi_i = [t_i - t_m; log(R_m^T R_i)],  W = diag(lambda*I3, I3),
+    //
+    // with sum_i Omega_i = I exactly. Regimes (all FD-pinned): n == 1 sole participant ->
+    // Omega = I (Option A exact); n == 2 geodesic midpoint -> Omega_i = (w_i/sum w)*I (the
+    // solver interpolates with FIXED weights there — NOT the d-based form); a source absent
+    // from the window -> u_i = 0 -> Omega_i = 0 (no coupling, its bias random-walks frozen);
+    // a (weight-dominant / coincident) vertex d_i <= eps -> the median sits ON the vertex set
+    // -> the coincident sources split the identity by weight and every other Omega_j -> 0
+    // (the documented non-smooth-vertex limit; no 1/d blow-up).
+    //
+    // median_influence() computes Omega_i for all n median participants from EXACTLY the
+    // inputs/weights the median consumed (the estimator passes its post-reliability fusion
+    // weights + the solver's lambda/eps conventions); bias_coupling() assembles J_i. Both are
+    // pure static value functions (strict core: fixed-size, no heap) so the FD pin can assert
+    // the PRODUCTION blocks against its reference construction directly.
+    static void median_influence(const SE3& med, const SE3* A, const Scalar* w, int n,
+                                 Scalar lambda, Scalar eps, Mat6* Omega);
+    static Mat6 bias_coupling(const SE3& med, const SE3& A_i, const Mat6& Omega_i,
+                              const SE3& X_i, Scalar dt);
+
+    // Maximum number of simultaneously-tracked bias sources (compile-time; augmented error
+    // dim <= 12 + 6*4 = 36).
+    static constexpr int kMaxBiasSources = 4;
+
+    // Switch into the generalized k-bias augmented mode at the current 12-DOF state: all k
+    // biases start at zero, each bias block of the 36x36 covariance is seeded to bias_cov0*I6
+    // (> 0 required for observability), pose+twist copy the live 12x12, cross-blocks zero,
+    // padding zero. Mutually exclusive with the Option-A enable_bias() mode (the estimator
+    // routes one or the other; init() resets both). k is clamped to [1, kMaxBiasSources].
+    void enable_multi_bias(int k, Scalar bias_cov0);
+    bool multi_bias_active() const { return mb_count_ > 0; }
+    int  multi_bias_count()  const { return mb_count_; }
+    // Current bias estimate of bias source j (zero when inactive / j out of range).
+    Vec6 multi_bias(int j) const;
+    // Per-bias observability confidence in [0,1] (the multi-bias analogue of
+    // bias_confidence(): 1 - trace(P_bias_j)/trace(prior)). 0 when inactive / out of range.
+    Scalar multi_bias_confidence(int j) const;
+
+    // predict_multi(): the generalized augmented predict. `delta` is the ALREADY-DE-BIASED
+    // consensus (the estimator de-biased each source before the median — no further de-bias
+    // here, unlike Option A's predict_aug). J_bias[j] (j < multi_bias_count()) is the
+    // pose<-bias_j coupling block for THIS step (bias_coupling() above; ZERO for a source
+    // absent from the window). bias_pn[j] is the per-source random-walk rate:
+    //   F (36x36 capacity, active 12+6k): pose row [Ad(delta^-1) | 0 | J_1 .. J_k];
+    //       twist row 0 (re-read each step); bias rows identity (random walk).
+    //   Q = blkdiag(q_pose, q_pose/dt^2, pn_1*dt*I6, .., pn_k*dt*I6).
+    // Mean: pose <- pose o delta; twist <- log(delta)/dt. dt <= 0 guarded as in predict().
+    void predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
+                       const Mat6* J_bias, const Scalar* bias_pn);
+
+    // update_multi(): the generalized augmented measurement update — identical structure to
+    // update_aug() at the 36 capacity (H pads zero bias columns; the gain's bias rows are
+    // nonzero via the pose<->bias cross-covariance; per-n gate / Joseph / robust kappa /
+    // C4 rot-suppression act on the pose rows 0..5 / 3..5 exactly as before — the pose block
+    // is ALWAYS the first 6 rows regardless of k). Injects pose/twist/all k biases.
+    // Returns true iff applied; no-op (false) when multi-bias is inactive.
+    bool update_multi(const Measurement& m, Scalar chi2_threshold,
+                      Scalar robust_kappa = Scalar(0), Scalar rot_suppress_kappa = Scalar(0));
+
+    // NIS (d2) of the LAST update() / update_aug() / update_multi() call — set whether the
+    // gate accepted or rejected; 0 before any update. Surfaced into Result diagnostics.
     Scalar last_nis() const { return last_nis_; }
 
     // Const-velocity extrapolation `dt_ahead` seconds past the frontier:
@@ -232,6 +308,14 @@ private:
     Vec6   bias_   = Vec6::Zero();
     Mat18  cov18_  = Mat18::Identity();
     Scalar bias_prior_trace_ = Scalar(0);   // trace(P_bias) at enable_bias() (for confidence)
+
+    // Generalized multi-bias mode — Slice 18 (Option B). Inactive (mb_count_ == 0) by
+    // default; enable_multi_bias() turns it on. cov36_'s active top-left (12+6k) block is the
+    // live covariance (state_.cov mirrors its top-left 12x12); padding stays exactly zero.
+    int    mb_count_ = 0;
+    Vec6   mb_bias_[kMaxBiasSources];
+    Mat36  cov36_ = Mat36::Zero();
+    Scalar mb_prior_trace_ = Scalar(0);   // per-bias-block trace at enable (for confidence)
 };
 
 } // namespace ofc

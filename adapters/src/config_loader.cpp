@@ -129,13 +129,15 @@ const char* kKnobDoc =
     "  timesync_enabled=<bool>\n"
     "  rot3d_enabled=<bool>     (turn-regime FULL rotation extrinsic, Slice 17; default off)\n"
     "  joint_lever_scale=<bool> (turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off)\n"
+    "  multi_bias_enabled=<bool> (median-coupled multi-source bias states, Slice 18; default off)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
     "[sensor.N]\n"
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
-    "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n";
+    "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n"
+    "  bias_states=<bool>     bias_process_noise=<f>   (per-source body-twist bias, Slice 11b/18)\n";
 
 } // namespace
 
@@ -281,6 +283,11 @@ Status ConfigLoader::parse(const std::string& text) {
                 // Default off = byte-identical 3-unknown lever numerics.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.joint_lever_scale = bv;
+            } else if (key == "multi_bias_enabled") {
+                // Slice 18: median-coupled multi-source bias states (11b Option B).
+                // Default off = byte-identical legacy behavior (Option A unchanged).
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.multi_bias_enabled = bv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
@@ -342,6 +349,15 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "is_reference") {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 sc.is_reference = bv;
+            } else if (key == "bias_states") {
+                // Slice 11b/18: this source carries a body-twist bias state (Option A when
+                // [global] multi_bias_enabled is off — single source only; Option B when on).
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                sc.bias_states = bv;
+            } else if (key == "bias_process_noise") {
+                // Slice 11b/18: the bias random-walk process-noise rate (>= 0; validate()).
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                sc.bias_process_noise = dv;
             } else {
                 return fail("unknown sensor key '" + key + "'", line_no, raw);
             }

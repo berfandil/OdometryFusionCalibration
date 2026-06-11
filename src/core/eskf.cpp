@@ -21,6 +21,7 @@
 #include "ofc/core/lie.hpp"
 
 #include <Eigen/Cholesky>
+#include <Eigen/LU>
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +75,11 @@ void Eskf::init(const SE3& pose0, const Mat12& cov0) {
     bias_             = Vec6::Zero();
     cov18_            = Mat18::Identity();
     bias_prior_trace_ = Scalar(0);
+    // Generalized multi-bias mode OFF on init (Slice 18).
+    mb_count_         = 0;
+    for (int j = 0; j < kMaxBiasSources; ++j) mb_bias_[j] = Vec6::Zero();
+    cov36_            = Mat36::Zero();
+    mb_prior_trace_   = Scalar(0);
 }
 
 void Eskf::enable_bias(Scalar bias_cov0) {
@@ -409,6 +415,253 @@ bool Eskf::update_aug(const Measurement& m, Scalar chi2_threshold, Scalar robust
 
     // Mirror the published 12x12.
     state_.cov       = cov18_.block<12, 12>(0, 0);
+    state_.twist.cov = state_.cov.block<6, 6>(6, 6);
+    return true;
+}
+
+// ---- Generalized multi-bias mode (Slice 18, 11b Option B) --------------------------------
+
+void Eskf::median_influence(const SE3& med, const SE3* A, const Scalar* w, int n,
+                            Scalar lambda, Scalar eps, Mat6* Omega) {
+    if (n <= 0 || A == nullptr || Omega == nullptr) return;
+
+    // Effective weights mirror median.cpp's w_of(): negatives clamp to 0; an all-<=0 set
+    // falls back to uniform — the influence must describe the median ACTUALLY solved.
+    Scalar wsum_all = Scalar(0);
+    for (int i = 0; i < n; ++i) wsum_all += (w != nullptr && w[i] > Scalar(0)) ? w[i] : Scalar(0);
+    const bool uniform = (wsum_all <= Scalar(0));
+    auto w_of = [&](int i) -> Scalar {
+        if (uniform) return Scalar(1);
+        return (w[i] > Scalar(0)) ? w[i] : Scalar(0);
+    };
+
+    // n == 1: passthrough — the sole participant IS the median (Omega = I; Option A exact).
+    if (n == 1) {
+        Omega[0] = Mat6::Identity();
+        return;
+    }
+
+    // n == 2: the solver interpolates with FIXED weights (weighted geodesic midpoint), so
+    // the influence is the interpolation weight w_i/sum(w) — NOT the d-based form (which is
+    // FD-falsified at n=2 for unequal weights; see tests/test_multi_bias.cpp).
+    if (n == 2) {
+        const Scalar w0 = w_of(0), w1 = w_of(1);
+        const Scalar denom = w0 + w1;
+        const Scalar a0 = (denom > Scalar(0)) ? (w0 / denom) : Scalar(0.5);
+        Omega[0] = a0 * Mat6::Identity();
+        Omega[1] = (Scalar(1) - a0) * Mat6::Identity();
+        return;
+    }
+
+    // n >= 3: the converged Weiszfeld fixed point. First the VERTEX (non-smooth) limit: if
+    // the median sits ON one or more inputs (d_i <= eps — the solver's own Vardi-Zhang
+    // exclusion threshold), the 1/d weights diverge there and the smooth formula below is
+    // invalid. The documented limit: the coincident vertex set splits the identity by weight
+    // (a single weight-dominant vertex -> Omega = I) and every non-coincident Omega_j -> 0.
+    const Scalar eps_v = (eps > Scalar(0)) ? eps : Scalar(0);
+    Scalar d[/*n<=*/32];                 // bounded by the estimator's source cap
+    const int nc = (n < 32) ? n : 32;    // defensive clamp (callers never exceed the cap)
+    Scalar coincident_w = Scalar(0);
+    int    coincident_n = 0;
+    for (int i = 0; i < nc; ++i) {
+        d[i] = se3::split_distance(med, A[i], lambda);
+        if (d[i] <= eps_v) { coincident_w += w_of(i); ++coincident_n; }
+    }
+    if (coincident_n > 0) {
+        for (int i = 0; i < nc; ++i) {
+            if (d[i] <= eps_v) {
+                const Scalar share = (coincident_w > Scalar(0))
+                                         ? (w_of(i) / coincident_w)
+                                         : (Scalar(1) / static_cast<Scalar>(coincident_n));
+                Omega[i] = share * Mat6::Identity();
+            } else {
+                Omega[i] = Mat6::Zero();
+            }
+        }
+        return;
+    }
+
+    // Smooth interior case: Omega_i = M^-1 u_i P_i (implicit function theorem at the fixed
+    // point; FD-verified to ~1%, tests/test_multi_bias.cpp). W = diag(lambda*I3, I3) on the
+    // [trans; rot] tangent; P_i is the W-radial projector; sum_i Omega_i = I exactly.
+    Mat6 W = Mat6::Identity();
+    W.topLeftCorner(3, 3) *= lambda;
+    Mat6 M = Mat6::Zero();
+    Mat6 uP[32];
+    const Mat3 RmT = med.R.transpose();
+    for (int i = 0; i < nc; ++i) {
+        Vec6 xi;
+        xi.head<3>() = A[i].t - med.t;
+        xi.tail<3>() = so3::log(RmT * A[i].R);
+        const Scalar d2 = std::max(xi.dot(W * xi), Scalar(1e-30));
+        const Scalar u  = w_of(i) / std::sqrt(d2);
+        const Mat6 P = Mat6::Identity() - (xi * (W * xi).transpose()) / d2;
+        uP[i] = u * P;
+        M += uP[i];
+    }
+    // M is W-self-adjoint, not symmetric — full-pivot solve for robustness (fixed-size, no
+    // heap). A w_i = 0 (absent/zero-weight) source gets u_i = 0 -> Omega_i = 0 exactly.
+    const Eigen::FullPivLU<Mat6> Mlu = M.fullPivLu();
+    for (int i = 0; i < nc; ++i) Omega[i] = Mlu.solve(uP[i]);
+}
+
+Mat6 Eskf::bias_coupling(const SE3& med, const SE3& A_i, const Mat6& Omega_i,
+                         const SE3& X_i, Scalar dt) {
+    // J_i = blkdiag(R_m^T, I) * Omega_i * blkdiag(R_{A_i}, I) * (-dt * Ad(X_i)). The blkdiag
+    // factors are the right-tangent translation transports between the input A_i, the ambient
+    // median equations, and the output median tangent; -dt*Ad(X_i) carries the SOURCE-FRAME
+    // bias (B_i' = B_i o exp(-b_i*dt)) through the frame-align conjugation (FD-pinned).
+    Mat6 Tg = Mat6::Identity();
+    Tg.topLeftCorner(3, 3) = med.R.transpose();
+    Mat6 Ta = Mat6::Identity();
+    Ta.topLeftCorner(3, 3) = A_i.R;
+    return Tg * Omega_i * Ta * (-dt * se3::adjoint(X_i));
+}
+
+void Eskf::enable_multi_bias(int k, Scalar bias_cov0) {
+    // Switch into the generalized augmented mode at the CURRENT 12-DOF state (mirrors
+    // enable_bias()). All biases start at zero; the active covariance copies the live
+    // pose+twist 12x12, seeds each bias block to bias_cov0*I6, zeroes every cross-block and
+    // all padding (the padding stays zero forever by construction).
+    mb_count_ = (k < 1) ? 1 : ((k > kMaxBiasSources) ? kMaxBiasSources : k);
+    bias_active_ = false;                 // the two augmented modes are mutually exclusive
+    for (int j = 0; j < kMaxBiasSources; ++j) mb_bias_[j] = Vec6::Zero();
+    cov36_ = Mat36::Zero();
+    cov36_.block<12, 12>(0, 0) = state_.cov;
+    const Scalar bc = (bias_cov0 > Scalar(0)) ? bias_cov0 : Scalar(1e-6);
+    for (int j = 0; j < mb_count_; ++j) {
+        cov36_.block<6, 6>(12 + 6 * j, 12 + 6 * j) = bc * Mat6::Identity();
+    }
+    cov36_ = Scalar(0.5) * (cov36_ + cov36_.transpose());
+    mb_prior_trace_ = Scalar(6) * bc;     // per-bias-block prior trace (for confidence)
+}
+
+Vec6 Eskf::multi_bias(int j) const {
+    if (j < 0 || j >= mb_count_) return Vec6::Zero();
+    return mb_bias_[j];
+}
+
+Scalar Eskf::multi_bias_confidence(int j) const {
+    if (j < 0 || j >= mb_count_ || !(mb_prior_trace_ > Scalar(0))) return Scalar(0);
+    const Scalar cur = cov36_.block<6, 6>(12 + 6 * j, 12 + 6 * j).trace();
+    const Scalar reduced = Scalar(1) - cur / mb_prior_trace_;
+    return std::max(Scalar(0), std::min(Scalar(1), reduced));
+}
+
+void Eskf::predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
+                         const Mat6* J_bias, const Scalar* bias_pn) {
+    if (mb_count_ <= 0) { predict(delta, dt, q_pose); return; }   // defensive routing
+    const Scalar dt_eff = (dt > kMinDt) ? dt : kMinDt;
+
+    // --- mean propagation ---------------------------------------------------
+    // `delta` is the ALREADY-DE-BIASED consensus (the estimator de-biased each biased
+    // source's SOURCE-FRAME delta BEFORE the median), so no further de-bias here.
+    state_.pose     = se3::compose(state_.pose, delta);
+    state_.twist.xi = se3::log(delta) / dt_eff;
+    // bias means unchanged (random walk; only an update moves them).
+
+    // --- covariance propagation: P <- F P F^T + Q (active 12+6k of 36) ------
+    const Mat6 Ad_inv = se3::adjoint(se3::inverse(delta));
+
+    Mat36 F = Mat36::Zero();
+    F.block<6, 6>(0, 0) = Ad_inv;                          // pose row: prior pose error
+    for (int j = 0; j < mb_count_; ++j) {
+        // pose row, bias_j column: the median-coupling block (zero for an absent source).
+        if (J_bias != nullptr) F.block<6, 6>(0, 12 + 6 * j) = J_bias[j];
+        // bias_j row: identity (random walk).
+        F.block<6, 6>(12 + 6 * j, 12 + 6 * j) = Mat6::Identity();
+    }
+    // twist row stays zero (re-read each step, as in predict()).
+
+    Mat36 Q = Mat36::Zero();
+    Q.block<6, 6>(0, 0) = q_pose;
+    Q.block<6, 6>(6, 6) = q_pose / (dt_eff * dt_eff);
+    for (int j = 0; j < mb_count_; ++j) {
+        const Scalar pn = (bias_pn != nullptr && bias_pn[j] > Scalar(0)) ? bias_pn[j]
+                                                                         : Scalar(0);
+        Q.block<6, 6>(12 + 6 * j, 12 + 6 * j) = (pn * dt_eff) * Mat6::Identity();
+    }
+
+    const Mat36 Pn = F * cov36_ * F.transpose() + Q;
+    cov36_ = Scalar(0.5) * (Pn + Pn.transpose());
+
+    // Mirror the published 12x12 (pose+twist).
+    state_.cov       = cov36_.block<12, 12>(0, 0);
+    state_.twist.cov = state_.cov.block<6, 6>(6, 6);
+    // stamp untouched — the estimator owns the frontier clock.
+}
+
+bool Eskf::update_multi(const Measurement& m, Scalar chi2_threshold, Scalar robust_kappa,
+                        Scalar rot_suppress_kappa) {
+    if (mb_count_ <= 0) return false;       // caller should use update()/update_aug()
+    const int n = m.dim;
+    if (n <= 0 || n > 6) return false;
+
+    // Pad to full fixed-size capacity (strict core, mirrors update_aug()). H is 6x36: the
+    // active measurement on the top-left n x 12 (pose+twist) block; ALL bias columns stay
+    // zero (the ref observes the pose, not a bias directly). The padded covariance rows/cols
+    // beyond 12+6k are exactly zero, so they contribute nothing anywhere below.
+    Eigen::Matrix<Scalar, 6, 36> H = Eigen::Matrix<Scalar, 6, 36>::Zero();
+    Vec6 r = Vec6::Zero();
+    Mat6 R = Mat6::Identity();
+    H.block(0, 0, n, 12)  = m.H.topLeftCorner(n, 12);
+    r.head(n)             = m.residual.head(n);
+    R.topLeftCorner(n, n) = m.R.topLeftCorner(n, n);
+
+    const Mat36& P = cov36_;
+
+    const Mat6 S = H * P * H.transpose() + R;
+    const Eigen::LDLT<Mat6> Sldlt = S.ldlt();
+    const Vec6  Sinv_r = Sldlt.solve(r);
+    const Scalar d2    = r.dot(Sinv_r);
+    last_nis_ = d2;
+
+    if (d2 > chi2_threshold) return false;   // gate: reject (state unchanged)
+
+    // Robust (Huber) gain down-weighting — identical to update()/update_aug().
+    const Scalar dbar = std::sqrt(d2 / static_cast<Scalar>(n));
+    Mat6 Reff = R;
+    Eigen::LDLT<Mat6> Seff = Sldlt;
+    if (robust_kappa > Scalar(0) && dbar > robust_kappa) {
+        const Scalar inv_w = dbar / robust_kappa;
+        const Mat6 dInfl = (inv_w - Scalar(1)) * R;
+        Reff.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+        Mat6 Snew = S;
+        Snew.topLeftCorner(n, n) += dInfl.topLeftCorner(n, n);
+        Seff = Snew.ldlt();
+    }
+
+    // Kalman gain K = P H^T Seff^-1 (36 x 6 capacity). The bias rows are nonzero via the
+    // pose<->bias cross-covariance the coupled predict built — the update injects the biases.
+    const Eigen::Matrix<Scalar, 6, 36> HP = H * P;
+    const Eigen::Matrix<Scalar, 6, 36> Kt = Seff.solve(HP);
+    Eigen::Matrix<Scalar, 36, 6> K = Kt.transpose();
+
+    // Bounded heading injection (Slice 15b, lever C4) — the pose rotation rows are ALWAYS
+    // rows 3..5 (the pose block leads the state at any k), so the suppression is unchanged.
+    if (rot_suppress_kappa > Scalar(0) && dbar > rot_suppress_kappa &&
+        H.middleCols(3, 3).norm() < kRotObsEps) {
+        K.middleRows(3, 3) *= (rot_suppress_kappa / dbar);
+    }
+
+    const Eigen::Matrix<Scalar, 36, 1> dx = K * r;
+
+    // Inject (same right-error tangent as update()): pose o exp(dx[0:6]); twist += dx[6:12];
+    // bias_j += dx[12+6j : 18+6j].
+    state_.pose     = se3::compose(state_.pose, se3::exp(dx.segment<6>(0)));
+    state_.twist.xi = state_.twist.xi + dx.segment<6>(6);
+    for (int j = 0; j < mb_count_; ++j) {
+        mb_bias_[j] = mb_bias_[j] + dx.segment<6>(12 + 6 * j);
+    }
+
+    // Joseph-form covariance (guaranteed PSD), then symmetrize. Padding stays zero: its H
+    // columns are zero and its P rows/cols are zero, so IKH is identity there and K R K^T
+    // has zero rows there.
+    const Mat36 IKH = Mat36::Identity() - K * H;
+    const Mat36 Pn  = IKH * P * IKH.transpose() + K * Reff * K.transpose();
+    cov36_ = Scalar(0.5) * (Pn + Pn.transpose());
+
+    state_.cov       = cov36_.block<12, 12>(0, 0);
     state_.twist.cov = state_.cov.block<6, 6>(6, 6);
     return true;
 }

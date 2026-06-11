@@ -215,6 +215,17 @@ struct Config {
     // typical enabled value is below the gate's per-DOF dbar ceiling sqrt(mahalanobis_chi2/3)
     // (~1.73 at the default gate), e.g. ~0.8, so an in-gate-but-large position residual is protected.
     Scalar correction_rot_suppress_kappa = 0.0;
+    // Median-coupled multi-source bias states (Slice 18, 11b Option B). When enabled, EVERY
+    // source with SensorConfig::bias_states (up to Eskf::kMaxBiasSources = 4) carries its own
+    // body-twist bias state in a generalized augmented ESKF [pose; twist; bias_1..bias_k]:
+    // each biased source's SOURCE-FRAME delta is de-biased B_i' = B_i ∘ exp(−b_i·dt) BEFORE
+    // the frame-align + median (the calibrators consume the SAME de-biased deltas), and the
+    // pose<->bias coupling uses the exact FD-verified median-influence block Ω_i (see
+    // eskf.hpp). Biases are observable only with an absolute ref. Default OFF = byte-identical
+    // legacy behavior: the Option-A single-bias path is unchanged and >1 bias_states source
+    // still rejects with InvalidConfig at validate(). In the persistence config-hash (a flip
+    // rejects stale restores).
+    bool   multi_bias_enabled = false;
 
     // Output
     bool   emit_predicted_tip = true;

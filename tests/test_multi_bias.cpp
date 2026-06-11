@@ -49,6 +49,7 @@
 // item 1 (swap the candidate under test) and a regression of either finding is loud.
 #include <doctest/doctest.h>
 
+#include "ofc/core/eskf.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
 #include "ofc/core/types.hpp"
@@ -343,4 +344,178 @@ TEST_CASE("slice18 FD pin: n==2 midpoint — influence is w_i/sum(w), not the d-
     CHECK(worst_interp < 0.06);
     // ...and the d-based omega formula systematically mismatches for unequal weights.
     CHECK(best_dbased > 0.10);
+}
+
+// ===========================================================================
+// PRODUCTION == PIN (Slice 18 implementation guard). The estimator-side production blocks
+// (Eskf::median_influence + Eskf::bias_coupling) must equal THIS FILE's FD-verified reference
+// construction (exact_influence + exact_block) on randomized states — guards drift between
+// the permanent FD pin above and the production implementation the filter actually runs.
+// ===========================================================================
+TEST_CASE("slice18 production: Eskf::median_influence/bias_coupling == the FD-pinned reference "
+          "construction on randomized states") {
+    const Scalar dt = 0.1, lambda = 1.0;
+    const median::Params mp = tight_params(lambda);
+
+    Scalar worst_omega = 0.0, worst_J = 0.0;
+    for (int trial = 0; trial < 8; ++trial) {
+        const int n = 3 + (trial % 2);
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(n, dt, B, X, bias, w);
+
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_median(B, X, bias, w, dt, mp, &A);
+
+        // Reference (the FD-verified construction in this file).
+        std::vector<Mat6> Omg_ref;
+        exact_influence(med0, A, w, lambda, Omg_ref);
+
+        // Production (what the estimator computes inside step()).
+        std::vector<Mat6> Omg_prod(static_cast<size_t>(n));
+        Eskf::median_influence(med0, A.data(), w.data(), n, lambda, mp.eps,
+                               Omg_prod.data());
+
+        for (int i = 0; i < n; ++i) {
+            const Scalar eo = (Omg_prod[static_cast<size_t>(i)] -
+                               Omg_ref[static_cast<size_t>(i)]).norm();
+            const Mat6 J_ref  = exact_block(med0, A[static_cast<size_t>(i)],
+                                            Omg_ref[static_cast<size_t>(i)],
+                                            X[static_cast<size_t>(i)], dt);
+            const Mat6 J_prod = Eskf::bias_coupling(med0, A[static_cast<size_t>(i)],
+                                                    Omg_prod[static_cast<size_t>(i)],
+                                                    X[static_cast<size_t>(i)], dt);
+            const Scalar ej = (J_prod - J_ref).norm();
+            worst_omega = std::max(worst_omega, eo);
+            worst_J     = std::max(worst_J, ej);
+        }
+    }
+    MESSAGE("production-vs-pin: worst |Omega diff|=" << worst_omega
+            << "  worst |J diff|=" << worst_J);
+    // Same math, same conventions -> agreement to numerical noise (NOT a percent tolerance:
+    // any re-derivation drift, sign flip, or transport reorder fails loudly).
+    CHECK(worst_omega < 1e-9);
+    CHECK(worst_J < 1e-9);
+}
+
+// ===========================================================================
+// Influence edge cases (acceptance §3 item 5, unit level): absent source (w = 0 -> Omega = 0),
+// sole participant (Omega = I -> J = -dt*Ad(X), Option A exact), n == 2 fixed interpolation,
+// VZ coincident vertex, weight-dominant vertex (Omega -> I, no blow-up).
+// ===========================================================================
+TEST_CASE("slice18 production: influence edge cases — absent, sole, n==2, coincident vertex, "
+          "weight-dominant vertex") {
+    const Scalar dt = 0.1, lambda = 1.0, eps = 1e-12;
+    const median::Params mp = tight_params(lambda);
+
+    // --- sole participant (n == 1): Omega = I, J = -dt*Ad(X) (Option A generalizes exactly).
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(1, dt, B, X, bias, w);
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_median(B, X, bias, w, dt, mp, &A);
+        Mat6 Om;
+        Eskf::median_influence(med0, A.data(), w.data(), 1, lambda, eps, &Om);
+        CHECK((Om - Mat6::Identity()).norm() < 1e-12);
+        // med == A[0] at n == 1, so the two transports cancel: J = -dt*Ad(X).
+        const Mat6 J = Eskf::bias_coupling(med0, A[0], Om, X[0], dt);
+        CHECK((J - (-dt * se3::adjoint(X[0]))).norm() < 1e-9);
+    }
+
+    // --- n == 2: fixed interpolation weights w_i/sum(w) (NOT the d-based form).
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(2, dt, B, X, bias, w);
+        w[0] = 2.0; w[1] = 0.5;
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_median(B, X, bias, w, dt, mp, &A);
+        Mat6 Om[2];
+        Eskf::median_influence(med0, A.data(), w.data(), 2, lambda, eps, Om);
+        CHECK((Om[0] - (2.0 / 2.5) * Mat6::Identity()).norm() < 1e-12);
+        CHECK((Om[1] - (0.5 / 2.5) * Mat6::Identity()).norm() < 1e-12);
+    }
+
+    // --- absent source: a zero-weight participant gets Omega = 0 exactly (u_i = 0); the
+    //     remaining influences still sum to I.
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(4, dt, B, X, bias, w);
+        w[2] = 0.0;                          // "absent" (the estimator passes it no weight)
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_median(B, X, bias, w, dt, mp, &A);
+        Mat6 Om[4];
+        Eskf::median_influence(med0, A.data(), w.data(), 4, lambda, eps, Om);
+        CHECK(Om[2].norm() < 1e-12);
+        Mat6 sum = Mat6::Zero();
+        for (int i = 0; i < 4; ++i) sum += Om[i];
+        CHECK((sum - Mat6::Identity()).norm() < 1e-9);
+    }
+
+    // --- VZ coincident vertex: two inputs EXACTLY coincident, jointly weight-dominant -> the
+    //     median sits ON them (the solver's Vardi-Zhang regime; we pass the exact vertex pose,
+    //     the limit point, so the test does not depend on the solver's vertex asymptotics).
+    //     The influence must not blow up: the coincident set splits I by weight, the
+    //     off-vertex source gets 0.
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(3, dt, B, X, bias, w);
+        std::vector<SE3> A;
+        (void)debias_align_median(B, X, bias, w, dt, mp, &A);
+        A[1] = A[0];                          // exact coincidence
+        w[0] = 1.0; w[1] = 1.0; w[2] = 0.5;   // w0 + w1 > w2 -> median == the coincident pair
+        Mat6 Om[3];
+        Eskf::median_influence(A[0], A.data(), w.data(), 3, lambda, eps, Om);
+        bool finite = true;
+        for (int i = 0; i < 3; ++i) finite = finite && Om[i].allFinite();
+        CHECK(finite);
+        CHECK((Om[0] - 0.5 * Mat6::Identity()).norm() < 1e-9);
+        CHECK((Om[1] - 0.5 * Mat6::Identity()).norm() < 1e-9);
+        CHECK(Om[2].norm() < 1e-12);
+    }
+
+    // --- weight-dominant vertex: w_0 > sum(others) -> the median IS vertex 0 (d_0 = 0). The
+    //     documented limit: Omega_0 -> I, others -> 0, no 1/d blow-up. ALSO pin the NEAR-vertex
+    //     numerics (d_0 ~ 1e-7, just above the eps guard): finite + bounded (graceful
+    //     degradation toward I, the honest-caveat regime of the design).
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(3, dt, B, X, bias, w);
+        std::vector<SE3> A;
+        (void)debias_align_median(B, X, bias, w, dt, mp, &A);
+        w[0] = 10.0; w[1] = 0.3; w[2] = 0.3;
+        Mat6 Om[3];
+        // Exactly ON the vertex (d_0 = 0 <= eps): the limit branch.
+        Eskf::median_influence(A[0], A.data(), w.data(), 3, lambda, eps, Om);
+        bool finite = true;
+        for (int i = 0; i < 3; ++i) finite = finite && Om[i].allFinite();
+        CHECK(finite);
+        CHECK((Om[0] - Mat6::Identity()).norm() < 1e-9);
+        CHECK(Om[1].norm() < 1e-12);
+        CHECK(Om[2].norm() < 1e-12);
+        // JUST OFF the vertex (d_0 ~ 1e-7 > eps): the smooth formula must stay finite and
+        // bounded (no 1/d blow-up into the covariance), with Omega_0 near I.
+        SE3 med_near = A[0];
+        med_near.t += Vec3(1e-7, 0, 0);
+        Eskf::median_influence(med_near, A.data(), w.data(), 3, lambda, eps, Om);
+        finite = true;
+        for (int i = 0; i < 3; ++i) finite = finite && Om[i].allFinite();
+        CHECK(finite);
+        // Bounded — no 1/d blow-up (|I| = sqrt(6) ~ 2.45; the near-vertex limit is I minus a
+        // bounded W-radial rank-1 deficiency, the design's documented non-smoothness caveat).
+        CHECK(Om[0].norm() < 10.0);
+        Mat6 sum = Mat6::Zero();
+        for (int i = 0; i < 3; ++i) sum += Om[i];
+        CHECK((sum - Mat6::Identity()).norm() < 1e-6);    // the sum rule still holds
+    }
 }

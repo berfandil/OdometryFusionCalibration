@@ -363,3 +363,73 @@ TEST_CASE("ConfigLoader: an empty config validates Ok (all core defaults)") {
     CHECK(loader.config().sensor_count == 0);
     CHECK(loader.config().sensors == nullptr);
 }
+
+TEST_CASE("ConfigLoader: multi_bias_enabled + per-sensor bias_states/bias_process_noise parse "
+          "(Slice 18); default off; the multi-bias guard surfaces through validate()") {
+    // Default off: an empty config leaves the flag false and the per-sensor bias fields at
+    // their SensorConfig defaults.
+    {
+        ConfigLoader loader;
+        REQUIRE(loader.parse("# defaults\n") == Status::Ok);
+        CHECK_FALSE(loader.config().multi_bias_enabled);
+    }
+
+    // The flag + per-sensor keys parse and land in the right fields; TWO bias_states sensors
+    // validate Ok only because the flag lifts the Option-A single-bias guard.
+    const std::string text =
+        "[global]\n"
+        "max_sources = 2\n"
+        "reference_sensor_id = 0\n"
+        "multi_bias_enabled = true\n"
+        "[sensor.0]\n"
+        "id = 0\n"
+        "is_reference = true\n"
+        "bias_states = true\n"
+        "bias_process_noise = 0.002\n"
+        "[sensor.1]\n"
+        "id = 1\n"
+        "bias_states = on\n";
+    {
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK(c.multi_bias_enabled);
+        REQUIRE(c.sensor_count == 2);
+        CHECK(c.sensors[0].bias_states);
+        CHECK(c.sensors[0].bias_process_noise == doctest::Approx(0.002));
+        CHECK(c.sensors[1].bias_states);
+        CHECK(c.sensors[1].bias_process_noise == doctest::Approx(1e-4));  // the core default
+    }
+
+    // WITHOUT the flag, the same two bias_states sensors are rejected by the core validate()
+    // (the Option-A InvalidConfig guard is intact when the flag is off).
+    {
+        std::string off_text = text;
+        const std::string flag_line = "multi_bias_enabled = true\n";
+        off_text.replace(off_text.find(flag_line), flag_line.size(), "");
+        ConfigLoader loader;
+        CHECK(loader.parse(off_text) == Status::InvalidConfig);
+    }
+
+    // Bad values reject with a line diagnostic.
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nmulti_bias_enabled = maybe\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("expected bool") != std::string::npos);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid = 0\nbias_states = maybe\n") == Status::InvalidConfig);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid = 0\nbias_process_noise = junk\n")
+              == Status::InvalidConfig);
+    }
+    // A negative bias_process_noise parses but fails the core validate() (OutOfRange).
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid = 0\nbias_process_noise = -1\n")
+              == Status::OutOfRange);
+    }
+}
