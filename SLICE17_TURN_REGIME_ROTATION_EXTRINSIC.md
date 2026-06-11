@@ -1,10 +1,10 @@
-# Slice 17 — Turn-regime full rotation-extrinsic (axis-correspondence hand-eye)
+﻿# Slice 17 — Turn-regime full rotation-extrinsic (axis-correspondence hand-eye)
 
 **Goal**: recover the FULL rotation extrinsic on non-ground (3D, multi-axis-rotation) motion — the gap EuRoC exposed (rotation extrinsic conf 0 on a drone; that error also corrupts the lever hand-eye rows at ~|t|·θ, blocking the <1 cm lever target on 3D motion).
 
 ---
 
-## 1. Math + prototype evidence (2026-06-10, `euroc_run/proto_rot_handeye.py`)
+## 1. Math + prototype evidence (2026-06-10, `tools/proto_rot_handeye.py`)
 
 A sensor at extrinsic `X` reports `B = X⁻¹∘A∘X`, so rotations satisfy the hand-eye identity `R_A R_X = R_X R_B`, equivalently the **rotation-axis correspondence**
 
