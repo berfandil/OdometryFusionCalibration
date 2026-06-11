@@ -545,11 +545,19 @@ struct Estimator::Impl {
     // Slot `i` indexes the registered-source arrays. (Full lifecycle is Slice 3; this is the
     // minimal cold-start interplay the brief asks for — it must not regress Slice-2 when
     // cold_start == MedianFromStart.)
+    //
+    // A rot3d commit (Slice 17, review fix MAJOR-2) counts as a committed rotation too: it
+    // is a strictly STRONGER rotation guarantee than the yaw/pitch commit (the full 3-DOF
+    // Wahba solve vs the 2-DOF direction), and on a never-straight rig (the EuRoC/drone
+    // regime the rot3d slice exists for) Phase-1 starves, so ext_committed alone would keep
+    // a fully-rotation-committed source out of the fusion median forever. rot3d_committed
+    // is pinned false when cfg.rot3d_enabled is off, so the default is byte-identical.
     bool participates(int i) const {
         if (cfg.cold_start == ColdStart::MedianFromStart) return true;
         const SourceId id = sources[i]->id();
         if (id == cfg.reference_sensor_id) return true;
-        return ext_committed[i];   // ReferenceOnly: join once the extrinsic is committed
+        // ReferenceOnly: join once the rotation extrinsic is committed (either path).
+        return ext_committed[i] || rot3d_committed[i];
     }
 
     // Drive BOTH calibrators (Phase 1 + Phase 2) for one set of calibration inputs — the
@@ -1323,7 +1331,12 @@ Status Estimator::step(Timestamp now) {
         // committed). `translation_committed` is the xyz lever-arm commit; `scale_committed`
         // the per-source scale commit.
         cs.committed             = s.offset_committed[i];
-        cs.extrinsic_committed   = s.ext_committed[i];
+        // The rot3d commit is OR-ed in (Slice 17, review fix MINOR): when the snapshot's
+        // rotation is rot3d-driven (the full 3-DOF commit superseding yaw/pitch ∘ roll), a
+        // consumer keying on this flag must read the published R as COMMITTED. Both latches
+        // are monotone-per-regime, so the OR does not oscillate; rot3d_committed is pinned
+        // false when the knob is off (the byte-identical default).
+        cs.extrinsic_committed   = s.ext_committed[i] || s.rot3d_committed[i];
         cs.scale_committed       = s.scale_committed[i];
         cs.translation_committed = s.lever_committed[i];
         // Per-source bias states (Slice 11b): the bias DOF is filled AFTER the predict/update

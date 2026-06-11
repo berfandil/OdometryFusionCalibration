@@ -30,6 +30,7 @@
 #include "ofc/core/lie.hpp"
 #include "ofc/core/persistence.hpp"
 #include "ofc/core/result.hpp"
+#include "ofc/core/source.hpp"
 
 #include "ofc_sim/rig.hpp"
 #include "ofc_sim/synthetic_source.hpp"
@@ -181,6 +182,40 @@ const CalibSnapshot* snap(const Result& r, SourceId id) {
         if (r.calib[i].id == id) return &r.calib[i];
     return nullptr;
 }
+
+// MIXED straight + multi-axis-turn trajectory: BOTH calibration regimes fire, so
+// Phase-1 ext/roll AND rot3d can commit simultaneously (the precedence-stability rig).
+Trajectory mixed_straight_turn_traj(int reps) {
+    Trajectory tr;
+    Vec6 straight; straight << 2.0, 0, 0, 0, 0,     0;
+    Vec6 turnA;    turnA    << 2.0, 0, 0, 0, 0.35,  0.6;
+    Vec6 turnB;    turnB    << 2.0, 0, 0, 0, -0.35, 0.6;
+    for (int rep = 0; rep < reps; ++rep) {
+        tr.add_segment(straight, 1.5);
+        tr.add_segment(turnA, 1.6);
+        tr.add_segment(turnB, 1.6);
+    }
+    return tr;
+}
+
+// An ISource that switches between two underlying sources at t_switch (keyed on the
+// query window END) — used to plant a mid-run MOUNT DRIFT so the rot3d commit can be
+// driven through a genuine confidence DROP (full histogram, lost concentration).
+class SwitchSource : public ISource {
+public:
+    SwitchSource(SourceId id, const ISource* before, const ISource* after,
+                 Timestamp t_switch)
+        : id_(id), before_(before), after_(after), t_switch_(t_switch) {}
+    SourceId id() const override { return id_; }
+    Expected<Delta> query(Timestamp t0, Timestamp t1) const override {
+        return (t1 < t_switch_) ? before_->query(t0, t1) : after_->query(t0, t1);
+    }
+private:
+    SourceId  id_;
+    const ISource* before_;
+    const ISource* after_;
+    Timestamp t_switch_;
+};
 } // namespace
 
 // ===========================================================================
@@ -323,6 +358,92 @@ TEST_CASE("rot3d re-anchor: large wrong basepoint -> recover -> re-anchor -> res
 }
 
 // ===========================================================================
+// Lever coupling (review fix, MAJOR-1): once the two-axis gate is open, the
+// TRANSLATION rows use the running Kabsch R̂ as R_X — so on turn-only motion
+// (Phase-1 starved, R_yp frozen at the prior) the lever still recovers. This is
+// the EuRoC regime and the spec §2 "lever coupling win": with the stale
+// R_yp ∘ Rx(roll) row the ~|t|·θ bias (~0.33 rad × ~0.5 m here) would dwarf the
+// planted lever and this pin fails — the R̂-driven row is load-bearing.
+// ===========================================================================
+TEST_CASE("rot3d lever coupling: turn-only planted rotation+lever — lever recovers "
+          "despite Phase-1 never firing") {
+    // Planted full mount: a large rotation (so the stale-row bias would be gross)
+    // AND a lever; IDENTITY prior, so both start wrong and only rot3d can fix R.
+    const SE3 X = make_extrinsic(0.25, -0.18, 0.12, Vec3(0.20, -0.15, 0.10));
+    auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+    REQUIRE(cal.configure(make_cfg(), 0) == Status::Ok);
+    REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+
+    // Turn-only conjugated stream (no straight windows ever reach Phase 2 anyway, and
+    // set_yaw_pitch is never called — exactly the starved-Phase-1 bootstrap path).
+    feed_stream(cal, 1, X, 250, /*multiaxis=*/true);
+
+    CHECK(cal.rot3d_observable(1));
+    CHECK(so3::log(cal.rot3d(1) * X.R.transpose()).norm() < 1e-3);   // rotation recovered
+    const Vec3 lever = cal.lever_arm(1);
+    INFO("lever err = " << (lever - X.t).norm() << " m  (planted |t| = " << X.t.norm() << ")");
+    CHECK((lever - X.t).norm() < 0.02);                              // lever recovered too
+    CHECK(cal.translation_confidence(1) > Scalar(0.5));
+}
+
+// ===========================================================================
+// Combo vote weighting (review NIT): the λ_mid/λ_max gate is weight-ratio-
+// invariant and the Wahba solve is mass-weighted — pin that rot3d behaves under
+// the shipped real-data weighting (votes carry ‖ω‖ × Σ-confidence MASS, so
+// rot3d_vote_count is a mass, mirroring the documented commit_min_votes
+// semantics of the other DOFs).
+// ===========================================================================
+TEST_CASE("rot3d under Combo vote weighting: solve converges; yaw-only gate stays shut") {
+    Config c = make_cfg();
+    c.vote_weight = VoteWeight::Combo;
+    const SE3 X = make_extrinsic(0.18, -0.11, 0.21, Vec3(0.10, 0.20, -0.10));
+    const Vec3 axes[3] = { Vec3(0, 0, 1), Vec3(0, 1, 0.2), Vec3(0.3, -0.4, 0.85) };
+
+    auto feed_combo = [&](Phase2Calibrator& cal, bool multiaxis) {
+        for (int k = 0; k < 220; ++k) {
+            const Vec3 axis = multiaxis ? axes[k % 3] : Vec3(0, 0, 1);
+            const Scalar theta = Scalar(0.25) + Scalar(0.10) * std::sin(Scalar(k) * Scalar(0.7));
+            SE3 A; A.R = so3::exp(axis.normalized() * theta); A.t = Vec3(0.5, 0.05, -0.02);
+            const SE3 B = se3::compose(se3::compose(se3::inverse(X), A), X);
+            const Scalar dt = Scalar(0.5);
+            const Vec3 omega = so3::log(A.R) / dt;
+            // Varying per-window source Σ-confidence — genuinely NON-UNIFORM vote mass.
+            const Scalar conf = Scalar(0.4) + Scalar(0.6) *
+                                (Scalar(0.5) + Scalar(0.5) * std::sin(Scalar(k) * Scalar(1.3)));
+            SourceId ids[1] = { 1 };
+            SE3      rep[1] = { B };
+            Scalar   cf[1]  = { conf };
+            cal.observe(1, ids, rep, A, omega, cf);
+        }
+    };
+
+    // Multi-axis: converges under mass-weighted votes (loose bound — clean data).
+    {
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+        feed_combo(cal, /*multiaxis=*/true);
+        CHECK(cal.rot3d_observable(1));
+        CHECK(cal.rot3d_vote_count(1) > Scalar(0));   // a MASS under Combo, not a count
+        const Scalar err = so3::log(cal.rot3d(1) * X.R.transpose()).norm();
+        INFO("Combo-weighted recovery err = " << err << " rad");
+        CHECK(err < 5e-3);
+        CHECK(cal.rot3d_confidence(1) > Scalar(0.5));
+    }
+    // Yaw-only: the gate is a RATIO test on BBw, so mass-weighting cannot fake a
+    // second axis — channels stay empty (the observability self-test holds under Combo).
+    {
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+        feed_combo(cal, /*multiaxis=*/false);
+        CHECK_FALSE(cal.rot3d_observable(1));
+        CHECK(cal.rot3d_vote_count(1) == doctest::Approx(0.0));
+        CHECK(cal.rot3d_confidence(1) == doctest::Approx(0.0));
+    }
+}
+
+// ===========================================================================
 // 6. Noise sanity: 2 mrad/step synthetic noise; the rank gate stays honest
 // ===========================================================================
 TEST_CASE("rot3d noise sanity: 2 mrad/step recovery bounded; yaw-only gate stays shut") {
@@ -459,6 +580,11 @@ TEST_CASE("rot3d estimator: commits on turn-only multi-axis motion, converges fr
     CHECK(rig.estimator().rot3d_committed(3));
     const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
     REQUIRE(cs != nullptr);
+    // Snapshot commit flag (review fix, MINOR): the published rotation is rot3d-driven
+    // here while Phase-1 (straight-gated) never fired — extrinsic_committed must still
+    // read TRUE (the rot3d commit is OR-ed in), so a consumer keying on the flag does
+    // not misread the fully-committed published R as uncommitted.
+    CHECK(cs->extrinsic_committed);
     const Scalar rerr = so3::log(X_true.R.transpose() * cs->extrinsic.R).norm();
     INFO("prior rot err=" << prior_rerr << "  converged rot err=" << rerr);
     CHECK(rerr < 0.10);
@@ -521,6 +647,318 @@ TEST_CASE("rot3d estimator: commits on turn-only multi-axis motion, converges fr
         if (blob[i] != blob2[i]) { same = false; break; }
     }
     CHECK(same);
+}
+
+// ===========================================================================
+// Cold start under ReferenceOnly (review fix, MAJOR-2): on a never-straight rig
+// (turn-only — the EuRoC/drone regime) Phase-1 starves, so ext_committed can never
+// latch; a rot3d-committed source must STILL join the fusion median (participates()
+// keys on EITHER rotation commit). Without the fix the non-reference source dead-
+// reckons behind the reference forever and the slice's win never reaches fusion.
+// ===========================================================================
+TEST_CASE("rot3d cold start: ReferenceOnly + turn-only rig — source joins the median "
+          "after the rot3d commit (and never joins with the knob off)") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X1 = make_extrinsic(0.20, -0.12, 0.15, Vec3(0.20, -0.10, 0.05));
+
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool rot3d_on = (pass == 1);
+
+        std::vector<SourceParams> planted(2);
+        planted[0].id = 0;
+        planted[1].id = 1;
+        planted[1].X = X1;
+        std::vector<std::unique_ptr<SyntheticSource>> srcs;
+        for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+        std::vector<SensorConfig> sensors(2);
+        sensors[0].id = 0;
+        sensors[1].id = 1;
+        sensors[1].prior_extrinsic = X1;   // prior == truth: the GAP is participates(), not
+                                           // convergence — rot3d votes ≈ 0 and commits fast.
+        Config cfg;
+        cfg.max_sources = 2; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+        cfg.timesync_enabled = false; cfg.cold_start = ColdStart::ReferenceOnly;
+        set_hists(cfg);
+        cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 60;
+        cfg.rot3d_enabled = rot3d_on;
+        cfg.sensors = sensors.data(); cfg.sensor_count = 2;
+
+        Rig rig;
+        rig.set_trajectory(tr);
+        REQUIRE(rig.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+        const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+        REQUIRE(fuses > 200);
+
+        const Result& r = rig.estimator().latest();
+        REQUIRE(r.source_count == 2);
+        REQUIRE(r.health[1].id == 1);
+        if (rot3d_on) {
+            // Committed (turn-only, prior == truth) -> PARTICIPATES: a nonzero fusion
+            // weight on the final fused step proves the source joined the median.
+            CHECK(rig.estimator().rot3d_committed(1));
+            CHECK(r.health[1].weight > Scalar(0));
+            // ...and the join is genuinely gated on the commit: before any commit the
+            // recorded weights are 0 (scan the early fused records).
+            bool early_weight_zero = true;
+            int  seen = 0;
+            for (const auto& rec : rig.records()) {
+                if (!rec.fused) continue;
+                if (++seen > 30) break;                 // the first ~30 fused steps are
+                if (rec.result.health[1].weight > Scalar(0)) early_weight_zero = false;
+            }                                           // well before commit_min_votes=60
+            CHECK(early_weight_zero);
+        } else {
+            // Knob off on the same never-straight rig: ext never commits -> the source
+            // NEVER joins (the pre-fix behaviour, now pinned as the off-path).
+            CHECK_FALSE(rig.estimator().rot3d_committed(1));
+            CHECK(r.health[1].weight == Scalar(0));
+        }
+    }
+}
+
+// ===========================================================================
+// Estimator rising-edge re-anchor mutation pin (review fix, MINOR): a prior rotation
+// error BEYOND the so3_hist range (1.2 rad yaw vs the ±0.8 rad channels). The δφ votes
+// CLAMP into the edge bin, so the first commit publishes a clamped (≈0.8 rad) partial
+// correction — only the rising-edge re-anchor (basepoint <- committed value + channel
+// reset) lets the remaining ≈0.4 rad residual re-vote IN range and converge. Deleting
+// the set_rot3d_basepoint/reset_rot3d pair in apply_calib_feedback leaves the published
+// rotation stuck ≈0.4 rad off truth and this pin fails (mirrors the Slice-8 large-error
+// ext walk).
+// ===========================================================================
+TEST_CASE("rot3d estimator bootstrap: prior error beyond the histogram range converges "
+          "only through the rising-edge re-anchor") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X_true  = make_extrinsic(0.15, -0.10, 0.12, Vec3(0.20, -0.15, 0.10));
+    const SE3 X_prior = make_extrinsic(0.15 + 1.20, -0.10, 0.12, X_true.t);   // yaw +1.2 rad
+    const Scalar prior_rerr = so3::log(X_true.R.transpose() * X_prior.R).norm();
+    REQUIRE(prior_rerr > 1.1);                       // genuinely beyond the ±0.8 range
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X_true;
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = X_prior;
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 60;
+    cfg.rot3d_enabled = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    CHECK(rig.estimator().rot3d_committed(3));
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    const Scalar rerr = so3::log(X_true.R.transpose() * cs->extrinsic.R).norm();
+    INFO("prior rot err=" << prior_rerr << "  converged rot err=" << rerr);
+    // The clamped single-commit value sits ≈0.4 rad off truth; converging well below
+    // that REQUIRES the contractive re-anchor walk.
+    CHECK(rerr < 0.15);
+    CHECK(rerr < prior_rerr * Scalar(0.15));
+}
+
+// ===========================================================================
+// Precedence stability (review fix, MINOR): MIXED straight + multi-axis-turn run where
+// Phase-1 ext/roll AND rot3d BOTH commit. Pins: (a) ext commits first (straight regime)
+// and rot3d on top — both latch; (b) while rot3d is committed the published rotation is
+// STABLE (no ext/roll-vs-rot3d publish thrash) and converged; (c) a genuine rot3d DROP
+// (a planted mid-run mount drift deconcentrates the full channels) falls back CLEANLY —
+// the published rotation stays orthonormal, fusion keeps running, and the fused error
+// stays bounded throughout.
+// ===========================================================================
+TEST_CASE("rot3d precedence: mixed straight+turn — both paths commit without thrash; "
+          "clean fallback when rot3d drops") {
+    const int  reps = 7;
+    const Trajectory tr = mixed_straight_turn_traj(reps);
+    const Scalar rep_s = 4.7;
+    const Scalar t_switch_s = 3 * rep_s;             // mount drifts after 3 clean reps
+    const SE3 X_true  = make_extrinsic(0.10, -0.07, 0.09, Vec3(0.15, -0.10, 0.05));
+    const SE3 X_drift = make_extrinsic(0.10 + 0.35, -0.07, 0.09 - 0.25, X_true.t);
+    const SE3 X_prior = make_extrinsic(0.10 + 0.08, -0.07 - 0.06, 0.09, X_true.t);
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X_true;
+    SourceParams drifted = planted[3];
+    drifted.X = X_drift;
+
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (int i = 0; i < 3; ++i) srcs.emplace_back(new SyntheticSource(tr, planted[i]));
+    SyntheticSource src3_before(tr, planted[3]);
+    SyntheticSource src3_after(tr, drifted);
+    SwitchSource sw3(3, &src3_before, &src3_after,
+                     static_cast<Timestamp>(t_switch_s * 1e9));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = X_prior;
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    // Decay aging so BOTH the channels and Mw/BBw track the drift (a SlidingK histogram
+    // only evicts on new votes; decay lets concentration genuinely fall during the walk).
+    // gamma=0.98 saturates the total vote MASS at ~50, so commit_min_votes=30.
+    cfg.so3_hist.aging = Aging::Decay;   cfg.so3_hist.decay_gamma = 0.98;
+    cfg.roll_hist.aging = Aging::Decay;  cfg.roll_hist.decay_gamma = 0.98;
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 30;
+    cfg.rot3d_enabled = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Estimator est;
+    REQUIRE(est.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+    REQUIRE(est.add_source(&sw3) == Status::Ok);
+
+    const Scalar tick_hz = 50.0;
+    const Timestamp tick = static_cast<Timestamp>(1e9 / tick_hz);
+    const Timestamp t0   = static_cast<Timestamp>(0.2 * 1e9);
+    const Timestamp tend = static_cast<Timestamp>((tr.duration_s() - 0.1) * 1e9);
+    const Timestamp t_switch = static_cast<Timestamp>(t_switch_s * 1e9);
+    const Timestamp window_ns = static_cast<Timestamp>(cfg.window_s * 1e9);
+
+    bool saw_ext_only      = false;   // Phase-1 ext committed BEFORE any rot3d commit
+    bool saw_rot3d         = false;
+    bool saw_drop          = false;   // rot3d went committed -> uncommitted post-drift
+    int  clean_rises       = 0;       // rot3d rising edges during the CLEAN phase
+    int  clean_drops       = 0;       // rot3d drops during the CLEAN phase (must be 0)
+    int  jumps_committed   = 0;       // published-R steps > 0.05 rad while committed (clean)
+    bool prev_rc           = false;
+    bool have_prev_R       = false;
+    Mat3 prev_R = Mat3::Identity();
+    Scalar clean_end_rerr  = Scalar(-1);
+    Scalar max_terr = 0, max_rerr = 0;
+    bool have_anchor = false;
+    SE3  anchor_inv;
+    int  fuses = 0;
+
+    for (Timestamp now = t0; now <= tend; now += tick) {
+        const Status st = est.step(now);
+        const bool rc = est.rot3d_committed(3);
+        const bool clean_phase = (now < t_switch);
+        if (rc && !prev_rc && clean_phase) ++clean_rises;
+        if (!rc && prev_rc) {
+            if (clean_phase) ++clean_drops; else saw_drop = true;
+        }
+        prev_rc = rc;
+        if (!ok(st)) { have_prev_R = false; continue; }
+        ++fuses;
+
+        const Result& r = est.latest();
+        const CalibSnapshot* cs = snap(r, 3);
+        REQUIRE(cs != nullptr);
+
+        // (a) Phase-1's OWN commit fires first (straight regime) — observable as the
+        // snapshot flag set while rot3d is still uncommitted.
+        if (cs->extrinsic_committed && !rc && !saw_rot3d) saw_ext_only = true;
+        if (rc) saw_rot3d = true;
+
+        // (c) The published rotation is ALWAYS sane (orthonormal, finite) — committed,
+        // fallen-back, or mid-walk.
+        const Mat3& R = cs->extrinsic.R;
+        REQUIRE(R.allFinite());
+        REQUIRE((R.transpose() * R - Mat3::Identity()).norm() < 1e-9);
+
+        // (b) No publish thrash while committed on CLEAN data: consecutive published
+        // rotations move smoothly (the rising-edge step itself is excluded — committed
+        // on both ends of the pair).
+        if (clean_phase && rc && have_prev_R) {
+            if (so3::log(R * prev_R.transpose()).norm() > Scalar(0.05)) ++jumps_committed;
+        }
+        prev_R = R; have_prev_R = rc;
+        if (clean_phase && rc) {
+            clean_end_rerr = so3::log(X_true.R.transpose() * R).norm();
+        }
+
+        // Fused-vs-GT error (the rig's anchoring, inlined — manual loop so the per-step
+        // commit flags are pollable).
+        const Timestamp frontier = r.frontier.stamp;
+        if (!have_anchor) {
+            anchor_inv = se3::inverse(tr.pose(frontier - window_ns));
+            have_anchor = true;
+        }
+        const SE3 gt = se3::compose(anchor_inv, tr.pose(frontier));
+        const SE3 e  = se3::compose(se3::inverse(gt), r.frontier.pose);
+        max_terr = std::max(max_terr, e.t.norm());
+        max_rerr = std::max(max_rerr, so3::log(e.R).norm());
+    }
+
+    REQUIRE(fuses > 500);
+    // (a) Both paths committed — ext first (straight), rot3d on top (multi-axis turns).
+    CHECK(saw_ext_only);
+    CHECK(saw_rot3d);
+    // (b) No thrash on clean data: EXACTLY ONE rising edge, ZERO drops, smooth publish.
+    CHECK(clean_rises == 1);
+    CHECK(clean_drops == 0);
+    CHECK(jumps_committed == 0);
+    // ...and the committed published rotation converged onto the planted mount.
+    REQUIRE(clean_end_rerr >= Scalar(0));
+    CHECK(clean_end_rerr < 0.05);
+    // (c) The planted drift deconcentrated the FULL channels -> a genuine drop, and the
+    // run survived it (fusion never destabilized; the median carries 3 clean sources).
+    CHECK(saw_drop);
+    INFO("max fused terr=" << max_terr << " rerr=" << max_rerr);
+    CHECK(max_terr < 1.0);
+    CHECK(max_rerr < 0.6);
+}
+
+// ===========================================================================
+// Estimator commit under Combo weighting (review NIT): rot3d_vote_count is a vote MASS
+// under Combo (‖ω‖ × Σ-confidence per vote), so commit_min_votes is a mass threshold —
+// pin that the commit machinery still latches on a turn-only rig with the shipped
+// real-data weighting (loose: just the latch + a sane published rotation).
+// ===========================================================================
+TEST_CASE("rot3d estimator commit under Combo vote weighting") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X1 = make_extrinsic(0.20, -0.12, 0.15, Vec3(0.20, -0.10, 0.05));
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[1].X = X1;
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[1].prior_extrinsic = X1;                 // prior == truth (commit, not walk)
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.vote_weight = VoteWeight::Combo;             // mass-weighted votes
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 60;
+    cfg.rot3d_enabled = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    CHECK(rig.estimator().rot3d_committed(1));
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 1);
+    REQUIRE(cs != nullptr);
+    CHECK(cs->extrinsic_committed);
+    CHECK(so3::log(X1.R.transpose() * cs->extrinsic.R).norm() < 0.05);
 }
 
 // ===========================================================================

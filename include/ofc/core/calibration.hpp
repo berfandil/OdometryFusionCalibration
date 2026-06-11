@@ -281,6 +281,11 @@ private:
 // xyz (3 linear DOF given rotation). Stack the translation row-block over accepted
 // (turning) windows and solve LEAST-SQUARES for t_X:
 //      Stack  (R_A − I) t_X = (R_X t_B − t_A)  =>  normal equations  AᵀA t_X = Aᵀb,
+// The row's R_X is the R_yp ∘ Rx(roll) composition at the per-window roll — EXCEPT when
+// rot3d is enabled AND its two-axis gate is open for the slot, in which case the running
+// Kabsch solve R̂ drives the row instead (the Slice-17 lever-coupling win: on turn-only 3D
+// motion Phase-1 starves, freezing R_yp at the prior, which would bias every row by ~|t|·θ;
+// R̂ is the best available full rotation there). Below the gate / disabled, byte-identical.
 // accumulated INCREMENTALLY into a fixed 3×3 (AᵀA) + 3×1 (Aᵀb) — no growing matrix
 // (strict core). Solve via Eigen LDLT (symmetric-PSD). NEAR-SINGULAR GUARD: pure yaw
 // turning leaves t_X.z unobservable (the null space of R_A−I for a z-axis rotation IS

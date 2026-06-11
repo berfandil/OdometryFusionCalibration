@@ -792,10 +792,57 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         const Scalar roll = best_roll(R_yp, R_A, R_B);
         roll_[slot].add(roll, w);
 
+        // --- rot3d: axis-correspondence Wahba accumulation + vote (Slice 17) -----
+        // a = log(R_A), b = log(R_B); the hand-eye rotation identity R_A R_X = R_X R_B is
+        // equivalently a = R_X·b per window. Accumulate Mw += w·a bᵀ / BBw += w·b bᵀ (both
+        // decay-aged per ACCEPTED window — "accepted" here = a rot3d-ROW-accepted window,
+        // i.e. one that also clears the ‖b‖ floor below and so DEPOSITS; the decay never
+        // runs without a deposit, keeping the effective window count consistent), then —
+        // only when TWO distinct rotation axes have been excited (the BBw λ_mid gate, the
+        // observability spine) — solve the running Kabsch R̂ and vote the basepoint-relative
+        // residual δφ = log(R̂·R_bpᵀ) into the 3 so(3) channels. Rank-1 (planar yaw-only)
+        // never clears the gate: channels stay empty -> conf 0 -> never commits -> planar
+        // behavior unchanged. Disabled entirely (no state touched) when rot3d_enabled is
+        // off — the byte-identical default.
+        //
+        // This block runs BEFORE the translation rows (review fix, Slice-17 MAJOR-1): once
+        // the two-axis gate is open, the running Kabsch R̂ is the best available FULL
+        // rotation and drives the translation row's R_X below — on turn-only 3D motion the
+        // R_yp ∘ Rx(roll) composition is frozen at the (possibly wrong) prior yaw/pitch
+        // (Phase-1 starves without straight segments), which would bias every lever row by
+        // ~|t|·θ. Below the gate / with rot3d disabled the existing composition is used,
+        // byte-identical to the pre-fix path.
+        bool rot3d_row = false;   // R̂ valid for THIS window's translation row
+        Mat3 Rhat;
+        if (rot3d_enabled_) {
+            const Vec3 b_axis = so3::log(R_B);
+            // ‖a‖ ≥ kRotRowMin is already guaranteed by the per-window guard above; require
+            // the same floor on ‖b‖ (a degenerate/noise-only sensor rotation row).
+            if (b_axis.norm() >= kRotRowMin) {
+                mw_[slot]  = rot3d_gamma_ * mw_[slot]  + w * (a_axis * b_axis.transpose());
+                bbw_[slot] = rot3d_gamma_ * bbw_[slot] + w * (b_axis * b_axis.transpose());
+                if (axis_pair_observable(bbw_[slot])) {
+                    if (wahba_solve(mw_[slot], Rhat)) {
+                        rot3d_row = true;
+                        const Vec3 dphi = so3::log(Rhat * rot3d_bp_[slot].transpose());
+                        // A basepoint ~π off the solve sits at the so3::log singularity —
+                        // skip the (non-finite / unstable) vote rather than deposit it.
+                        if (dphi.allFinite()) {
+                            rot3d_[3 * slot + 0].add(dphi.x(), w);
+                            rot3d_[3 * slot + 1].add(dphi.y(), w);
+                            rot3d_[3 * slot + 2].add(dphi.z(), w);
+                        }
+                    }
+                }
+            }
+        }
+
         // --- xyz: accumulate the LS row (R_A − I) t_X = R_X t_B − t_A ------------
-        // Use the full R_X at the just-recovered roll for the translation row (the row
+        // R_X for the row: the running Kabsch R̂ once the rot3d two-axis gate is open
+        // (the full 3-DOF rotation — the Slice-17 lever-coupling win); otherwise the
+        // R_yp ∘ Rx(roll) composition at the just-recovered per-window roll (the row
         // depends on the rotation; using the per-window roll keeps it consistent).
-        const Mat3 R_X = R_yp * roll_about_forward(roll);
+        const Mat3 R_X = rot3d_row ? Rhat : Mat3(R_yp * roll_about_forward(roll));
         const Vec3 b   = R_X * t_B - t_A;
         // Incremental normal equations (fixed 3×3 + 3×1; no growing matrix).
         ata_[slot].noalias() += RA_minus_I.transpose() * RA_minus_I;
@@ -814,38 +861,6 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
         if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
         if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
-
-        // --- rot3d: axis-correspondence Wahba accumulation + vote (Slice 17) -----
-        // a = log(R_A), b = log(R_B); the hand-eye rotation identity R_A R_X = R_X R_B is
-        // equivalently a = R_X·b per window. Accumulate Mw += w·a bᵀ / BBw += w·b bᵀ (both
-        // decay-aged per ACCEPTED window), then — only when TWO distinct rotation axes have
-        // been excited (the BBw λ_mid gate, the observability spine) — solve the running
-        // Kabsch R̂ and vote the basepoint-relative residual δφ = log(R̂·R_bpᵀ) into the 3
-        // so(3) channels. Rank-1 (planar yaw-only) never clears the gate: channels stay
-        // empty -> conf 0 -> never commits -> planar behavior unchanged. Disabled entirely
-        // (no state touched) when rot3d_enabled is off — the byte-identical default.
-        if (rot3d_enabled_) {
-            const Vec3 b_axis = so3::log(R_B);
-            // ‖a‖ ≥ kRotRowMin is already guaranteed by the per-window guard above; require
-            // the same floor on ‖b‖ (a degenerate/noise-only sensor rotation row).
-            if (b_axis.norm() >= kRotRowMin) {
-                mw_[slot]  = rot3d_gamma_ * mw_[slot]  + w * (a_axis * b_axis.transpose());
-                bbw_[slot] = rot3d_gamma_ * bbw_[slot] + w * (b_axis * b_axis.transpose());
-                if (axis_pair_observable(bbw_[slot])) {
-                    Mat3 Rhat;
-                    if (wahba_solve(mw_[slot], Rhat)) {
-                        const Vec3 dphi = so3::log(Rhat * rot3d_bp_[slot].transpose());
-                        // A basepoint ~π off the solve sits at the so3::log singularity —
-                        // skip the (non-finite / unstable) vote rather than deposit it.
-                        if (dphi.allFinite()) {
-                            rot3d_[3 * slot + 0].add(dphi.x(), w);
-                            rot3d_[3 * slot + 1].add(dphi.y(), w);
-                            rot3d_[3 * slot + 2].add(dphi.z(), w);
-                        }
-                    }
-                }
-            }
-        }
 
         any = true;
     }
