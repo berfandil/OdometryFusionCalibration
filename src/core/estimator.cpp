@@ -698,6 +698,19 @@ struct Estimator::Impl {
             if (rot3d_committed[i] && !was_rot3d) {
                 calib2.set_rot3d_basepoint(id, prior_extrinsic[i].R);
                 calib2.reset_rot3d(id);
+                // ...and drop the LEVER state too (accumulator + xyz channels): every
+                // lever row deposited BEFORE the BBw gate opened / R̂ converged was built
+                // with the WRONG row rotation R_X, and the un-aged cumulative normal
+                // equations would carry that pollution forever — the xyz channels vote
+                // the RUNNING ridge solve, so the polluted cumulative solution drags the
+                // mode (EuRoC: lever x stuck 3.5 cm off while y read 1.4 mm). Same
+                // rationale as the so3 reset above: rows/votes cast at the stale
+                // rotation are stale. Rows rebuild quickly from R̂-driven windows; a
+                // just-committed lever flag is HELD through the refill by
+                // commit_gate_reanchor's votes < N_min hysteresis (no commit thrash),
+                // and the published lever holds the last committed value via the
+                // set_basepoint prior sync below until clean votes land.
+                calib2.reset_lever(id);
             }
             // (2) Yaw/pitch RE-ANCHOR (rising edge of the yaw/pitch commit): move calib1's
             // so(3) basepoint to the recovered MINIMAL rotation (extrinsic().R — the gauge that

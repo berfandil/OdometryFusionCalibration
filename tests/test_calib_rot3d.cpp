@@ -773,6 +773,84 @@ TEST_CASE("rot3d estimator bootstrap: prior error beyond the histogram range con
 }
 
 // ===========================================================================
+// Pre-gate lever pollution (real-data follow-up, EuRoC euroc_calib_rot3d.ini): lever
+// rows deposited BEFORE the BBw two-axis gate opens are built with the WRONG row
+// rotation R_X (on turn-only motion the R_yp ∘ Rx(roll) composition is frozen at the
+// prior — Phase-1 starves), and the lever normal equations ata_/atb_/rows_ have NO
+// aging, so that early pollution sits in the cumulative LS forever; the xyz channels
+// vote the RUNNING ridge solve, so the polluted cumulative solution drags the mode
+// even after gate-open rows turn clean (on EuRoC: rotation recovered to 1.6e-7 rad and
+// lever y to 1.4 mm, but lever x stuck 3.5 cm off — truth 0.30 m, read 0.2653 m).
+// Rig: a LONG yaw-only (rank-1 — gate shut) turning phase deposits hundreds of
+// polluted rows, then multi-axis turns open the gate and rot3d converges + commits.
+// The fix under test: the rot3d COMMIT RISING EDGE in apply_calib_feedback() also
+// reset_lever()s — drop the polluted accumulator + xyz histograms (rows/votes cast at
+// the wrong rotation are stale, exactly the so3-reset-on-re-anchor rationale); the
+// rows rebuild quickly from gate-open R̂-driven windows and the lever lands on truth.
+// MUTATION GUARD: deleting the reset_lever call in apply_calib_feedback leaves the
+// published lever dragged by the polluted cumulative solve and the bound below fails.
+// ===========================================================================
+TEST_CASE("rot3d lever pollution: pre-gate yaw-only rows are dropped on the commit "
+          "rising edge — lever converges despite early wrong-R_X pollution") {
+    // 8 s of PURE yaw turning (turn-gated -> lever rows deposit; rank-1 -> rot3d gate
+    // shut -> every row uses the wrong prior rotation), then the multi-axis turns.
+    Trajectory tr;
+    Vec6 yawturn; yawturn << 2.0, 0, 0, 0, 0,     0.6;
+    Vec6 turnA;   turnA   << 2.0, 0, 0, 0, 0.35,  0.6;
+    Vec6 turnB;   turnB   << 2.0, 0, 0, 0, -0.35, 0.6;
+    tr.add_segment(yawturn, 8.0);
+    for (int rep = 0; rep < 3; ++rep) {
+        tr.add_segment(turnA, 1.6);
+        tr.add_segment(turnB, 1.6);
+    }
+
+    // Planted mount: rotation ≥ 0.3 rad + a lever; IDENTITY prior (both start wrong,
+    // and with no straight regime only rot3d can ever fix the rotation).
+    const SE3 X_true = make_extrinsic(0.25, -0.18, 0.12, Vec3(0.20, -0.15, 0.10));
+    REQUIRE(so3::log(X_true.R).norm() > Scalar(0.30));
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X_true;                  // sources 0,1,2 identity (consensus anchor)
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = SE3{};     // identity prior — rotation AND lever wrong
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 60;
+    cfg.rot3d_enabled = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 500);
+
+    // The rotation committed + converged (the rising edge genuinely fired).
+    REQUIRE(rig.estimator().rot3d_committed(3));
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    const Scalar rerr = so3::log(X_true.R.transpose() * cs->extrinsic.R).norm();
+    INFO("converged rot err = " << rerr << " rad");
+    CHECK(rerr < 0.05);
+
+    // THE PIN: the published lever lands on truth INCLUDING the early-window pollution
+    // (~400 polluted rows). Without the rising-edge reset_lever the cumulative solve
+    // stays dragged several cm (the EuRoC lever-x failure) and this bound fails.
+    const Scalar lerr = (cs->extrinsic.t - X_true.t).norm();
+    INFO("lever err = " << lerr << " m  (planted |t| = " << X_true.t.norm() << ")");
+    CHECK(lerr < 0.02);
+}
+
+// ===========================================================================
 // Precedence stability (review fix, MINOR): MIXED straight + multi-axis-turn run where
 // Phase-1 ext/roll AND rot3d BOTH commit. Pins: (a) ext commits first (straight regime)
 // and rot3d on top — both latch; (b) while rot3d is committed the published rotation is
