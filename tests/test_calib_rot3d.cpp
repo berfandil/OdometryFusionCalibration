@@ -387,6 +387,75 @@ TEST_CASE("rot3d lever coupling: turn-only planted rotation+lever — lever reco
 }
 
 // ===========================================================================
+// joint_lever_scale=ON regression section (Slice 17b review MINOR): acceptance §3
+// item 5 ("the rot3d suite still passes with the flag ON") was previously verified
+// only locally — this pins the KEY shapes in CI permanently. Small section, not a
+// file duplication: the load-bearing recovery / observability / fixed-point /
+// lever-coupling shapes, run with the joint 4-unknown rows driving the lever path.
+// (The full-3D-recipe pairing rot3d + joint_lever_scale is the shipping config.)
+// ===========================================================================
+TEST_CASE("rot3d with joint_lever_scale ON: recovery, planar gate, fixed point and "
+          "turn-only lever coupling unchanged") {
+    Config c = make_cfg();
+    c.joint_lever_scale = true;
+
+    // (a) Clean multi-axis recovery (case-1 shape): full rotation < 1e-3 rad.
+    {
+        const SE3 X = make_extrinsic(8 * kPi / 180, 5 * kPi / 180, 4 * kPi / 180,
+                                     Vec3(0.10, -0.05, 0.20));
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+        feed_stream(cal, 1, X, 200, /*multiaxis=*/true);
+        CHECK(cal.rot3d_observable(1));
+        CHECK(so3::log(cal.rot3d(1) * X.R.transpose()).norm() < 1e-3);
+        CHECK(cal.rot3d_confidence(1) > Scalar(0.5));
+    }
+
+    // (b) Observability self-test (LOAD-BEARING): yaw-only rank-1 NEVER votes.
+    {
+        const SE3 X = make_extrinsic(0.20, -0.12, 0.30, Vec3(0.2, -0.1, 0.1));
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+        feed_stream(cal, 1, X, 200, /*multiaxis=*/false);
+        CHECK_FALSE(cal.rot3d_observable(1));
+        CHECK(cal.rot3d_vote_count(1) == doctest::Approx(0.0));
+        CHECK(cal.rot3d_confidence(1) == doctest::Approx(0.0));
+        CHECK(so3::log(cal.rot3d(1)).norm() < 1e-12);    // frozen at the basepoint
+    }
+
+    // (c) Fixed point: votes ~ 0 at prior == truth, concentrated.
+    {
+        const SE3 X = make_extrinsic(0.14, -0.09, 0.07, Vec3(0.1, 0.0, -0.1));
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, X) == Status::Ok);
+        feed_stream(cal, 1, X, 150, /*multiaxis=*/true);
+        CHECK(so3::log(cal.rot3d(1) * X.R.transpose()).norm() < 1e-3);
+        CHECK(cal.rot3d_confidence(1) > Scalar(0.5));
+    }
+
+    // (d) Turn-only lever coupling (the Slice-17 headline): lever recovers via the
+    // JOINT rows despite Phase-1 never firing. 400 windows so the pre-R̂-convergence
+    // transient ages out of the SlidingK-256 ring (margin banking — the flag-OFF
+    // original passes 250/0.02 with the same shape).
+    {
+        const SE3 X = make_extrinsic(0.25, -0.18, 0.12, Vec3(0.20, -0.15, 0.10));
+        auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+        REQUIRE(cal.configure(c, 0) == Status::Ok);
+        REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);
+        feed_stream(cal, 1, X, 400, /*multiaxis=*/true);
+        CHECK(cal.rot3d_observable(1));
+        CHECK(so3::log(cal.rot3d(1) * X.R.transpose()).norm() < 1e-3);
+        const Vec3 lever = cal.lever_arm(1);
+        INFO("flag-ON lever err = " << (lever - X.t).norm() << " m");
+        CHECK((lever - X.t).norm() < 0.02);              // measured 0.0148 @ 400 windows
+        CHECK(cal.translation_confidence(1) > Scalar(0.5));
+    }
+}
+
+// ===========================================================================
 // Combo vote weighting (review NIT): the λ_mid/λ_max gate is weight-ratio-
 // invariant and the Wahba solve is mass-weighted — pin that rot3d behaves under
 // the shipped real-data weighting (votes carry ‖ω‖ × Σ-confidence MASS, so

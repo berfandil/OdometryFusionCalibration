@@ -1625,6 +1625,14 @@ bool Estimator::scale2_committed(SourceId id) const {
     return false;
 }
 
+Scalar Estimator::scale2_skipped(SourceId id) const {
+    // Diagnostic readout (Slice 17b, review MAJOR-2): the calibrator's cumulative
+    // range-guard-withheld joint-scale vote count. 0 when uninited / unknown id / knob
+    // off (the calibrator readout pins 0 in that case). No state mutated; no heap.
+    if (impl_ == nullptr || !impl_->inited) return Scalar(0);
+    return impl_->calib2.scale2_skipped(id);
+}
+
 bool Estimator::rot3d_committed(SourceId id) const {
     // Diagnostic readout (Slice 17): the latched per-source rot3d commit state from the
     // last apply_calib_feedback(). Always false when uninited / unknown id / knob off

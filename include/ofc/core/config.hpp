@@ -164,9 +164,18 @@ struct Config {
     // histogram (configured from scale_hist), giving a SECOND, turn-regime scale estimator
     // (scale2) that commits/folds into prior_scale alongside Phase-1's straight-regime
     // path. Recovers scale on rigs with no straight regime (drones) and immunizes the
-    // lever solve against an unrecovered scale. Default OFF = byte-identical 3-unknown
-    // lever numerics (this changes lever numbers even without scale activity, so it cannot
-    // ride an existing knob); in the persistence config-hash (a flip rejects stale restores).
+    // lever solve against an unrecovered scale. RANGE SEMANTICS (review MAJOR-2):
+    // scale_hist's (range_min, range_max) BOUNDS the residual this path can recover per
+    // fold — an out-of-range residual is SKIPPED at the vote site (never edge-clamped:
+    // deterministic out-of-regime mass must not concentrate, commit, and irreversibly
+    // poison prior_scale), so on a turn-only rig a true scale error beyond the range
+    // (default: >50%) stays uncorrected at confidence 0 (diagnosable via
+    // Phase2Calibrator::scale2_skipped / Estimator::scale2_skipped). Phase-1's
+    // straight-regime scale vote has NO such guard — its edge-clamped fold iterates
+    // toward an out-of-range truth on rigs WITH a straight regime; the two scale paths
+    // deliberately differ here. Default OFF = byte-identical 3-unknown lever numerics
+    // (this changes lever numbers even without scale activity, so it cannot ride an
+    // existing knob); in the persistence config-hash (a flip rejects stale restores).
     bool        joint_lever_scale = false;
 
     // Histograms (per quantity)
@@ -182,6 +191,8 @@ struct Config {
     // into prior_scale. Default this field to a positive-ratio range with 1.0 STRICTLY INTERIOR
     // ([0.5, 1.5] — the convention every dedicated calibration test already uses), keeping the
     // generic bin-count / aging defaults. The other (signed) histograms keep [-1, 1].
+    // With joint_lever_scale, this range also BOUNDS the turn-regime (scale2) path's
+    // recoverable residual per fold — see the joint_lever_scale comment above.
     HistogramConfig scale_hist{ /*bins=*/64, /*range_min=*/0.5, /*range_max=*/1.5 };
     HistogramConfig offset_hist;
 

@@ -407,6 +407,18 @@ constexpr Scalar kAxisInfoMin = Scalar(1e-2);
 // Ridge for the per-window voting solve (relative to the largest AᵀA diagonal). Small
 // enough not to bias observable axes; large enough to pin an unobservable axis at prior.
 constexpr Scalar kVoteRidgeRel = Scalar(1e-3);
+// Joint-conditioning vote floor (Slice 17b, review MAJOR-1): an axis of the 4-unknown
+// [t_X; κ] system votes only when its MARGINAL (Schur-complement) information — what is
+// left after optimizing ALL other unknowns out — retains at least this fraction of its
+// raw diagonal information. Catches the MIXED lever/κ near-null direction a 2-excitation
+// (constant-twist-pair) trajectory produces, which the per-diagonal kAxisInfoMin floors
+// cannot see (every raw diagonal stays large while the marginal information of the
+// involved axes collapses to ridge level). Value chosen from MEASURED regimes (the
+// test_calib_joint_lever_scale scenarios): rich 3+-excitation reads marginal ratios
+// 0.13–0.97, planar (yaw-only ground) xy+κ reads 0.062–0.94, while the 2-excitation
+// near-null reads ~1.0e-3–1.3e-3 on the involved axes — 1e-2 sits between the regimes
+// with ≳6× margin on both sides.
+constexpr Scalar kJointMarginMin = Scalar(1e-2);
 // rot3d two-axis observability floor (Slice 17): the Wahba solve is votable only when the
 // MIDDLE eigenvalue of the axis Gram BBw clears this fraction of the largest (two distinct
 // rotation axes excited; Kabsch needs only two correspondences — gate λ_mid, NOT λ_min).
@@ -552,6 +564,11 @@ Phase2Calibrator::Vec4 Phase2Calibrator::solve_ridge4(const Mat4& AtA, const Vec
     for (int c = 0; c < 3; ++c) {
         obs[c] = (max_lever > Scalar(0)) && (AtA(c, c) >= kAxisInfoMin * max_lever);
     }
+    // NOTE (review NIT): this κ floor compares metres² (AtA(3,3) = Σ w‖R_X t_B‖²) against
+    // the dimensionless lever information, so κ "informedness" depends on the rig's
+    // per-window translation MAGNITUDE (a ~10 cm-per-window rig sits near the floor; a
+    // 0.5 m one clears it 100×). Acceptable: the histogram + commit gate is the second
+    // defense and the starved direction fails SAFE (κ pinned at its prior 1, conf 0).
     obs[3] = (max_diag > Scalar(0)) && (AtA(3, 3) >= kAxisInfoMin * max_diag);
     if (!(max_diag > Scalar(0))) return u_prior;     // no information at all
 
@@ -562,7 +579,38 @@ Phase2Calibrator::Vec4 Phase2Calibrator::solve_ridge4(const Mat4& AtA, const Vec
     Mat4 M = AtA;
     const Scalar rl = ridge * ((max_lever > Scalar(0)) ? max_lever : max_diag);
     for (int c = 0; c < 3; ++c) M(c, c) += rl;
-    M(3, 3) += ridge * max_diag;
+    const Scalar rk = ridge * max_diag;
+    M(3, 3) += rk;
+
+    // JOINT-CONDITIONING vote gate (Slice-17b review MAJOR-1). The raw diagonals above
+    // measure per-axis information IGNORING the coupling — they cannot see a MIXED
+    // lever/κ near-null direction (2-excitation constant-twist-pair trajectories produce
+    // one with every raw diagonal large; the ridge then resolves the null toward the
+    // prior and deterministically dumps a planted scale into the lever, which VOTES and
+    // CONCENTRATES — confidently wrong). Gate each axis on its MARGINAL (Schur)
+    // information instead: info_i = 1/(M⁻¹)(i,i) − ridge_i is exactly the Schur
+    // complement of axis i against ALL other unknowns — for κ this is the lever-
+    // marginalized A(3,3) − a_lκᵀ(A_ll + r_l I)⁻¹ a_lκ, for a lever axis the κ-and-
+    // other-axes-marginalized scalar (the same marginalization algebra solve_lever_arm's
+    // kCondMin guard runs on the κ-marginalized 3×3 Schur complement, taken per axis).
+    // A near-null direction involving axis i collapses info_i to ~ridge level even when
+    // the raw diagonal AtA(i,i) is large, so requiring
+    //     info_i ≥ kJointMarginMin · AtA(i,i)
+    // withholds the vote (honest: the axis is only resolvable through the prior). A
+    // genuinely decoupled axis (planar: z has all-zero coefficients, x/y/κ resolve in
+    // their own sub-block) keeps info_i ≈ AtA-block level and votes as before.
+    const Mat4 Minv = M.inverse();                    // fixed 4×4, heap-free
+    if (Minv.allFinite()) {
+        for (int i = 0; i < 4; ++i) {
+            if (!obs[i]) continue;
+            const Scalar mii = Minv(i, i);
+            if (!(mii > Scalar(0))) { obs[i] = false; continue; }
+            const Scalar info = Scalar(1) / mii - ((i < 3) ? rl : rk);
+            obs[i] = info >= kJointMarginMin * AtA(i, i);
+        }
+    } else {
+        for (int i = 0; i < 4; ++i) obs[i] = false;  // defensive: no finite inverse
+    }
     const Vec4 rhs = Atb - AtA * u_prior;
     const Vec4 du  = M.ldlt().solve(rhs);
     Vec4 u = u_prior + du;
@@ -654,9 +702,11 @@ void Phase2Calibrator::reset() {
         bbw_[i]      = Mat3::Zero();
         rot3d_bp_[i] = Mat3::Identity();
         scale2_[i].reset();
-        ata4_[i]         = Mat4::Zero();
-        atb4_[i]         = Vec4::Zero();
-        scale2_calib_[i] = true;
+        ata4_[i]           = Mat4::Zero();
+        atb4_[i]           = Vec4::Zero();
+        rows4_[i]          = Scalar(0);
+        scale2_skipped_[i] = Scalar(0);
+        scale2_calib_[i]   = true;
     }
     for (int i = 0; i < 3 * kMaxSources; ++i) xyz_[i].reset();
     for (int i = 0; i < 3 * kMaxSources; ++i) rot3d_[i].reset();
@@ -686,9 +736,11 @@ int Phase2Calibrator::ensure_slot(SourceId id) {
     mw_[slot]       = Mat3::Zero();
     bbw_[slot]      = Mat3::Zero();
     rot3d_bp_[slot] = Mat3::Identity();
-    ata4_[slot]         = Mat4::Zero();
-    atb4_[slot]         = Vec4::Zero();
-    scale2_calib_[slot] = true;
+    ata4_[slot]           = Mat4::Zero();
+    atb4_[slot]           = Vec4::Zero();
+    rows4_[slot]          = Scalar(0);
+    scale2_skipped_[slot] = Scalar(0);
+    scale2_calib_[slot]   = true;
     return slot;
 }
 
@@ -739,9 +791,11 @@ void Phase2Calibrator::reset_lever(SourceId id) {
     xyz_[3 * s + 2].reset();
     // Joint state (Slice 17b): the 4×4 rows AND the scale2 votes were running solutions
     // of the same now-stale rows — clear the full joint state with them. Zeroing/reset on
-    // never-filled state is a no-op, so the off path is unaffected.
-    ata4_[s] = Mat4::Zero();
-    atb4_[s] = Vec4::Zero();
+    // never-filled state is a no-op, so the off path is unaffected. (scale2_skipped_ is
+    // deliberately KEPT: a cumulative "the range guard fired" diagnostic, not vote state.)
+    ata4_[s]  = Mat4::Zero();
+    atb4_[s]  = Vec4::Zero();
+    rows4_[s] = Scalar(0);
     scale2_[s].reset();
 }
 
@@ -752,15 +806,17 @@ void Phase2Calibrator::reset_scale2(SourceId id) {
     scale2_[s].reset();
     // A scale fold moves the prior the rows' t_B were de-scaled by, so the single-κ joint
     // model cannot keep pre-fold rows (the running κ̂ would blend the two de-scale epochs
-    // and re-vote a residual ≠ 1 forever). Drop the accumulator + row count; the xyz
-    // HISTOGRAMS are kept — their votes came from the scale-immune joint solve and remain
-    // valid lever estimates across the fold (the lever commit is held through the row
-    // refill by commit_gate_reanchor's vote-mass hysteresis). Off path: nothing
-    // accumulated, all no-ops.
+    // and re-vote a residual ≠ 1 forever). Drop the accumulator + its epoch row count
+    // rows4_; the xyz HISTOGRAMS are kept — their votes came from the scale-immune joint
+    // solve and remain valid lever estimates across the fold — and so is rows_ (=
+    // xyz_vote_count, the lever commit gate's vote-mass input): zeroing it would erase a
+    // pending lever commit's entire gate progress / drop a committed lever's vote mass on
+    // EVERY scale fold even though the votes it measures were kept (review finding,
+    // reset_scale2/rows_ coupling). Off path: nothing accumulated, all no-ops.
     if (joint_) {
-        ata4_[s] = Mat4::Zero();
-        atb4_[s] = Vec4::Zero();
-        rows_[s] = Scalar(0);
+        ata4_[s]  = Mat4::Zero();
+        atb4_[s]  = Vec4::Zero();
+        rows4_[s] = Scalar(0);
     }
 }
 
@@ -939,7 +995,8 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
             const Vec3 rhs = -t_A;
             ata4_[slot].noalias() += w * (J.transpose() * J);
             atb4_[slot].noalias() += w * (J.transpose() * rhs);
-            rows_[slot]           += Scalar(1);
+            rows_[slot]           += Scalar(1);   // vote-mass counter (kept across folds)
+            rows4_[slot]          += Scalar(1);   // accumulator-epoch rows (reset w/ fold)
 
             // Vote the RUNNING ridge solve (centered on [t_prior; 1]): observable lever
             // axes into the EXISTING xyz channels (unchanged downstream), an observable
@@ -953,9 +1010,7 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
             if (obs4[0]) xyz_[3 * slot + 0].add(u_run(0), w);
             if (obs4[1]) xyz_[3 * slot + 1].add(u_run(1), w);
             if (obs4[2]) xyz_[3 * slot + 2].add(u_run(2), w);
-            if (obs4[3] && scale2_calib_[slot] && id != reference_id_ &&
-                u_run(3) > Scalar(1e-6)) {           // κ̂ ≤ 0 is degenerate: never vote
-                const Scalar s_res = Scalar(1) / u_run(3);
+            if (obs4[3] && scale2_calib_[slot] && id != reference_id_) {
                 // RANGE GUARD (the Phase-1 π-guard analog): a residual outside the
                 // configured scale histogram range is OUTSIDE the calibrated regime —
                 // e.g. the κ sink absorbing wrong-R_X row pollution before the rot3d
@@ -964,8 +1019,28 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
                 // commits, and IRREVERSIBLY folds into prior_scale (a value, not a
                 // vote — no reset can heal it). Skip the vote instead: the histogram
                 // only ever holds genuine in-regime residual mass.
-                if (s_res > scale2_cfg_.range_min && s_res < scale2_cfg_.range_max) {
-                    scale2_[slot].add(s_res, w);
+                //
+                // KNOWN LIMITATION (review MAJOR-2): the skip also withholds a
+                // LEGITIMATE true residual outside (range_min, range_max) — default
+                // (0.5, 1.5), i.e. any >50% scale error. On a turn-only rig (where
+                // Phase-1's straight-regime scale path starves, and unlike here its
+                // unguarded edge-clamped fold would at least ITERATE toward an
+                // out-of-range truth) such a miscalibration is permanently
+                // uncorrected by this path: scale2 stays 1 at confidence 0, never
+                // commits, prior_scale is never touched — fail-safe, but a >50%
+                // turn-only scale error needs a wider scale_hist range or a better
+                // prior. NOT silent: every withheld vote increments scale2_skipped_
+                // (the scale2_skipped() readout), so "rows high, votes 0, skipped
+                // high" (out-of-regime) is distinguishable from "rows high, votes 0,
+                // skipped 0" (κ unexcited/unobservable). The skipped count includes
+                // the degenerate κ̂ ≤ 0 case (s_res unrepresentable — out of any
+                // range). Documented at scale2()'s declaration (calibration.hpp).
+                if (u_run(3) > Scalar(1e-6) &&
+                    Scalar(1) / u_run(3) > scale2_cfg_.range_min &&
+                    Scalar(1) / u_run(3) < scale2_cfg_.range_max) {
+                    scale2_[slot].add(Scalar(1) / u_run(3), w);
+                } else {
+                    scale2_skipped_[slot] += Scalar(1);
                 }
             }
         } else {
@@ -1003,7 +1078,10 @@ Vec3 Phase2Calibrator::solve_lever_arm(SourceId id, bool* observable) const {
     const int s = slot_for(id);
     if (s < 0) return Vec3::Zero();
     const SE3 prior = prior_[s];
-    if (rows_[s] < Scalar(1)) return prior.t;        // no rows -> prior
+    // No rows -> prior. The joint path reads the EPOCH row count rows4_ (the 4×4
+    // accumulator is dropped on a scale fold while rows_ keeps the kept-histogram vote
+    // mass — see reset_scale2); the legacy path keeps reading rows_ (byte-identical).
+    if (joint_ ? (rows4_[s] < Scalar(1)) : (rows_[s] < Scalar(1))) return prior.t;
 
     if (joint_) {
         // --- JOINT readout (Slice 17b): lever observability on the LEVER SUB-PROBLEM --
@@ -1155,6 +1233,15 @@ Scalar Phase2Calibrator::scale2_vote_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return scale2_[s].total();
+}
+
+Scalar Phase2Calibrator::scale2_skipped(SourceId id) const {
+    // Range-guard-withheld vote count (cumulative; see the scale2() RANGE LIMITATION
+    // note in calibration.hpp). 0 unknown / joint path disabled.
+    if (!configured_ || !joint_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return scale2_skipped_[s];
 }
 
 // --- rot3d readouts (Slice 17) ----------------------------------------------

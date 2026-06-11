@@ -51,6 +51,14 @@ public:
     // rot3d_committed; the snapshot's scale_committed OR-s this flag in.)
     bool scale2_committed(SourceId id) const;
 
+    // Diagnostic readout (Slice 17b, review MAJOR-2): count of joint-scale votes the
+    // vote-site RANGE GUARD withheld (residual s_res outside scale_hist's range, incl.
+    // a degenerate κ̂ ≤ 0) — cumulative since init. Distinguishes "out-of-regime scale,
+    // permanently uncorrectable by the turn path" (votes 0, skipped HIGH — widen the
+    // scale_hist range or fix the prior scale) from "κ unexcited" (votes 0, skipped 0).
+    // Always 0 when Config::joint_lever_scale is off / id unknown.
+    Scalar scale2_skipped(SourceId id) const;
+
     // Warm-restart persistence (D23): serialize/deserialize into a fixed buffer.
     // File I/O + double-buffering live in an adapter.
     Expected<int> serialize(unsigned char* buf, int cap) const;  // bytes written

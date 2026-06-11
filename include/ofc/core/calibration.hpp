@@ -395,12 +395,17 @@ public:
     // same stale rows).
     void reset_lever(SourceId id);
     // Drop the joint-scale (scale2) histogram votes AND the joint 4×4/4×1 accumulator +
-    // row count for `id`, KEEPING the xyz histograms (Slice 17b). Used on a SCALE
+    // its row count for `id`, KEEPING the xyz histograms (Slice 17b). Used on a SCALE
     // commit+re-anchor (either scale path's fold into prior_scale): the accumulated rows'
     // t_B were de-scaled by the OLD prior_scale, so the single-κ joint model cannot mix
     // pre-/post-fold rows (the running κ̂ would blend the two de-scale epochs and re-vote
     // a residual ≠ 1 forever); the xyz votes are KEPT because the joint solve they were
     // read from is scale-immune — they remain valid lever estimates across the fold.
+    // xyz_vote_count() — the lever commit gate's vote-mass input — is likewise KEPT
+    // (review finding, reset_scale2/rows_ coupling: it tracks the kept histograms via the
+    // deposited-row counter rows_, while the accumulator epoch is tracked separately in
+    // rows4_), so a pending lever commit loses no gate progress and a committed lever
+    // holds across the fold.
     // The post-reset scale2() falls back to 1 until new votes land. No-op when the joint
     // path is disabled (nothing accumulated).
     void reset_scale2(SourceId id);
@@ -484,6 +489,18 @@ public:
     // the SAME residual-vs-prior convention as Phase-1's scale() (t_B arrives prior-de-
     // scaled, so a converged calibration re-votes ≈ 1). Returns 1.0 for the reference /
     // a scale_calib==false source / an unvoted source / when the joint path is disabled.
+    //
+    // RANGE LIMITATION (review MAJOR-2): the vote site's range guard SKIPS (never edge-
+    // clamps) a residual outside (scale_hist.range_min, scale_hist.range_max) — default
+    // (0.5, 1.5). A TRUE residual scale outside that range therefore never votes here:
+    // on a turn-only rig (where the straight-regime Phase-1 scale path starves and its
+    // iterating clamped fold cannot help either) a >50% scale miscalibration is NOT
+    // recoverable by this path — scale2 stays at 1 with confidence 0. This is the honest
+    // fail-safe direction (depositing edge-clamped mass would let deterministic garbage
+    // look concentrated, commit, and irreversibly poison prior_scale — a fold is a VALUE,
+    // not a vote). Distinguish it from plain under-excitation via scale2_skipped():
+    // "rows high, votes 0, skipped HIGH" = out-of-range regime (widen scale_hist range /
+    // fix the prior scale); "rows high, votes 0, skipped 0" = κ not excited/observable.
     Scalar scale2(SourceId id) const;
     // scale2 histogram concentration in [0,1]. 0 for the reference / scale_calib==false /
     // unvoted / unknown / joint path disabled — in particular a κ starved of information
@@ -491,6 +508,12 @@ public:
     Scalar scale2_confidence(SourceId id) const;
     // Total scale2 vote mass (the N_min driver; 0 if none).
     Scalar scale2_vote_count(SourceId id) const;
+    // Count of scale2 votes WITHHELD by the vote-site range guard (out-of-range s_res,
+    // including a degenerate κ̂ ≤ 0) since configure()/reset() — review MAJOR-2 "no silent
+    // state". CUMULATIVE across re-anchors/folds (deliberately NOT cleared by reset_lever
+    // / reset_scale2: it records that the guard fired at all, which is the diagnostic).
+    // 0 for unknown / joint path disabled. See the scale2() RANGE LIMITATION note.
+    Scalar scale2_skipped(SourceId id) const;
 
     // Roll-histogram concentration in [0,1] — the roll (extrinsic) confidence. 0 unvoted.
     Scalar extrinsic_confidence(SourceId id) const;
@@ -540,7 +563,13 @@ private:
     // κ diagonal — metres² vs the dimensionless lever columns — cannot mask an observable
     // lever axis), κ against the FULL matrix's largest diagonal (so a starved κ — near-
     // zero translation — pins at its prior 1, never voted). The ridge is likewise
-    // per-block-scaled. Heap-free (fixed 4×4 LDLT).
+    // per-block-scaled. ADDITIONALLY (review MAJOR-1) each axis must clear the JOINT-
+    // CONDITIONING floor: its marginal (Schur-complement-against-all-other-unknowns)
+    // information 1/(M⁻¹)(i,i) − ridge_i must retain ≥ kJointMarginMin of its raw
+    // diagonal — a MIXED lever/κ near-null direction (2-excitation constant-twist-pair
+    // trajectories) collapses the marginal information of the involved axes while every
+    // raw diagonal stays large, and the involved axes must NOT vote the ridge-resolved
+    // (prior-dragged, deterministically biased) solution. Heap-free (fixed 4×4 LDLT).
     static Vec4 solve_ridge4(const Mat4& AtA, const Vec4& Atb, const Vec4& u_prior,
                              Scalar ridge, bool obs[4]);
     // Per-vote weight factor honoring vote_weight_ (D5). `omega_norm` is ‖fused_omega‖;
@@ -606,12 +635,18 @@ private:
 
     // Joint lever+scale state (Slice 17b, only touched when joint_). ata4_/atb4_ are the
     // 4×4/4×1 joint normal-equation accumulators (unknowns [t_X; κ] — the legacy ata_/atb_
-    // stay untouched for the byte-identical off path); scale2_[slot] is the per-source
+    // stay untouched for the byte-identical off path); rows4_ counts the rows in the
+    // CURRENT accumulator (de-scale) epoch — reset with the accumulator on a scale fold,
+    // while rows_ (= xyz_vote_count, the lever commit gate's vote-mass input) keeps
+    // tracking the KEPT xyz histograms (review finding); scale2_[slot] is the per-source
     // residual-scale histogram (s_res = 1/κ̂ votes, cfg.scale_hist shape);
+    // scale2_skipped_[slot] counts range-guard-withheld votes (cumulative diagnostics);
     // scale2_calib_[slot] mirrors Phase-1's scale_calib gate.
     Histogram1D scale2_[kMaxSources];
     Mat4        ata4_[kMaxSources];
     Vec4        atb4_[kMaxSources];
+    Scalar      rows4_[kMaxSources] = {};
+    Scalar      scale2_skipped_[kMaxSources] = {};
     bool        scale2_calib_[kMaxSources] = {};
 };
 

@@ -318,6 +318,126 @@ TEST_CASE("joint lever+scale: the kappa column is load-bearing (3-unknown contro
 }
 
 // ===========================================================================
+// 1c. 2-EXCITATION HONESTY (17b review MAJOR-1): exactly TWO constant-twist window
+// types leave a MIXED lever/κ trade direction near-null in the joint 4×4 — per-
+// diagonal information looks healthy (every raw diagonal is large), but the ridge
+// resolves the near-null toward the prior and deterministically dumps the planted
+// scale into the lever (measured pre-fix: lever err ~0.12 m, votes CONCENTRATED →
+// confidently wrong, worse than flag-off). The joint VOTE path must therefore gate
+// on the JOINT conditioning (the per-axis Schur-marginalized information), not the
+// raw diagonals: under this trajectory NO joint votes may land — conf 0, vote count
+// 0, prior-pinned readouts (honest "cannot observe"), NOT a confident wrong answer.
+// MUTATION GUARD: dropping the Schur vote gates in solve_ridge4 re-deposits the
+// biased votes and the vote-count/confidence pins below fail.
+// ===========================================================================
+TEST_CASE("joint lever+scale 2-excitation: constant-twist PAIR yields NO joint votes "
+          "(honest prior-pin) instead of a confidently wrong lever/scale") {
+    const SE3 X = make_extrinsic(8 * kPi / 180, 5 * kPi / 180, 4 * kPi / 180,
+                                 Vec3(0.10, -0.05, 0.20));
+    const Scalar s_res = 1.08;
+    auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+    REQUIRE(cal.configure(make_cfg(), 0) == Status::Ok);
+    SE3 Xp; Xp.R = X.R; Xp.t = Vec3::Zero();            // true rotation, zero lever
+    REQUIRE(cal.set_prior(1, Xp) == Status::Ok);
+
+    // EXACTLY two distinct constant-twist window types, alternating: two rotation axes
+    // (the rot3d two-axis gate OPENS — the rotation is fine) but only two (A, t_B) row
+    // shapes — SAME forward translation, mirrored pitch rate (the measured-0.12 m
+    // trajectory pair, see 1d below). The mixed near-null is structural: with axes
+    // n± = (0, ±a, b) the relative axis w = axis(R₂ᵀR₁) ≈ e_y and (R₁−I)·w ≈ −θb·e_x
+    // is PARALLEL to the x-only translation, so to first order in θ the joint system
+    // admits the null family [δt; δκ] = α[w + δκ·s·t_X; δκ] — a lever/κ trade the
+    // per-diagonal information cannot see (every raw diagonal stays large).
+    for (int k = 0; k < 300; ++k) {
+        const bool odd = (k % 2 == 1);
+        feed_window(cal, 1, X, s_res,
+                    odd ? Vec3(0, -0.35, 0.6) : Vec3(0, 0.35, 0.6), Scalar(0.12),
+                    Vec3(0.35, 0, 0));
+    }
+    CHECK(cal.rot3d_observable(1));                      // rotation IS observable...
+
+    // ...but the null-involved joint axes are NOT (here the null is along e_y + κ —
+    // see the geometry note above): κ NEVER votes (scale2 inert, conf 0) and the
+    // dragged lever axis y NEVER votes (stays at the prior 0 exactly — pre-fix it read
+    // ≈ −0.13, the planted scale dumped into the lever). The honestly-observable x/z
+    // marginals (their Schur information survives the null) may keep voting, but their
+    // values stay near truth — nothing is confidently wrong, and the empty y channel
+    // pins translation_confidence at 0 (the per-DOF spine), so no lever commit either.
+    CHECK(cal.scale2_vote_count(1) == doctest::Approx(0.0));
+    CHECK(cal.scale2_confidence(1) == doctest::Approx(0.0));
+    CHECK(cal.scale2(1) == doctest::Approx(1.0));        // prior (empty histogram)
+    CHECK(cal.translation_confidence(1) == doctest::Approx(0.0));
+    const Vec3 lever = cal.lever_arm(1);
+    INFO("lever = [" << lever.x() << ", " << lever.y() << ", " << lever.z() << "]");
+    CHECK(lever.y() == Scalar(0));                       // withheld axis: prior, exactly
+    CHECK(std::abs(lever.x() - X.t.x()) < 0.02);         // voted axes: not poisoned
+    CHECK(std::abs(lever.z() - X.t.z()) < 0.02);
+    // The full-solve guard (kCondMin on the κ-marginalized Schur) agrees: unobservable.
+    bool obs = true;
+    cal.solve_lever_arm(1, &obs);
+    CHECK_FALSE(obs);
+}
+
+// ===========================================================================
+// 1d. The estimator-level measured failure (17b review MAJOR-1): the SAME
+// 2-excitation regime through the full feedback loop. Pre-fix the biased joint
+// votes CONCENTRATE, the lever commits ~0.12 m off truth and scale2 commits a
+// κ-pinned ≈1 residual — flag-on confidently WORSE than flag-off. Post-fix the
+// joint votes are withheld: the mount (prior == truth) stays put and the scale
+// stays prior-pinned (honest: this trajectory cannot observe the joint DOFs).
+// ===========================================================================
+TEST_CASE("joint lever+scale estimator 2-excitation: lever stays at truth and scale "
+          "stays prior-pinned (no confident wrong commit)") {
+    Trajectory tr;
+    Vec6 t1; t1 << 2.0, 0, 0, 0,  0.35, 0.6;             // the measured 0.12 m pair:
+    Vec6 t2; t2 << 2.0, 0, 0, 0, -0.35, 0.6;             // same v, mirrored pitch rate
+    for (int rep = 0; rep < 6; ++rep) {                  // 2-type constant-twist pair
+        tr.add_segment(t1, 0.9);
+        tr.add_segment(t2, 0.9);
+    }
+    const SE3 X3 = make_extrinsic(0.10, -0.07, 0.09, Vec3(0.15, -0.10, 0.05));
+    const Scalar planted_scale = 1.08;
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X     = X3;
+    planted[3].scale = planted_scale;
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = X3;        // prior == truth: any motion is vote bias
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 120;
+    cfg.rot3d_enabled     = true;
+    cfg.joint_lever_scale = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    // HONEST: the under-excited joint DOFs never commit a wrong value. The mount
+    // holds the (true) prior — pre-fix it walked ~0.12 m off — and the published
+    // scale stays at the (unobservable-here) prior 1.
+    CHECK_FALSE(rig.estimator().scale2_committed(3));
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    INFO("published scale = " << cs->scale
+         << ", lever err = " << (cs->extrinsic.t - X3.t).norm() << " m");
+    CHECK((cs->extrinsic.t - X3.t).norm() < 0.02);
+    CHECK(std::abs(cs->scale - Scalar(1)) < 0.02);
+}
+
+// ===========================================================================
 // 5. Slice-17 lever regression with the flag ON: unit scale, turn-only,
 // Phase-1 starved — the joint solve must not degrade the unit-scale cases.
 // ===========================================================================
@@ -331,16 +451,109 @@ TEST_CASE("joint lever+scale: Slice-17 lever-coupling shape at UNIT scale still 
     REQUIRE(cal.set_prior(1, SE3{}) == Status::Ok);      // IDENTITY prior — both wrong
 
     // Turn-only conjugated stream at UNIT scale (the Slice-17 rig, joint flag ON).
-    feed_stream(cal, 1, X, /*s_res=*/1.0, 250, /*multiaxis=*/true);
+    // 400 windows (vs the Slice-17 case's 250; review MINOR — margin banking): with
+    // SlidingK 256 the first ~150 pre-R̂-convergence transient votes age fully OUT of
+    // the ring, so the mode reads the converged tail instead of mixing the wrong-R_X
+    // bootstrap votes in. Same excitation SHAPE as Slice 17 (the regression intent),
+    // just enough extra windows that the 0.02 bound carries a real margin instead of
+    // passing at ~0.019.
+    feed_stream(cal, 1, X, /*s_res=*/1.0, 400, /*multiaxis=*/true);
 
     CHECK(cal.rot3d_observable(1));
     CHECK(so3::log(cal.rot3d(1) * X.R.transpose()).norm() < 1e-3);
     const Vec3 lever = cal.lever_arm(1);
     INFO("lever err = " << (lever - X.t).norm() << " m");
-    CHECK((lever - X.t).norm() < 0.02);                  // the Slice-17 bound
+    // The Slice-17 bound. Measured 0.0148 at 400 windows (0.019 at the original 250 —
+    // a 5% margin the review flagged as brittle): the residual is the shape's floor
+    // (centroid-off bin-center quantization ~6 mm bins + the R̂-driven row residual),
+    // not joint-path bias, and 0.02 now carries ~35% headroom for benign numeric drift.
+    CHECK((lever - X.t).norm() < 0.02);
     CHECK(cal.translation_confidence(1) > Scalar(0.5));
     // κ reads "no residual scale": scale2 ≈ 1.
     CHECK(std::abs(cal.scale2(1) - Scalar(1)) < 0.02);
+}
+
+// ===========================================================================
+// Range guard, calibrator level (17b review MAJOR-2/MAJOR-3): a TRUE residual scale
+// outside scale_hist's range is SKIPPED — never deposited as edge-clamped mass. The
+// "replace skip with clamp" mutation deposits ~300 deterministic edge votes here:
+// vote_count explodes, the mode reads ~1.5 at high confidence (a confidently WRONG
+// scale that would commit and irreversibly poison prior_scale at the estimator) and
+// the skipped counter stays 0 — every CHECK below fails. Also pins the documented
+// LIMITATION: the out-of-range truth is never recovered by this path (votes 0), but
+// it is DIAGNOSABLE (skipped high) and costs only the scale vote — the joint solve
+// absorbs κ̂ = 0.5 internally, so the lever still recovers (scale-immune).
+// ===========================================================================
+TEST_CASE("joint lever+scale range guard: out-of-range TRUE residual (s_res = 2.0) "
+          "never votes — skip not clamp; skipped counter grows; lever unharmed") {
+    const SE3 X = make_extrinsic(8 * kPi / 180, 5 * kPi / 180, 4 * kPi / 180,
+                                 Vec3(0.10, -0.05, 0.20));
+    auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+    REQUIRE(cal.configure(make_cfg(), 0) == Status::Ok);
+    SE3 Xp; Xp.R = X.R; Xp.t = Vec3::Zero();
+    REQUIRE(cal.set_prior(1, Xp) == Status::Ok);
+
+    // RICHLY excited stream (κ is fully observable — only the RANGE withholds votes)
+    // with the planted residual at 2.0, outside the configured (0.5, 1.5). 400 windows
+    // so the early running-solve transient (κ̂ converging toward 0.5 biases the first
+    // lever votes) ages out of the SlidingK-256 ring before the mode is read.
+    feed_stream(cal, 1, X, /*s_res=*/2.0, 400, /*multiaxis=*/true);
+
+    CHECK(cal.scale2_vote_count(1) == doctest::Approx(0.0));   // skip, NOT clamp
+    CHECK(cal.scale2(1) == doctest::Approx(1.0));              // prior (empty histogram)
+    CHECK(cal.scale2_confidence(1) == doctest::Approx(0.0));
+    CHECK(cal.scale2_skipped(1) > Scalar(350));                // diagnosable, not silent
+    // The lever is still recovered (the joint solve is scale-immune): the 2× scale
+    // costs only the (out-of-range) scale vote, not centimetres of lever.
+    INFO("lever err = " << (cal.lever_arm(1) - X.t).norm() << " m");
+    CHECK((cal.lever_arm(1) - X.t).norm() < 0.02);
+}
+
+// ===========================================================================
+// reset_scale2 / lever-gate decoupling (17b review): a scale fold drops the scale2
+// votes + the joint ACCUMULATOR epoch, but must KEEP the xyz histograms AND the
+// lever commit gate's vote-mass input xyz_vote_count — pre-fix reset_scale2 zeroed
+// rows_ (which doubles as xyz_vote_count), erasing a pending lever commit's entire
+// gate progress on every fold even though the votes it measures were kept.
+// ===========================================================================
+TEST_CASE("joint lever+scale reset_scale2: keeps xyz histograms AND the lever gate's "
+          "vote mass; drops only the scale2 votes + the accumulator epoch") {
+    const SE3 X = make_extrinsic(8 * kPi / 180, 5 * kPi / 180, 4 * kPi / 180,
+                                 Vec3(0.10, -0.05, 0.20));
+    auto calp = make_calib(); Phase2Calibrator& cal = *calp;
+    REQUIRE(cal.configure(make_cfg(), 0) == Status::Ok);
+    SE3 Xp; Xp.R = X.R; Xp.t = Vec3::Zero();
+    REQUIRE(cal.set_prior(1, Xp) == Status::Ok);
+
+    feed_stream(cal, 1, X, /*s_res=*/1.08, 150, /*multiaxis=*/true);
+    const Scalar votes_before = cal.xyz_vote_count(1);
+    const Vec3   lever_before = cal.lever_arm(1);
+    REQUIRE(votes_before > Scalar(100));
+    REQUIRE(cal.scale2_vote_count(1) > Scalar(0));
+
+    cal.reset_scale2(1);
+
+    // The lever side is untouched: gate vote mass + histogram readout EXACTLY equal.
+    CHECK(cal.xyz_vote_count(1) == votes_before);        // pre-fix: dropped to 0
+    CHECK(cal.lever_arm(1).x() == lever_before.x());
+    CHECK(cal.lever_arm(1).y() == lever_before.y());
+    CHECK(cal.lever_arm(1).z() == lever_before.z());
+    // The scale2 votes are gone (fall back to the prior 1)...
+    CHECK(cal.scale2_vote_count(1) == doctest::Approx(0.0));
+    CHECK(cal.scale2(1) == doctest::Approx(1.0));
+    // ...and so is the accumulator EPOCH: the direct solve falls back to the prior
+    // until post-fold rows land (the single-κ model cannot mix de-scale epochs).
+    bool obs = true;
+    const Vec3 t_solve = cal.solve_lever_arm(1, &obs);
+    CHECK_FALSE(obs);
+    CHECK(t_solve.norm() < 1e-12);                       // prior (zero lever)
+
+    // Post-fold rows (residual now ≈ 1, the re-anchored convention) resume cleanly:
+    // scale2 re-votes ≈ 1 with no stale-epoch blending.
+    feed_stream(cal, 1, X, /*s_res=*/1.0, 100, /*multiaxis=*/true);
+    CHECK(cal.scale2_vote_count(1) > Scalar(50));
+    CHECK(std::abs(cal.scale2(1) - Scalar(1)) < 5e-3);
+    CHECK(cal.xyz_vote_count(1) == votes_before + Scalar(100));
 }
 
 // ===========================================================================
@@ -572,4 +785,262 @@ TEST_CASE("joint lever+scale: either-path rising edge folds once — no double-f
         INFO("max published scale over the run = " << max_scale);
         CHECK(max_scale < Scalar(1.155));
     }
+}
+
+// ===========================================================================
+// Range guard, estimator level (17b review MAJOR-3 i): the POISONING repro. With a
+// WRONG prior rotation the pre-rot3d-gate lever rows are built with the wrong R_X
+// and the κ sink absorbs the pollution — the running s_res leaves the histogram
+// range ON CLEAN UNIT-SCALE DATA. Those residuals must deposit NOTHING: under the
+// "replace skip with clamp" mutation the deterministic transient mass concentrates
+// in the edge bin, commits, and folds ~1.5 into prior_scale — an IRREVERSIBLE value
+// poison no later reset can heal (the per-step scale bound below fails).
+// ===========================================================================
+TEST_CASE("joint lever+scale estimator: pre-gate wrong-R_X transient deposits no "
+          "edge mass and never commits — prior_scale never poisoned") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    // Large planted mount ROTATION with an IDENTITY prior (the rot3d bootstrap shape):
+    // every pre-gate row's R_X is badly wrong. UNIT planted scale — any scale the κ
+    // sink reads during the transient is pure pollution.
+    const SE3 X3 = make_extrinsic(0.25, -0.18, 0.12, Vec3(0.20, -0.15, 0.10));
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X = X3;                                   // unit scale, rotated mount
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    // sensors[3].prior_extrinsic left at identity — the WRONG prior.
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 120;
+    cfg.rot3d_enabled     = true;
+    cfg.joint_lever_scale = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    // The transient DID produce out-of-range residuals (the repro is live, and the
+    // guard — not luck — is what kept them out of the histogram)...
+    CHECK(rig.estimator().scale2_skipped(3) > Scalar(0));
+    // ...and the transient garbage never looked concentrated enough to COMMIT: on
+    // every step where the scale is committed the published value sits at unit (a
+    // legitimate late ≈1.0 fold at most). Under the clamp mutation the deterministic
+    // edge mass concentrates, commits EARLY, and folds ~1.4–1.5 into prior_scale —
+    // the committed-step bound fails. (UNcommitted snapshot values may wobble while
+    // the in-range slice of the sweeping transient sits in the histogram: that is the
+    // pre-existing "turn residual surfaces at Phase-1 conf 0" snapshot multiply, not
+    // a fold — prior_scale is only ever moved by a COMMIT edge.)
+    Scalar max_committed_dev = 0;
+    for (const auto& rec : rig.records()) {
+        if (!rec.fused) continue;
+        const CalibSnapshot* c3 = snap(rec.result, 3);
+        if (c3 == nullptr || !c3->scale_committed) continue;
+        max_committed_dev = std::max(max_committed_dev,
+                                     std::abs(c3->scale - Scalar(1)));
+    }
+    INFO("max |published scale - 1| over committed steps = " << max_committed_dev);
+    CHECK(max_committed_dev < Scalar(0.05));
+    // Final state: unit scale (prior_scale unpoisoned), mount rotation recovered.
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    INFO("final published scale = " << cs->scale);
+    CHECK(std::abs(cs->scale - Scalar(1)) < 0.05);
+    CHECK(so3::log(cs->extrinsic.R * X3.R.transpose()).norm() < 0.02);
+}
+
+// ===========================================================================
+// Range guard, estimator level (17b review MAJOR-3 ii): a LEGITIMATE out-of-range
+// true scale (2.0) on a TURN-ONLY rig — the documented limitation, pinned: the turn
+// path never votes/commits/folds (prior_scale untouched, published scale stays at
+// the prior 1) and Phase-1 cannot help (no straight regime). NOT silent: the
+// skipped counter reads high, distinguishing out-of-regime from under-excitation.
+// ===========================================================================
+TEST_CASE("joint lever+scale estimator: out-of-range TRUE scale on a turn-only rig "
+          "never commits and prior_scale stays untouched — but reads as skipped") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X3 = make_extrinsic(0.10, -0.07, 0.09, Vec3(0.15, -0.10, 0.05));
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X     = X3;
+    planted[3].scale = 2.0;                              // outside (0.5, 1.5)
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = X3;                     // isolate the scale DOF
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 120;
+    cfg.rot3d_enabled     = true;
+    cfg.joint_lever_scale = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    // Never voted, never committed, never folded — at ANY step.
+    CHECK_FALSE(rig.estimator().scale2_committed(3));
+    for (const auto& rec : rig.records()) {
+        if (!rec.fused) continue;
+        const CalibSnapshot* c3 = snap(rec.result, 3);
+        if (c3 == nullptr) continue;
+        CHECK_FALSE(c3->scale_committed);
+        CHECK(c3->scale == doctest::Approx(1.0));        // prior_scale untouched
+    }
+    // The limitation is DIAGNOSABLE: rows accumulated, votes 0, skipped HIGH.
+    CHECK(rig.estimator().scale2_skipped(3) > Scalar(50));
+}
+
+// ===========================================================================
+// Lever commit across the scale2 fold (17b review, reset_scale2/rows_ coupling):
+// prior lever != truth (the shape the existing estimator test sidesteps with
+// prior == truth) — the lever must commit, HOLD through the scale2 fold's
+// reset_scale2 (which keeps the xyz histograms + their gate vote mass), and both
+// DOFs land on truth. Pins the previously comment-only "committed lever held
+// through the fold" claim.
+// ===========================================================================
+TEST_CASE("joint lever+scale estimator: lever commit holds across the scale2 fold "
+          "(prior lever wrong; no commit thrash)") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X3 = make_extrinsic(0.10, -0.07, 0.09, Vec3(0.15, -0.10, 0.05));
+    const Scalar planted_scale = 1.08;
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X     = X3;
+    planted[3].scale = planted_scale;
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic.R = X3.R;                 // rotation prior = truth,
+    sensors[3].prior_extrinsic.t = Vec3::Zero();         // lever prior WRONG (zero)
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 120;
+    cfg.rot3d_enabled     = true;
+    cfg.joint_lever_scale = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    // Both DOFs committed and landed on truth...
+    CHECK(rig.estimator().scale2_committed(3));
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    CHECK(cs->translation_committed);
+    CHECK(cs->scale_committed);
+    INFO("published scale = " << cs->scale
+         << ", lever err = " << (cs->extrinsic.t - X3.t).norm() << " m");
+    CHECK(std::abs(cs->scale - planted_scale) < 0.02);
+    CHECK((cs->extrinsic.t - X3.t).norm() < 0.02);
+
+    // ...and the lever commit NEVER thrashed: once up, it stayed up — in particular
+    // across the scale2 fold's reset_scale2 (which must keep the gate's vote mass).
+    bool lever_seen = false, scale_seen = false;
+    for (const auto& rec : rig.records()) {
+        if (!rec.fused) continue;
+        const CalibSnapshot* c3 = snap(rec.result, 3);
+        if (c3 == nullptr) continue;
+        if (c3->translation_committed) lever_seen = true;
+        else CHECK_FALSE(lever_seen);                    // no un-commit, ever
+        if (c3->scale_committed) scale_seen = true;
+    }
+    CHECK(lever_seen);
+    CHECK(scale_seen);                                   // the fold DID happen
+}
+
+// ===========================================================================
+// Premature fold (17b review MINOR): with a LOW commit_min_votes the scale2 commit
+// can fire while the running κ̂ convergence transient still owns the SlidingK mode —
+// the one-shot rising-edge fold then moves prior_scale by a PARTIAL residual. Pinned
+// benign-by-design behavior: the latch HOLDS (no re-edge, no second fold), the
+// post-fold votes record the REMAINING residual vs the new prior, and the PUBLISHED
+// scale (prior × live residual) still converges to the planted truth.
+// ===========================================================================
+TEST_CASE("joint lever+scale estimator: premature fold at low commit_min_votes — "
+          "latch holds and the published prior x residual still reaches truth") {
+    const Trajectory tr = multiaxis_turnonly_traj();
+    const SE3 X3 = make_extrinsic(0.10, -0.07, 0.09, Vec3(0.15, -0.10, 0.05));
+    const Scalar planted_scale = 1.08;
+
+    std::vector<SourceParams> planted(4);
+    for (int i = 0; i < 4; ++i) planted[i].id = static_cast<SourceId>(i);
+    planted[3].X     = X3;
+    planted[3].scale = planted_scale;
+    std::vector<std::unique_ptr<SyntheticSource>> srcs;
+    for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[3].prior_extrinsic = X3;                     // isolate the scale DOF
+
+    Config cfg;
+    cfg.max_sources = 4; cfg.fusion_delay_s = 0.05; cfg.window_s = 0.10;
+    cfg.timesync_enabled = false; cfg.cold_start = ColdStart::MedianFromStart;
+    set_hists(cfg);
+    // LOW N_min — the production-config shape the 120-vote main test tunes around.
+    cfg.commit_concentration = 0.5; cfg.commit_drop = 0.3; cfg.commit_min_votes = 30;
+    cfg.rot3d_enabled     = true;
+    cfg.joint_lever_scale = true;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+
+    Rig rig;
+    rig.set_trajectory(tr);
+    REQUIRE(rig.init(cfg) == Status::Ok);
+    for (auto& sp : srcs) REQUIRE(rig.add_source(sp.get()) == Status::Ok);
+    const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
+    REQUIRE(fuses > 200);
+
+    // Latch: exactly one rising edge, never re-opened (a re-edge would re-fold and
+    // overshoot — the over-fold bound below also guards it).
+    CHECK(rig.estimator().scale2_committed(3));
+    bool seen_commit = false;
+    Scalar max_scale = 0;
+    for (const auto& rec : rig.records()) {
+        if (!rec.fused) continue;
+        const CalibSnapshot* c3 = snap(rec.result, 3);
+        if (c3 == nullptr) continue;
+        if (c3->scale_committed) seen_commit = true;
+        else CHECK_FALSE(seen_commit);                   // latch never drops
+        max_scale = std::max(max_scale, c3->scale);
+    }
+    CHECK(seen_commit);
+    CHECK(max_scale < planted_scale * Scalar(1.06));     // no over-fold past truth
+
+    // Whether or not the fold was partial, the SNAPSHOT scale is prior × the LIVE
+    // residual — the leftover surfaces multiplicatively and lands on the truth.
+    const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
+    REQUIRE(cs != nullptr);
+    INFO("final published scale = " << cs->scale);
+    CHECK(std::abs(cs->scale - planted_scale) < 0.02);
 }
