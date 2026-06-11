@@ -109,6 +109,7 @@ void Phase1Calibrator::reset() {
         scale_[i].reset();
         prior_[i]       = SE3{};
         scale_calib_[i] = true;
+        so3_skipped_[i] = Scalar(0);
         ids_[i]         = 0;
     }
     source_count_       = 0;
@@ -130,6 +131,7 @@ int Phase1Calibrator::ensure_slot(SourceId id) {
     ids_[slot]         = id;
     prior_[slot]       = SE3{};
     scale_calib_[slot] = true;
+    so3_skipped_[slot] = Scalar(0);
     return slot;
 }
 
@@ -287,9 +289,29 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // The guard above keeps θ < 90°, well clear of the so3::log singularity at π.
         const Mat3 dR  = rotation_between(kFwd, g_unit);
         const Vec3 phi = so3::log(dR);
-        so3_[3 * slot + 0].add(phi.x(), w);
-        so3_[3 * slot + 1].add(phi.y(), w);
-        so3_[3 * slot + 2].add(phi.z(), w);
+        // RANGE GUARD (Slice 18 review/B1 — the scale2 precedent generalized to the so(3)
+        // direction channels). A vote whose value falls OUTSIDE the configured histogram
+        // range is outside the calibrated regime (e.g. a de-biasing filter's wandering
+        // bias DOFs injecting a growing fake rotation into every source delta — the
+        // urban12 corruption channel). Depositing it would CLAMP into the boundary bin,
+        // where deterministic out-of-regime mass looks concentrated, COMMITS at the
+        // edge-bin center (~±0.984 at 64 bins over [-1,1]) and feeds absurd extrinsics
+        // back into fusion. SKIP the whole 3-channel vote instead (the components are one
+        // coupled rotation; a partial deposit would skew the joint readout) and count it —
+        // the histogram only ever holds genuine in-regime mass, so boundary-bin garbage
+        // can never commit. Strictly-interior test, mirroring the scale2 guard; the
+        // fold() clamp inside Histogram1D stays (it serves circular/edge cases elsewhere).
+        const bool in_range =
+            phi.x() > so3_cfg_.range_min && phi.x() < so3_cfg_.range_max &&
+            phi.y() > so3_cfg_.range_min && phi.y() < so3_cfg_.range_max &&
+            phi.z() > so3_cfg_.range_min && phi.z() < so3_cfg_.range_max;
+        if (in_range) {
+            so3_[3 * slot + 0].add(phi.x(), w);
+            so3_[3 * slot + 1].add(phi.y(), w);
+            so3_[3 * slot + 2].add(phi.z(), w);
+        } else {
+            so3_skipped_[slot] += Scalar(1);
+        }
 
         // Scale vote = magnitude ratio vs the reference's reported magnitude (same weight).
         if (have_ref && scale_calib_[slot] && id != reference_id_) {
@@ -381,6 +403,14 @@ Scalar Phase1Calibrator::vote_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return so3_[3 * s + 0].total();
+}
+
+Scalar Phase1Calibrator::so3_skipped(SourceId id) const {
+    // Range-guard-withheld so(3) vote count (cumulative; Slice 18 review/B1). 0 unknown.
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return so3_skipped_[s];
 }
 
 // ===========================================================================
@@ -706,6 +736,8 @@ void Phase2Calibrator::reset() {
         atb4_[i]           = Vec4::Zero();
         rows4_[i]          = Scalar(0);
         scale2_skipped_[i] = Scalar(0);
+        xyz_skipped_[i]    = Scalar(0);
+        rot3d_skipped_[i]  = Scalar(0);
         scale2_calib_[i]   = true;
     }
     for (int i = 0; i < 3 * kMaxSources; ++i) xyz_[i].reset();
@@ -740,6 +772,8 @@ int Phase2Calibrator::ensure_slot(SourceId id) {
     atb4_[slot]           = Vec4::Zero();
     rows4_[slot]          = Scalar(0);
     scale2_skipped_[slot] = Scalar(0);
+    xyz_skipped_[slot]    = Scalar(0);
+    rot3d_skipped_[slot]  = Scalar(0);
     scale2_calib_[slot]   = true;
     return slot;
 }
@@ -965,12 +999,23 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
                     if (wahba_solve(mw_[slot], Rhat)) {
                         rot3d_row = true;
                         const Vec3 dphi = so3::log(Rhat * rot3d_bp_[slot].transpose());
-                        // A basepoint ~π off the solve sits at the so3::log singularity —
-                        // skip the (non-finite / unstable) vote rather than deposit it.
-                        if (dphi.allFinite()) {
+                        // RANGE GUARD (Slice 18 review/B1, the scale2 precedent — see the
+                        // Phase-1 so(3) vote site for the full rationale): an out-of-range
+                        // residual is SKIPPED as a whole 3-channel vote, never edge-clamped
+                        // into a boundary bin where deterministic out-of-regime mass would
+                        // look concentrated and commit. The strictly-interior test also
+                        // subsumes the Slice-17 near-π-basepoint allFinite skip (a NaN
+                        // component fails both comparisons) — now COUNTED, not silent.
+                        const bool in_range =
+                            dphi.x() > rot3d_cfg_.range_min && dphi.x() < rot3d_cfg_.range_max &&
+                            dphi.y() > rot3d_cfg_.range_min && dphi.y() < rot3d_cfg_.range_max &&
+                            dphi.z() > rot3d_cfg_.range_min && dphi.z() < rot3d_cfg_.range_max;
+                        if (in_range) {
                             rot3d_[3 * slot + 0].add(dphi.x(), w);
                             rot3d_[3 * slot + 1].add(dphi.y(), w);
                             rot3d_[3 * slot + 2].add(dphi.z(), w);
+                        } else {
+                            rot3d_skipped_[slot] += Scalar(1);
                         }
                     }
                 }
@@ -1007,9 +1052,20 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
             u_prior << prior_[slot].t, Scalar(1);
             const Vec4 u_run = solve_ridge4(ata4_[slot], atb4_[slot], u_prior,
                                             kVoteRidgeRel, obs4);
-            if (obs4[0]) xyz_[3 * slot + 0].add(u_run(0), w);
-            if (obs4[1]) xyz_[3 * slot + 1].add(u_run(1), w);
-            if (obs4[2]) xyz_[3 * slot + 2].add(u_run(2), w);
+            // RANGE GUARD per lever channel (Slice 18 review/B1, the scale2 precedent —
+            // full rationale at the Phase-1 so(3) vote site): an out-of-range solve value
+            // deposits nothing for that channel (never edge-clamped boundary mass, which
+            // committed the urban12 ±0.984375 fake levers) and is counted. Channels are
+            // independent per-axis solutions, so the guard is per-channel (the in-range
+            // axes still vote; the skipped axis stays empty -> conf 0 -> never commits).
+            for (int c = 0; c < 3; ++c) {
+                if (!obs4[c]) continue;
+                if (u_run(c) > xyz_cfg_.range_min && u_run(c) < xyz_cfg_.range_max) {
+                    xyz_[3 * slot + c].add(u_run(c), w);
+                } else {
+                    xyz_skipped_[slot] += Scalar(1);
+                }
+            }
             if (obs4[3] && scale2_calib_[slot] && id != reference_id_) {
                 // RANGE GUARD (the Phase-1 π-guard analog): a residual outside the
                 // configured scale histogram range is OUTSIDE the calibrated regime —
@@ -1059,9 +1115,16 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
             bool obs[3];
             const Vec3 tx_run = solve_ridge(ata_[slot], atb_[slot], prior_[slot].t,
                                             kVoteRidgeRel, obs);
-            if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
-            if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
-            if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
+            // RANGE GUARD per lever channel (Slice 18 review/B1) — identical to the joint
+            // path's guard above: skip + count, never edge-clamp.
+            for (int c = 0; c < 3; ++c) {
+                if (!obs[c]) continue;
+                if (tx_run(c) > xyz_cfg_.range_min && tx_run(c) < xyz_cfg_.range_max) {
+                    xyz_[3 * slot + c].add(tx_run(c), w);
+                } else {
+                    xyz_skipped_[slot] += Scalar(1);
+                }
+            }
         }
 
         any = true;
@@ -1242,6 +1305,22 @@ Scalar Phase2Calibrator::scale2_skipped(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return scale2_skipped_[s];
+}
+
+Scalar Phase2Calibrator::xyz_skipped(SourceId id) const {
+    // Range-guard-withheld xyz channel-vote count (cumulative; Slice 18 review/B1).
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return xyz_skipped_[s];
+}
+
+Scalar Phase2Calibrator::rot3d_skipped(SourceId id) const {
+    // Range-guard-withheld rot3d vote count (cumulative; Slice 18 review/B1).
+    if (!configured_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return rot3d_skipped_[s];
 }
 
 // --- rot3d readouts (Slice 17) ----------------------------------------------

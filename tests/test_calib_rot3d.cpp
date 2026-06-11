@@ -788,17 +788,26 @@ TEST_CASE("rot3d cold start: ReferenceOnly + turn-only rig — source joins the 
 }
 
 // ===========================================================================
-// Estimator rising-edge re-anchor mutation pin (review fix, MINOR): a prior rotation
-// error BEYOND the so3_hist range (1.2 rad yaw vs the ±0.8 rad channels). The δφ votes
-// CLAMP into the edge bin, so the first commit publishes a clamped (≈0.8 rad) partial
-// correction — only the rising-edge re-anchor (basepoint <- committed value + channel
-// reset) lets the remaining ≈0.4 rad residual re-vote IN range and converge. Deleting
-// the set_rot3d_basepoint/reset_rot3d pair in apply_calib_feedback leaves the published
-// rotation stuck ≈0.4 rad off truth and this pin fails (mirrors the Slice-8 large-error
-// ext walk).
+// Estimator vote-site RANGE GUARD, rot3d (Slice 18 review/B1) — DELIBERATELY SUPERSEDES
+// the pre-B1 rising-edge bootstrap pin that lived here. Pre-B1, a prior rotation error
+// BEYOND the so3_hist range (1.2 rad yaw vs the ±0.8 rad channels) converged by the δφ
+// votes EDGE-CLAMPING into the boundary bin, committing a partial (≈0.8 rad) correction,
+// and iterating through the re-anchor. That edge-clamp-then-commit iterate is the SAME
+// channel a deterministic out-of-regime fake rotation corrupts fusion through (the urban12
+// real-data failure: weakly-observable bias DOFs wander -> a growing fake rotation in the
+// de-biased deltas -> votes edge-clamp -> boundary mass reads concentrated -> COMMITS at
+// the edge-bin center ±0.984 -> feedback applies absurd extrinsics -> fusion destroyed).
+// B1 kills the channel at the vote site: an out-of-range vote deposits NOTHING.
+//
+// The NEW fail-safe contract pinned here: a beyond-range prior rotation error stays
+// UNCOMMITTED at the prior — no partial clamped correction is ever published — and the
+// situation is DIAGNOSABLE via rot3d_skipped (the remedy for a rig with a legitimately
+// larger prior rotation error is a wider so3_hist range, not boundary-bin mass). The
+// "replace skip with clamp" mutation (deleting the guard) re-commits the clamped value,
+// converges rerr to ~0.13, and leaves skipped == 0 — every CHECK below fails.
 // ===========================================================================
-TEST_CASE("rot3d estimator bootstrap: prior error beyond the histogram range converges "
-          "only through the rising-edge re-anchor") {
+TEST_CASE("rot3d estimator range guard: prior error beyond the histogram range stays "
+          "UNCOMMITTED at the prior (skip not clamp; diagnosable via rot3d_skipped)") {
     const Trajectory tr = multiaxis_turnonly_traj();
     const SE3 X_true  = make_extrinsic(0.15, -0.10, 0.12, Vec3(0.20, -0.15, 0.10));
     const SE3 X_prior = make_extrinsic(0.15 + 1.20, -0.10, 0.12, X_true.t);   // yaw +1.2 rad
@@ -830,15 +839,20 @@ TEST_CASE("rot3d estimator bootstrap: prior error beyond the histogram range con
     const int fuses = rig.run(0.2, tr.duration_s() - 0.1, 50.0);
     REQUIRE(fuses > 200);
 
-    CHECK(rig.estimator().rot3d_committed(3));
+    // FAIL-SAFE: the out-of-range residual never votes, so rot3d never concentrates and
+    // never commits — the published rotation stays at (near) the prior instead of a
+    // confidently-wrong boundary-bin value.
+    CHECK_FALSE(rig.estimator().rot3d_committed(3));
+    // NOT silent: the withheld votes are counted (the "votes 0, skipped HIGH" signature
+    // that says "out-of-regime / widen the range", distinguishable from "unexcited").
+    CHECK(rig.estimator().rot3d_skipped(3) > Scalar(50));
     const CalibSnapshot* cs = snap(rig.estimator().latest(), 3);
     REQUIRE(cs != nullptr);
     const Scalar rerr = so3::log(X_true.R.transpose() * cs->extrinsic.R).norm();
-    INFO("prior rot err=" << prior_rerr << "  converged rot err=" << rerr);
-    // The clamped single-commit value sits ≈0.4 rad off truth; converging well below
-    // that REQUIRES the contractive re-anchor walk.
-    CHECK(rerr < 0.15);
-    CHECK(rerr < prior_rerr * Scalar(0.15));
+    INFO("prior rot err=" << prior_rerr << "  published rot err=" << rerr);
+    // No partial clamped commit was applied: the published rotation error stays at the
+    // prior scale (the clamp mutation converges this to ~0.13 through the boundary bin).
+    CHECK(rerr > Scalar(0.8));
 }
 
 // ===========================================================================

@@ -1765,6 +1765,27 @@ Scalar Estimator::scale2_skipped(SourceId id) const {
     return impl_->calib2.scale2_skipped(id);
 }
 
+Scalar Estimator::so3_skipped(SourceId id) const {
+    // Diagnostic readout (Slice 18 review/B1): Phase-1's cumulative range-guard-withheld
+    // so(3) direction vote count. 0 when uninited / unknown id.
+    if (impl_ == nullptr || !impl_->inited) return Scalar(0);
+    return impl_->calib1.so3_skipped(id);
+}
+
+Scalar Estimator::xyz_skipped(SourceId id) const {
+    // Diagnostic readout (Slice 18 review/B1): Phase-2's cumulative range-guard-withheld
+    // xyz lever channel-vote count. 0 when uninited / unknown id.
+    if (impl_ == nullptr || !impl_->inited) return Scalar(0);
+    return impl_->calib2.xyz_skipped(id);
+}
+
+Scalar Estimator::rot3d_skipped(SourceId id) const {
+    // Diagnostic readout (Slice 18 review/B1): Phase-2's cumulative range-guard-withheld
+    // rot3d vote count. 0 when uninited / unknown id.
+    if (impl_ == nullptr || !impl_->inited) return Scalar(0);
+    return impl_->calib2.rot3d_skipped(id);
+}
+
 bool Estimator::rot3d_committed(SourceId id) const {
     // Diagnostic readout (Slice 17): the latched per-source rot3d commit state from the
     // last apply_calib_feedback(). Always false when uninited / unknown id / knob off

@@ -59,6 +59,18 @@ public:
     // Always 0 when Config::joint_lever_scale is off / id unknown.
     Scalar scale2_skipped(SourceId id) const;
 
+    // Diagnostic readouts (Slice 18 review/B1): cumulative counts of calibration votes the
+    // generalized vote-site RANGE GUARDS withheld (the scale2_skipped precedent extended to
+    // the remaining vote channels — an out-of-range vote deposits NOTHING instead of
+    // edge-clamping into a boundary bin where deterministic out-of-regime mass would look
+    // concentrated and COMMIT, the urban12 ±0.984 corruption channel). so3 = Phase-1
+    // direction votes (whole 3-channel vote); xyz = Phase-2 lever channel votes (per
+    // channel); rot3d = Phase-2 full-rotation votes (whole vote, incl. the non-finite
+    // near-π-basepoint case). All 0 when uninited / id unknown.
+    Scalar so3_skipped(SourceId id) const;
+    Scalar xyz_skipped(SourceId id) const;
+    Scalar rot3d_skipped(SourceId id) const;
+
     // Warm-restart persistence (D23): serialize/deserialize into a fixed buffer.
     // File I/O + double-buffering live in an adapter.
     Expected<int> serialize(unsigned char* buf, int cap) const;  // bytes written

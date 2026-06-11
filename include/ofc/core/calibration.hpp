@@ -189,6 +189,14 @@ public:
     SourceId reference()  const { return reference_id_; }
     // Total so(3)-channel vote mass for source `id` (the N_min driver; 0 if none).
     Scalar   vote_count(SourceId id) const;
+    // Count of so(3) direction votes WITHHELD by the vote-site RANGE GUARD (Slice 18
+    // review/B1, the scale2_skipped precedent): a vote any of whose 3 so(3) channel values
+    // falls outside so3_hist's (range_min, range_max) is SKIPPED as a whole — never
+    // edge-clamped into a boundary bin where deterministic out-of-regime mass would look
+    // concentrated and commit. One increment per withheld vote. CUMULATIVE since
+    // configure()/reset() (deliberately NOT cleared by reset_so3 — it records that the
+    // guard fired at all, the diagnostic). 0 for an unknown source.
+    Scalar   so3_skipped(SourceId id) const;
     bool     gated_straight() const { return last_gate_straight_; }   // last observe()
 
 private:
@@ -228,6 +236,8 @@ private:
     Histogram1D scale_[kMaxSources];
     SE3         prior_[kMaxSources];
     bool        scale_calib_[kMaxSources] = {};
+    // Range-guard-withheld so(3) vote count (cumulative diagnostics; Slice 18 review/B1).
+    Scalar      so3_skipped_[kMaxSources] = {};
     SourceId    ids_[kMaxSources] = {};
     int         source_count_ = 0;
 };
@@ -515,6 +525,21 @@ public:
     // 0 for unknown / joint path disabled. See the scale2() RANGE LIMITATION note.
     Scalar scale2_skipped(SourceId id) const;
 
+    // Count of xyz lever-arm CHANNEL votes withheld by the vote-site range guard (Slice 18
+    // review/B1 — the scale2 precedent generalized): an observable axis whose running-solve
+    // value falls outside xyz_hist's (range_min, range_max) deposits NOTHING for that
+    // channel (never edge-clamped — deterministic out-of-range mass must not look
+    // concentrated and commit a boundary-bin lever) and increments this counter (one per
+    // withheld channel deposit; the in-range channels still vote). CUMULATIVE since
+    // configure()/reset() (NOT cleared by reset_lever — diagnostics). 0 for unknown.
+    Scalar xyz_skipped(SourceId id) const;
+    // Count of rot3d votes withheld by the vote-site range guard (Slice 18 review/B1): a
+    // δφ = log(R̂·R_bpᵀ) residual any of whose 3 channel values is outside so3_hist's
+    // (range_min, range_max) — INCLUDING the non-finite near-π-basepoint case the Slice-17
+    // allFinite guard skipped silently — is skipped as a whole (one increment per withheld
+    // vote). CUMULATIVE since configure()/reset() (NOT cleared by reset_rot3d). 0 unknown.
+    Scalar rot3d_skipped(SourceId id) const;
+
     // Roll-histogram concentration in [0,1] — the roll (extrinsic) confidence. 0 unvoted.
     Scalar extrinsic_confidence(SourceId id) const;
     // Translation confidence: MIN of the 3 xyz-channel concentrations in [0,1]. The
@@ -648,6 +673,10 @@ private:
     Scalar      rows4_[kMaxSources] = {};
     Scalar      scale2_skipped_[kMaxSources] = {};
     bool        scale2_calib_[kMaxSources] = {};
+    // Range-guard-withheld xyz channel-vote / rot3d vote counts (cumulative diagnostics;
+    // Slice 18 review/B1 — the scale2_skipped_ precedent generalized).
+    Scalar      xyz_skipped_[kMaxSources]   = {};
+    Scalar      rot3d_skipped_[kMaxSources] = {};
 };
 
 } // namespace ofc
