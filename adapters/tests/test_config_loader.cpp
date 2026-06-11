@@ -171,6 +171,39 @@ TEST_CASE("ConfigLoader: rot3d_enabled parses (Slice 17); default off; bad value
     }
 }
 
+TEST_CASE("ConfigLoader: joint_lever_scale parses (Slice 17b); default off; bad value "
+          "rejects") {
+    // Enabled.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "joint_lever_scale = true\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().joint_lever_scale);
+    }
+    // Key absent -> default OFF (byte-identical 3-unknown lever numerics).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK_FALSE(loader.config().joint_lever_scale);
+    }
+    // Non-bool value -> loud error naming the line.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "joint_lever_scale = banana\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) == Status::InvalidConfig);
+        CHECK(loader.error().find("joint_lever_scale") != std::string::npos);
+    }
+}
+
 TEST_CASE("ConfigLoader: subbin_centroid round-trips into all five calibration histograms") {
     // Slice 16: one [global] key switches the centroid sub-bin readout on for
     // every calibration histogram (so3/roll/xyz/scale/offset).

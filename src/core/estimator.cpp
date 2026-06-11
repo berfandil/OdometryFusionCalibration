@@ -185,6 +185,10 @@ std::uint64_t config_hash(const Config& cfg) {
     // full Wahba solve vs yaw/pitch ∘ roll) -> calibration-shaping, hashed. Flipping it
     // rejects a cross-flag restore.
     w.put_bool(cfg.rot3d_enabled);
+    // Slice 17b: the joint flag changes the LEVER NUMERICS (4-unknown rows) and adds a
+    // second scale estimator -> calibration-shaping, hashed. Flipping it rejects a
+    // cross-flag restore.
+    w.put_bool(cfg.joint_lever_scale);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -381,6 +385,12 @@ struct Estimator::Impl {
     bool     roll_committed[kMaxSourcesCap]  = {};   // roll about forward
     bool     lever_committed[kMaxSourcesCap] = {};   // xyz lever arm
     bool     scale_committed[kMaxSourcesCap] = {};   // per-source scale
+    // Turn-regime joint scale (Slice 17b, only when cfg.joint_lever_scale). The SECOND
+    // scale path: calib2's scale2 (the κ axis of the joint 4-unknown lever+scale LS,
+    // voted as the residual s_res = 1/κ̂). Same commit_gate_reanchor machinery; the
+    // rising edge of EITHER scale path folds its residual into prior_scale and resets
+    // BOTH scale histograms (both are residual-convention — a re-anchor stales both).
+    bool     scale2_committed[kMaxSourcesCap] = {};  // per-source joint (turn) scale
     // Turn-regime FULL rotation extrinsic (Slice 17, only when cfg.rot3d_enabled). Same
     // commit_gate_reanchor machinery; on commit the published prior_extrinsic.R is driven
     // by calib2.rot3d() (SUPERSEDING the yaw/pitch ∘ roll composition — rot3d only ever
@@ -596,6 +606,7 @@ struct Estimator::Impl {
                 ext_committed[i] = roll_committed[i] = false;
                 lever_committed[i] = scale_committed[i] = false;
                 rot3d_committed[i] = false;
+                scale2_committed[i] = false;
                 continue;
             }
 
@@ -642,6 +653,19 @@ struct Estimator::Impl {
                     cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
             } else {
                 rot3d_committed[i] = false;
+            }
+
+            // --- scale2: turn-regime joint scale (Slice 17b, opt-in) ------------------
+            // Same N_min + hysteresis + re-fill gate on the scale2 histogram's confidence
+            // / vote mass. Entirely inert (flag pinned false, zero calls) when
+            // joint_lever_scale is off — the byte-identical default.
+            const bool was_scale2 = scale2_committed[i];
+            if (cfg.joint_lever_scale) {
+                scale2_committed[i] = commit_gate_reanchor(
+                    was_scale2, calib2.scale2_confidence(id), calib2.scale2_vote_count(id),
+                    cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+            } else {
+                scale2_committed[i] = false;
             }
 
             // === ROTATION + LEVER feedback (yaw/pitch ∘ roll, xyz) ===================
@@ -753,6 +777,28 @@ struct Estimator::Impl {
                     prior_scale[i] *= residual;
                     if (!(prior_scale[i] > Scalar(0))) prior_scale[i] = Scalar(1);
                     calib1.reset_scale(id);
+                    // Slice 17b: BOTH residual-convention scale estimators re-anchor on a
+                    // fold — the scale2 votes (and the joint rows they were solved from,
+                    // de-scaled by the OLD prior) are equally stale. Guarded by the knob
+                    // so the default-off scale path stays byte-identical.
+                    if (cfg.joint_lever_scale) calib2.reset_scale2(id);
+                }
+            }
+            // === SCALE2 feedback (Slice 17b — the turn-regime joint-scale fold) =======
+            // The SECOND scale path's rising edge, processed AFTER Phase-1's: if both
+            // edges rise on the same step, the Phase-1 fold above has already reset the
+            // scale2 histogram, so calib2.scale2() here reads 1 (empty hist) and this
+            // fold is a no-op multiply — sequential edge processing, NO DOUBLE-FOLD.
+            // Fold direction identical to Phase-1's: prior_scale ← prior_scale × s_res
+            // (both estimators vote the residual s_res vs the CURRENT prior; the
+            // committed absolute scale is prior × residual). Both histograms reset.
+            if (cfg.joint_lever_scale && scale2_committed[i] && !was_scale2) {
+                const Scalar residual2 = calib2.scale2(id);
+                if (residual2 > Scalar(0)) {
+                    prior_scale[i] *= residual2;
+                    if (!(prior_scale[i] > Scalar(0))) prior_scale[i] = Scalar(1);
+                    calib2.reset_scale2(id);
+                    calib1.reset_scale(id);   // Phase-1's ratios were vs the old prior too
                 }
             }
         }
@@ -800,6 +846,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->lever_committed[i]   = false;
         impl_->scale_committed[i]   = false;
         impl_->rot3d_committed[i]   = false;
+        impl_->scale2_committed[i]  = false;
         impl_->med_slot[i]          = -1;
         // Variance-EMA reliability reset (Slice 9, D17): clean EMA state + neutral
         // multiplier so the first kRelWarmup steps weight exactly as Slice 2.
@@ -920,8 +967,9 @@ Status Estimator::add_source(const ISource* src) {
         const bool sccal = (sc != nullptr) ? sc->scale_calib : true;
         impl_->calib1.set_prior(src->id(), Xp, sccal);
         // Phase-2 prior (pinned-ref gauge + translation fallback). yaw/pitch is fed each
-        // step from the live Phase-1 estimate; roll/t start from the prior.
-        impl_->calib2.set_prior(src->id(), Xp);
+        // step from the live Phase-1 estimate; roll/t start from the prior. scale_calib
+        // gates the joint-scale (scale2) channel identically to Phase-1 (Slice 17b).
+        impl_->calib2.set_prior(src->id(), Xp, sccal);
     }
     ++impl_->source_count;
     return Status::Ok;
@@ -1319,7 +1367,20 @@ Status Estimator::step(Timestamp now) {
         if (cfg.rot3d_enabled && s.rot3d_committed[i]) {
             cs.extrinsic.R = s.calib2.rot3d(id);
         }
-        cs.scale         = s.prior_scale[i] * s.calib1.scale(id);
+        // Published scale = prior × the RESIDUAL from the more-confident scale estimator
+        // (Slice 17b). Phase-1 (straight-regime ratio) and scale2 (turn-regime joint κ)
+        // both vote the residual vs the CURRENT prior_scale, so exactly ONE of them may
+        // multiply the prior (multiplying both would double-count the same residual);
+        // ties — including the both-empty cold state — go to Phase-1 (the denser/simpler
+        // source where it fires at all). On a never-straight rig (drone) Phase-1 starves
+        // at confidence 0, so the scale2 residual surfaces. With joint_lever_scale off,
+        // scale2_confidence is pinned 0 -> the Phase-1 branch, byte-identical.
+        Scalar scale_resid = s.calib1.scale(id);
+        if (cfg.joint_lever_scale &&
+            s.calib2.scale2_confidence(id) > s.calib1.scale_confidence(id)) {
+            scale_resid = s.calib2.scale2(id);
+        }
+        cs.scale         = s.prior_scale[i] * scale_resid;
         cs.time_offset_s = s.effective_offset(i);
         // confidence stays the TIME-OFFSET confidence (Slice 5); per-DOF confidences are
         // reported in their own fields (each DOF converges in its own regime).
@@ -1350,7 +1411,11 @@ Status Estimator::step(Timestamp now) {
         // are monotone-per-regime, so the OR does not oscillate; rot3d_committed is pinned
         // false when the knob is off (the byte-identical default).
         cs.extrinsic_committed   = s.ext_committed[i] || s.rot3d_committed[i];
-        cs.scale_committed       = s.scale_committed[i];
+        // The Slice-17b joint-scale commit is OR-ed in (the rot3d precedent): once scale2
+        // has committed, the published scale (prior_scale — the fold target) IS commit-
+        // driven, so a consumer keying on this flag must read it as committed. Pinned
+        // false when joint_lever_scale is off (the byte-identical default).
+        cs.scale_committed       = s.scale_committed[i] || s.scale2_committed[i];
         cs.translation_committed = s.lever_committed[i];
         // Per-source bias states (Slice 11b): the bias DOF is filled AFTER the predict/update
         // below (it reflects this step's de-bias + any absolute-ref injection), not here.
@@ -1547,6 +1612,19 @@ Status Estimator::step(Timestamp now) {
 
 const Result& Estimator::latest() const { return impl_->result; }
 
+bool Estimator::scale2_committed(SourceId id) const {
+    // Diagnostic readout (Slice 17b): the latched per-source joint-scale commit state
+    // from the last apply_calib_feedback(). Always false when uninited / unknown id /
+    // knob off (the flag is pinned false in that case). Bounded linear scan; no heap.
+    if (impl_ == nullptr || !impl_->inited) return false;
+    for (int i = 0; i < impl_->source_count; ++i) {
+        if (impl_->sources[i] != nullptr && impl_->sources[i]->id() == id) {
+            return impl_->scale2_committed[i];
+        }
+    }
+    return false;
+}
+
 bool Estimator::rot3d_committed(SourceId id) const {
     // Diagnostic readout (Slice 17): the latched per-source rot3d commit state from the
     // last apply_calib_feedback(). Always false when uninited / unknown id / knob off
@@ -1596,6 +1674,11 @@ bool Estimator::rot3d_committed(SourceId id) const {
 //                                        hold + re-anchors the rot3d basepoint on restore.
 //                                        Mw/BBw are NOT persisted — they re-fill, mirroring
 //                                        the histogram bins. Schema change -> format v2.)
+//     uint8  scale2_committed           (Slice 17b — the committed scale2 VALUE lives in
+//                                        prior_scale above (the fold target); this flag drives
+//                                        the re-fill hold. The joint accumulator / scale2
+//                                        histogram are NOT persisted — they re-fill. Schema
+//                                        change -> format v3.)
 //     f64    resid_mean, resid_var, reliability
 //     int32  resid_n
 Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
@@ -1628,6 +1711,7 @@ Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
         pw.put_bool(s.scale_committed[i]);
         pw.put_bool(s.offset_committed[i]);
         pw.put_bool(s.rot3d_committed[i]);   // Slice 17 (format v2)
+        pw.put_bool(s.scale2_committed[i]);  // Slice 17b (format v3)
         pw.put_f64(s.resid_mean[i]);
         pw.put_f64(s.resid_var[i]);
         pw.put_f64(s.reliability[i]);
@@ -1705,7 +1789,7 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         SE3      prior_extrinsic;
         Scalar   prior_scale;
         Scalar   time_offset;
-        bool     ext_c, roll_c, lever_c, scale_c, offset_c, rot3d_c;
+        bool     ext_c, roll_c, lever_c, scale_c, offset_c, rot3d_c, scale2_c;
         Scalar   resid_mean, resid_var, reliability;
         int      resid_n;
     };
@@ -1722,6 +1806,7 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         rc.scale_c         = pr.get_bool();
         rc.offset_c        = pr.get_bool();
         rc.rot3d_c         = pr.get_bool();   // Slice 17 (format v2)
+        rc.scale2_c        = pr.get_bool();   // Slice 17b (format v3)
         rc.resid_mean      = pr.get_f64();
         rc.resid_var       = pr.get_f64();
         rc.reliability     = pr.get_f64();
@@ -1782,6 +1867,10 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         // Only meaningful when cfg.rot3d_enabled (the config-hash guarantees the blob and
         // this run agree on the flag).
         s.rot3d_committed[slot]  = rc.rot3d_c;
+        // Slice 17b: the restored scale2 flag drives the same re-fill hysteresis (the
+        // empty post-restore scale2 histogram holds it committed through refill); the
+        // committed VALUE is already inside the restored prior_scale (the fold target).
+        s.scale2_committed[slot] = rc.scale2_c;
         s.offset_restored[slot]  = rc.offset_c;   // hold restored-committed offset through refill
         // Restore the variance-EMA reliability track (Slice 9) so the source's quality weight
         // resumes rather than re-warming for kRelWarmup steps.

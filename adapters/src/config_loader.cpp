@@ -128,6 +128,7 @@ const char* kKnobDoc =
     "  straight_omega_max=<f>  straight_trans_min=<f>  turn_omega_min=<f>\n"
     "  timesync_enabled=<bool>\n"
     "  rot3d_enabled=<bool>     (turn-regime FULL rotation extrinsic, Slice 17; default off)\n"
+    "  joint_lever_scale=<bool> (turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
@@ -275,6 +276,11 @@ Status ConfigLoader::parse(const std::string& text) {
                 // hand-eye). Default off = byte-identical legacy behavior.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.rot3d_enabled = bv;
+            } else if (key == "joint_lever_scale") {
+                // Slice 17b: turn-regime JOINT lever+scale (4-unknown hand-eye LS).
+                // Default off = byte-identical 3-unknown lever numerics.
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.joint_lever_scale = bv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);

@@ -534,6 +534,42 @@ bool Phase2Calibrator::wahba_solve(const Mat3& Mw, Mat3& R_out) {
     return true;
 }
 
+Phase2Calibrator::Vec4 Phase2Calibrator::solve_ridge4(const Mat4& AtA, const Vec4& Atb,
+                                                      const Vec4& u_prior, Scalar ridge,
+                                                      bool obs[4]) {
+    // PER-BLOCK information scales (Slice 17b). The joint columns mix units: the lever
+    // columns of J are entries of (R_A − I) (dimensionless), the κ column is −R_X t_B
+    // (metres). Judging every diagonal against the GLOBAL max would let a dominant κ
+    // diagonal (e.g. |t_B| ~ 0.5 m vs ‖(R_A−I)col‖ ~ 0.3 — KAIST AtA eigvals
+    // [0, 18.8, 18.8, 7435]) mask a perfectly observable lever axis. So:
+    //   * lever axes (0..2) gate against the LEVER sub-block's largest diagonal;
+    //   * κ (3) gates against the FULL matrix's largest diagonal — a starved κ (near-zero
+    //     translation: AtA(3,3) = Σ w‖R_X t_B‖² ≈ 0 while rotation keeps the lever
+    //     diagonals alive) falls below the floor and is pinned at its prior 1.
+    Scalar max_lever = Scalar(0);
+    for (int c = 0; c < 3; ++c) max_lever = std::max(max_lever, AtA(c, c));
+    const Scalar max_diag = std::max(max_lever, AtA(3, 3));
+    for (int c = 0; c < 3; ++c) {
+        obs[c] = (max_lever > Scalar(0)) && (AtA(c, c) >= kAxisInfoMin * max_lever);
+    }
+    obs[3] = (max_diag > Scalar(0)) && (AtA(3, 3) >= kAxisInfoMin * max_diag);
+    if (!(max_diag > Scalar(0))) return u_prior;     // no information at all
+
+    // Ridge centered on the prior [t_prior; 1], per-block-scaled for the same unit-mixing
+    // reason: (AtA + R)(u − u_prior) = Atb − AtA u_prior. An unobservable axis is pinned
+    // near its prior component; observable axes resolve (the relative ridge bias is
+    // ≤ ~kVoteRidgeRel of the axis information, as in the 3-unknown solve).
+    Mat4 M = AtA;
+    const Scalar rl = ridge * ((max_lever > Scalar(0)) ? max_lever : max_diag);
+    for (int c = 0; c < 3; ++c) M(c, c) += rl;
+    M(3, 3) += ridge * max_diag;
+    const Vec4 rhs = Atb - AtA * u_prior;
+    const Vec4 du  = M.ldlt().solve(rhs);
+    Vec4 u = u_prior + du;
+    if (!u.allFinite()) return u_prior;
+    return u;
+}
+
 Vec3 Phase2Calibrator::solve_ridge(const Mat3& AtA, const Vec3& Atb,
                                    const Vec3& t_prior, Scalar ridge, bool obs[3]) {
     // Largest diagonal (the information scale). Pure PSD normal matrix -> diagonals >= 0.
@@ -556,9 +592,10 @@ Vec3 Phase2Calibrator::solve_ridge(const Mat3& AtA, const Vec3& Atb,
 Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
     if (static_cast<int>(reference_id) >= kMaxSources) return Status::OutOfRange;
 
-    roll_cfg_  = cfg.roll_hist;
-    xyz_cfg_   = cfg.xyz_hist;
-    rot3d_cfg_ = cfg.so3_hist;   // rot3d channels reuse the Phase-1 so(3) shape (Slice 17)
+    roll_cfg_   = cfg.roll_hist;
+    xyz_cfg_    = cfg.xyz_hist;
+    rot3d_cfg_  = cfg.so3_hist;   // rot3d channels reuse the Phase-1 so(3) shape (Slice 17)
+    scale2_cfg_ = cfg.scale_hist; // joint-scale channel reuses the scale shape (Slice 17b)
 
     for (int i = 0; i < kMaxSources; ++i) {
         const Status hs = roll_[i].configure(roll_cfg_);
@@ -572,12 +609,23 @@ Status Phase2Calibrator::configure(const Config& cfg, SourceId reference_id) {
         const Status hs = rot3d_[i].configure(rot3d_cfg_);
         if (!ok(hs)) return hs;
     }
+    // scale2 histograms only bind when the joint path is enabled, so a config whose
+    // scale_hist Phase 2 never validated before cannot newly fail configure() with the
+    // knob off (the byte-identical default — Phase 1 validates scale_hist for the rigs
+    // that actually use scale).
+    if (cfg.joint_lever_scale) {
+        for (int i = 0; i < kMaxSources; ++i) {
+            const Status hs = scale2_[i].configure(scale2_cfg_);
+            if (!ok(hs)) return hs;
+        }
+    }
 
     reference_id_   = reference_id;
     turn_omega_min_ = std::max(Scalar(0), cfg.turn_omega_min);
     strategy_       = cfg.phase2_strategy;
     vote_weight_    = cfg.vote_weight;
     rot3d_enabled_  = cfg.rot3d_enabled;
+    joint_          = cfg.joint_lever_scale;
     // Mw/BBw decay per ACCEPTED window = the so(3) histogram's decay_gamma (Slice 17),
     // independent of the histogram aging MODE (a SlidingK ring cannot evict from a rank
     // accumulator). Defensive clamp: under SlidingK the knob is unvalidated by the
@@ -605,6 +653,10 @@ void Phase2Calibrator::reset() {
         mw_[i]       = Mat3::Zero();
         bbw_[i]      = Mat3::Zero();
         rot3d_bp_[i] = Mat3::Identity();
+        scale2_[i].reset();
+        ata4_[i]         = Mat4::Zero();
+        atb4_[i]         = Vec4::Zero();
+        scale2_calib_[i] = true;
     }
     for (int i = 0; i < 3 * kMaxSources; ++i) xyz_[i].reset();
     for (int i = 0; i < 3 * kMaxSources; ++i) rot3d_[i].reset();
@@ -634,10 +686,14 @@ int Phase2Calibrator::ensure_slot(SourceId id) {
     mw_[slot]       = Mat3::Zero();
     bbw_[slot]      = Mat3::Zero();
     rot3d_bp_[slot] = Mat3::Identity();
+    ata4_[slot]         = Mat4::Zero();
+    atb4_[slot]         = Vec4::Zero();
+    scale2_calib_[slot] = true;
     return slot;
 }
 
-Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic) {
+Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
+                                   bool scale_calib) {
     if (!configured_)                        return Status::NotInitialized;
     if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
     const int slot = ensure_slot(id);
@@ -647,6 +703,9 @@ Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic) {
     // is the per-source REGISTRATION call (once, before observe()); the later every-step
     // set_basepoint value sync deliberately does NOT move it (see set_rot3d_basepoint).
     rot3d_bp_[slot] = prior_extrinsic.R;
+    // Joint-scale gate (Slice 17b), mirroring Phase-1: a scale_calib==false source never
+    // votes/reads the scale2 channel (its scale is pinned at the prior).
+    scale2_calib_[slot] = scale_calib;
     return Status::Ok;
 }
 
@@ -678,6 +737,31 @@ void Phase2Calibrator::reset_lever(SourceId id) {
     xyz_[3 * s + 0].reset();
     xyz_[3 * s + 1].reset();
     xyz_[3 * s + 2].reset();
+    // Joint state (Slice 17b): the 4×4 rows AND the scale2 votes were running solutions
+    // of the same now-stale rows — clear the full joint state with them. Zeroing/reset on
+    // never-filled state is a no-op, so the off path is unaffected.
+    ata4_[s] = Mat4::Zero();
+    atb4_[s] = Vec4::Zero();
+    scale2_[s].reset();
+}
+
+void Phase2Calibrator::reset_scale2(SourceId id) {
+    if (!configured_) return;
+    const int s = slot_for(id);
+    if (s < 0) return;
+    scale2_[s].reset();
+    // A scale fold moves the prior the rows' t_B were de-scaled by, so the single-κ joint
+    // model cannot keep pre-fold rows (the running κ̂ would blend the two de-scale epochs
+    // and re-vote a residual ≠ 1 forever). Drop the accumulator + row count; the xyz
+    // HISTOGRAMS are kept — their votes came from the scale-immune joint solve and remain
+    // valid lever estimates across the fold (the lever commit is held through the row
+    // refill by commit_gate_reanchor's vote-mass hysteresis). Off path: nothing
+    // accumulated, all no-ops.
+    if (joint_) {
+        ata4_[s] = Mat4::Zero();
+        atb4_[s] = Vec4::Zero();
+        rows_[s] = Scalar(0);
+    }
 }
 
 Status Phase2Calibrator::set_rot3d_basepoint(SourceId id, const Mat3& R_bp) {
@@ -843,24 +927,67 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // R_yp ∘ Rx(roll) composition at the just-recovered per-window roll (the row
         // depends on the rotation; using the per-window roll keeps it consistent).
         const Mat3 R_X = rot3d_row ? Rhat : Mat3(R_yp * roll_about_forward(roll));
-        const Vec3 b   = R_X * t_B - t_A;
-        // Incremental normal equations (fixed 3×3 + 3×1; no growing matrix).
-        ata_[slot].noalias() += RA_minus_I.transpose() * RA_minus_I;
-        atb_[slot]           += RA_minus_I.transpose() * b;
-        rows_[slot]          += Scalar(1);
+        if (joint_) {
+            // --- JOINT 4-unknown row (Slice 17b): J = [(R_A − I) | −(R_X t_B)] ----
+            // rhs −t_A, unknowns [t_X; κ] (κ = 1/s_res; t_B arrives prior-de-scaled,
+            // so the κ prior is 1 — the residual convention). Unlike the 3-unknown
+            // path the rows carry the vote weight w (D5 honored on the LS too: the κ
+            // estimate benefits from the same excitation/confidence weighting).
+            Eigen::Matrix<Scalar, 3, 4> J;
+            J.template block<3, 3>(0, 0) = RA_minus_I;
+            J.col(3) = -(R_X * t_B);
+            const Vec3 rhs = -t_A;
+            ata4_[slot].noalias() += w * (J.transpose() * J);
+            atb4_[slot].noalias() += w * (J.transpose() * rhs);
+            rows_[slot]           += Scalar(1);
 
-        // Vote the RUNNING ridge-regularized solution into the per-channel histograms.
-        // The running solve converges as rows accumulate; the histogram mode then gives a
-        // robust (outlier-window-resistant) committed estimate on top of the LS. Only an
-        // OBSERVABLE axis (enough information in AᵀA) is voted — an unobservable axis (e.g.
-        // z under pure yaw) stays empty -> low translation_confidence (the spine: the
-        // lever arm needs rotation, per-axis).
-        bool obs[3];
-        const Vec3 tx_run = solve_ridge(ata_[slot], atb_[slot], prior_[slot].t,
-                                        kVoteRidgeRel, obs);
-        if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
-        if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
-        if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
+            // Vote the RUNNING ridge solve (centered on [t_prior; 1]): observable lever
+            // axes into the EXISTING xyz channels (unchanged downstream), an observable
+            // κ as s_res = 1/κ̂ into the scale2 histogram — the reference / a
+            // scale_calib==false source is excluded, mirroring Phase-1's scale vote.
+            bool obs4[4];
+            Vec4 u_prior;
+            u_prior << prior_[slot].t, Scalar(1);
+            const Vec4 u_run = solve_ridge4(ata4_[slot], atb4_[slot], u_prior,
+                                            kVoteRidgeRel, obs4);
+            if (obs4[0]) xyz_[3 * slot + 0].add(u_run(0), w);
+            if (obs4[1]) xyz_[3 * slot + 1].add(u_run(1), w);
+            if (obs4[2]) xyz_[3 * slot + 2].add(u_run(2), w);
+            if (obs4[3] && scale2_calib_[slot] && id != reference_id_ &&
+                u_run(3) > Scalar(1e-6)) {           // κ̂ ≤ 0 is degenerate: never vote
+                const Scalar s_res = Scalar(1) / u_run(3);
+                // RANGE GUARD (the Phase-1 π-guard analog): a residual outside the
+                // configured scale histogram range is OUTSIDE the calibrated regime —
+                // e.g. the κ sink absorbing wrong-R_X row pollution before the rot3d
+                // gate opens reads s_res ≈ 2 on clean data. Depositing it would CLAMP
+                // into the edge bin, where deterministic garbage looks concentrated,
+                // commits, and IRREVERSIBLY folds into prior_scale (a value, not a
+                // vote — no reset can heal it). Skip the vote instead: the histogram
+                // only ever holds genuine in-regime residual mass.
+                if (s_res > scale2_cfg_.range_min && s_res < scale2_cfg_.range_max) {
+                    scale2_[slot].add(s_res, w);
+                }
+            }
+        } else {
+            const Vec3 b = R_X * t_B - t_A;
+            // Incremental normal equations (fixed 3×3 + 3×1; no growing matrix).
+            ata_[slot].noalias() += RA_minus_I.transpose() * RA_minus_I;
+            atb_[slot]           += RA_minus_I.transpose() * b;
+            rows_[slot]          += Scalar(1);
+
+            // Vote the RUNNING ridge-regularized solution into the per-channel histograms.
+            // The running solve converges as rows accumulate; the histogram mode then gives
+            // a robust (outlier-window-resistant) committed estimate on top of the LS. Only
+            // an OBSERVABLE axis (enough information in AᵀA) is voted — an unobservable
+            // axis (e.g. z under pure yaw) stays empty -> low translation_confidence (the
+            // spine: the lever arm needs rotation, per-axis).
+            bool obs[3];
+            const Vec3 tx_run = solve_ridge(ata_[slot], atb_[slot], prior_[slot].t,
+                                            kVoteRidgeRel, obs);
+            if (obs[0]) xyz_[3 * slot + 0].add(tx_run.x(), w);
+            if (obs[1]) xyz_[3 * slot + 1].add(tx_run.y(), w);
+            if (obs[2]) xyz_[3 * slot + 2].add(tx_run.z(), w);
+        }
 
         any = true;
     }
@@ -877,6 +1004,47 @@ Vec3 Phase2Calibrator::solve_lever_arm(SourceId id, bool* observable) const {
     if (s < 0) return Vec3::Zero();
     const SE3 prior = prior_[s];
     if (rows_[s] < Scalar(1)) return prior.t;        // no rows -> prior
+
+    if (joint_) {
+        // --- JOINT readout (Slice 17b): lever observability on the LEVER SUB-PROBLEM --
+        // κ is ridge-pinned toward its prior (1) when under-informed, then MARGINALIZED:
+        // the kCondMin conditioning guard runs on the 3×3 Schur complement
+        //   S = A_ll − a_lκ a_lκᵀ / (A_κκ + r_κ)
+        // so a dominant κ diagonal (metres² vs the dimensionless lever columns) cannot
+        // mask an observable lever, and a starved κ (A_κκ ≈ 0 ⇒ a_lκ ≈ 0 by Cauchy-
+        // Schwarz; the ridge keeps the division sane) cannot fake one. Planar yaw-only
+        // keeps its z null direction through the marginalization -> prior, as before.
+        const Mat4& A4 = ata4_[s];
+        Scalar max_diag = Scalar(0);
+        for (int c = 0; c < 4; ++c) max_diag = std::max(max_diag, A4(c, c));
+        if (!(max_diag > Scalar(0))) return prior.t;
+        // κ ridge ONLY when κ is under-informed (the per-axis info floor): an informed κ
+        // solves raw (the direct LS is exact on clean data — no ridge bias leaking into
+        // the lever through the κ coupling); a starved κ is ridge-pinned at its prior 1,
+        // which reduces the joint system exactly to the 3-unknown solve.
+        const bool kappa_informed = A4(3, 3) >= kAxisInfoMin * max_diag;
+        const Scalar rk = kappa_informed ? Scalar(0) : kVoteRidgeRel * max_diag;
+        const Scalar akk = A4(3, 3) + rk;
+        const Vec3 alk = A4.template block<3, 1>(0, 3);
+        const Mat3 S = A4.template topLeftCorner<3, 3>() -
+                       (alk * alk.transpose()) / akk;
+        Eigen::SelfAdjointEigenSolver<Mat3> es(S);
+        if (es.info() != Eigen::Success) return prior.t;
+        const Vec3 ev = es.eigenvalues();            // ascending
+        const Scalar lo = ev(0), hi = ev(2);
+        if (!(hi > Scalar(0)) || lo < kCondMin * hi) {
+            return prior.t;                          // ill-conditioned / rank-deficient
+        }
+        // Solve the (κ-ridged when starved) 4×4 CENTERED on [t_prior; 1].
+        Mat4 M = A4;
+        M(3, 3) += rk;
+        Vec4 u0;
+        u0 << prior.t, Scalar(1);
+        const Vec4 u = u0 + M.ldlt().solve(atb4_[s] - A4 * u0);
+        if (!u.allFinite()) return prior.t;
+        if (observable) *observable = true;
+        return u.template head<3>();
+    }
 
     const Mat3& AtA = ata_[s];
     // Conditioning guard via the symmetric eigenvalues (AtA is symmetric PSD). If the
@@ -959,6 +1127,34 @@ Scalar Phase2Calibrator::xyz_vote_count(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return Scalar(0);
     return rows_[s];
+}
+
+// --- joint-scale readouts (Slice 17b) ----------------------------------------
+
+Scalar Phase2Calibrator::scale2(SourceId id) const {
+    // Mirror of Phase-1 scale(): 1.0 for the reference / scale_calib==false / unvoted /
+    // unknown / joint path disabled (the residual convention — "no information" reads as
+    // "no residual scale error").
+    if (!configured_ || !joint_) return Scalar(1);
+    if (id == reference_id_) return Scalar(1);
+    const int s = slot_for(id);
+    if (s < 0 || !scale2_calib_[s] || scale2_[s].empty()) return Scalar(1);
+    return scale2_[s].mode();
+}
+
+Scalar Phase2Calibrator::scale2_confidence(SourceId id) const {
+    if (!configured_ || !joint_) return Scalar(0);
+    if (id == reference_id_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0 || !scale2_calib_[s]) return Scalar(0);
+    return scale2_[s].confidence();
+}
+
+Scalar Phase2Calibrator::scale2_vote_count(SourceId id) const {
+    if (!configured_ || !joint_) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return scale2_[s].total();
 }
 
 // --- rot3d readouts (Slice 17) ----------------------------------------------

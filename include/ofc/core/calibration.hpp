@@ -278,6 +278,30 @@ private:
 // Rank-1 motion NEVER votes (channels stay empty, confidence 0, never commits) — planar
 // behavior unchanged; no partial-subspace voting (covered by Phase 1 + roll).
 //
+// JOINT LEVER + SCALE (Slice 17b, opt-in via Config::joint_lever_scale) — the 4-unknown
+// hand-eye translation LS. With the OBSERVED (prior-de-scaled) t_B = s_res·t_true the
+// translation identity becomes LINEAR in u = [t_X; κ], κ = 1/s_res:
+//     (R_A − I)·t_X − κ·(R_X t_B) = −t_A          (row block J = [(R_A − I) | −(R_X t_B)])
+// accumulated into fixed 4×4/4×1 normal equations exactly where the 3-unknown rows
+// accumulate today (same turn gate, same kRotRowMin guard, same R_X source — the running
+// Kabsch R̂ when the rot3d gate is open, else R_yp ∘ Rx(roll)). The production 3-unknown
+// solve is the κ≡1 special case; an unmodeled residual scale lands as a lever error along
+// the dominant motion axis (Slice-17 finding: scale 1.08 → lever x off 3.5 cm). The
+// running vote solve is ridge-regularized CENTERED ON [t_prior; 1] (κ prior = 1: the
+// residual convention — matching Phase-1's scale()); per-axis info gating extends to the
+// κ diagonal, with the LEVER axes judged against the lever sub-block's largest diagonal
+// and κ against the full matrix's (mixed units: the κ column carries metres, the lever
+// columns are dimensionless — a dominant κ diagonal must not mask an observable lever,
+// and a starved κ — near-zero translation — must pin at 1 with scale2 confidence 0).
+// Observable lever axes vote into the EXISTING xyz histograms (unchanged); the κ axis
+// votes s_res = 1/κ̂ into a NEW per-source scale histogram (cfg.scale_hist shape — a
+// residual ratio clustering at 1), read out via scale2()/scale2_confidence()/
+// scale2_vote_count() (1/0/0 for the reference / a scale_calib==false source / unvoted —
+// mirroring Phase-1's scale readouts). Unlike the 3-unknown path, the joint rows carry
+// the per-source vote weight w (the κ estimate benefits from the same excitation/
+// confidence weighting as its histogram votes). Default OFF keeps the 3-unknown path
+// BYTE-IDENTICAL (separate accumulators; the off path is untouched code).
+//
 // xyz (3 linear DOF given rotation). Stack the translation row-block over accepted
 // (turning) windows and solve LEAST-SQUARES for t_X:
 //      Stack  (R_A − I) t_X = (R_X t_B − t_A)  =>  normal equations  AᵀA t_X = Aᵀb,
@@ -341,9 +365,12 @@ public:
 
     // Register the per-source PRIOR extrinsic (sensor->base) — used by
     // PairwisePinnedRef as the pinned-reference gauge, and as the translation fallback
-    // for an unvoted source. Call once per source after configure(). Returns OutOfRange
-    // if id is out of range, CapacityExceeded at cap.
-    Status set_prior(SourceId id, const SE3& prior_extrinsic);
+    // for an unvoted source. `scale_calib` (Slice 17b) mirrors Phase-1's: a source with
+    // scale_calib == false never votes/reads the joint-scale (scale2) channel (its scale
+    // is pinned at the prior); it defaults true, so every pre-17b caller is unchanged.
+    // Call once per source after configure(). Returns OutOfRange if id is out of range,
+    // CapacityExceeded at cap.
+    Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true);
 
     // --- Re-anchor API (Slice 8 feedback loop) -------------------------------
     // RE-ANCHOR the lever-arm prior + the PairwisePinnedRef gauge to a NEW committed
@@ -363,7 +390,20 @@ public:
     // (keeps roll + prior). Used on a lever-arm / extrinsic commit+re-anchor: the LS rows
     // were accumulated against the OLD base/extrinsic frame, so they are stale — drop them
     // and re-accumulate around the new basepoint. lever_arm() falls back to prior_.t.
+    // With joint_lever_scale (Slice 17b) this clears the FULL joint state: the 4×4/4×1
+    // accumulators AND the scale2 histogram (the κ votes were running solutions of the
+    // same stale rows).
     void reset_lever(SourceId id);
+    // Drop the joint-scale (scale2) histogram votes AND the joint 4×4/4×1 accumulator +
+    // row count for `id`, KEEPING the xyz histograms (Slice 17b). Used on a SCALE
+    // commit+re-anchor (either scale path's fold into prior_scale): the accumulated rows'
+    // t_B were de-scaled by the OLD prior_scale, so the single-κ joint model cannot mix
+    // pre-/post-fold rows (the running κ̂ would blend the two de-scale epochs and re-vote
+    // a residual ≠ 1 forever); the xyz votes are KEPT because the joint solve they were
+    // read from is scale-immune — they remain valid lever estimates across the fold.
+    // The post-reset scale2() falls back to 1 until new votes land. No-op when the joint
+    // path is disabled (nothing accumulated).
+    void reset_scale2(SourceId id);
     // RE-ANCHOR the rot3d so(3) basepoint to a NEW committed rotation (Slice 17). The rot3d
     // votes are δφ = log(R̂·R_bpᵀ), so moving the basepoint onto a freshly-committed rot3d
     // makes the residual re-vote ≈ 0 around it (the contractive iterate, mirroring Phase-1's
@@ -439,6 +479,19 @@ public:
     // Diagnostics / observability self-tests; rank-1 (planar) motion never clears it.
     bool   rot3d_observable(SourceId id) const;
 
+    // --- joint-scale readouts (Slice 17b; meaningful only when cfg.joint_lever_scale) --
+    // Turn-regime per-source residual scale s_res = 1/κ̂ (the scale2 histogram mode) —
+    // the SAME residual-vs-prior convention as Phase-1's scale() (t_B arrives prior-de-
+    // scaled, so a converged calibration re-votes ≈ 1). Returns 1.0 for the reference /
+    // a scale_calib==false source / an unvoted source / when the joint path is disabled.
+    Scalar scale2(SourceId id) const;
+    // scale2 histogram concentration in [0,1]. 0 for the reference / scale_calib==false /
+    // unvoted / unknown / joint path disabled — in particular a κ starved of information
+    // (negligible translation) never votes, so its confidence stays 0 (the per-DOF spine).
+    Scalar scale2_confidence(SourceId id) const;
+    // Total scale2 vote mass (the N_min driver; 0 if none).
+    Scalar scale2_vote_count(SourceId id) const;
+
     // Roll-histogram concentration in [0,1] — the roll (extrinsic) confidence. 0 unvoted.
     Scalar extrinsic_confidence(SourceId id) const;
     // Translation confidence: MIN of the 3 xyz-channel concentrations in [0,1]. The
@@ -456,9 +509,19 @@ public:
     // the conditioning guard. Returns the prior translation if ill-conditioned / no rows.
     // `observable` (out) flags whether the solve was well-conditioned. Diagnostics path
     // (the histogram mode is the committed estimate); also used by lever_arm()'s seeding.
+    // JOINT MODE (Slice 17b): the solve reads the 4×4 joint system, but LEVER observability
+    // is judged on the LEVER SUB-PROBLEM — the kCondMin eigenvalue-ratio guard runs on the
+    // κ-marginalized 3×3 Schur complement (with κ ridge-pinned toward its prior 1 when
+    // under-informed), so a dominant/starved κ diagonal can neither mask nor fake lever
+    // conditioning (planar yaw-only still reports the prior: the z null direction survives
+    // the marginalization). When the guard passes, the κ-ridged 4×4 is solved centered on
+    // [t_prior; 1] and the lever components returned.
     Vec3 solve_lever_arm(SourceId id, bool* observable = nullptr) const;
 
 private:
+    // Fixed-size joint-system types (Slice 17b; strict core — Eigen fixed 4×4/4×1).
+    using Mat4 = Eigen::Matrix<Scalar, 4, 4>;
+    using Vec4 = Eigen::Matrix<Scalar, 4, 1>;
     int slot_for(SourceId id) const;
     int ensure_slot(SourceId id);
 
@@ -471,6 +534,15 @@ private:
     // information (AᵀA(c,c) ≥ kAxisInfoMin × max diagonal). Heap-free.
     static Vec3 solve_ridge(const Mat3& AtA, const Vec3& Atb, const Vec3& t_prior,
                             Scalar ridge, bool obs[3]);
+    // Joint-system analogue (Slice 17b): ridge-regularized solve of the 4×4 normal
+    // equations CENTERED on u_prior = [t_prior; 1]. Per-axis info flags `obs[4]`: the 3
+    // LEVER axes are judged against the LEVER sub-block's largest diagonal (so a dominant
+    // κ diagonal — metres² vs the dimensionless lever columns — cannot mask an observable
+    // lever axis), κ against the FULL matrix's largest diagonal (so a starved κ — near-
+    // zero translation — pins at its prior 1, never voted). The ridge is likewise
+    // per-block-scaled. Heap-free (fixed 4×4 LDLT).
+    static Vec4 solve_ridge4(const Mat4& AtA, const Vec4& Atb, const Vec4& u_prior,
+                             Scalar ridge, bool obs[4]);
     // Per-vote weight factor honoring vote_weight_ (D5). `omega_norm` is ‖fused_omega‖;
     // `confidence` is the source's Σ-confidence (1 if not supplied). One -> 1; Rotation ->
     // omega_norm (already > turn_omega_min by the gate, so always positive); Confidence ->
@@ -501,10 +573,12 @@ private:
     VoteWeight vote_weight_      = VoteWeight::Combo;
     bool     last_gate_turning_  = false;
     bool     rot3d_enabled_      = false;            // Config::rot3d_enabled (Slice 17)
+    bool     joint_              = false;            // Config::joint_lever_scale (Slice 17b)
     Scalar   rot3d_gamma_        = Scalar(0.999);    // Mw/BBw per-window decay (so3 gamma)
     HistogramConfig roll_cfg_{};
     HistogramConfig xyz_cfg_{};
     HistogramConfig rot3d_cfg_{};                    // = cfg.so3_hist (Slice 17)
+    HistogramConfig scale2_cfg_{};                   // = cfg.scale_hist (Slice 17b)
 
     // Per-source state. roll_[slot] is the circular roll histogram; xyz_[3*slot + c] is
     // channel c (0=x,1=y,2=z) of the lever-arm histogram. prior_[slot] is the full SE3
@@ -529,6 +603,16 @@ private:
     Mat3        mw_[kMaxSources];
     Mat3        bbw_[kMaxSources];
     Mat3        rot3d_bp_[kMaxSources];
+
+    // Joint lever+scale state (Slice 17b, only touched when joint_). ata4_/atb4_ are the
+    // 4×4/4×1 joint normal-equation accumulators (unknowns [t_X; κ] — the legacy ata_/atb_
+    // stay untouched for the byte-identical off path); scale2_[slot] is the per-source
+    // residual-scale histogram (s_res = 1/κ̂ votes, cfg.scale_hist shape);
+    // scale2_calib_[slot] mirrors Phase-1's scale_calib gate.
+    Histogram1D scale2_[kMaxSources];
+    Mat4        ata4_[kMaxSources];
+    Vec4        atb4_[kMaxSources];
+    bool        scale2_calib_[kMaxSources] = {};
 };
 
 } // namespace ofc

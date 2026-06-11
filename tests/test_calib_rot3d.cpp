@@ -618,7 +618,7 @@ TEST_CASE("rot3d estimator: commits on turn-only multi-axis motion, converges fr
             const SE3 Xp = pr.get_se3();
             (void)pr.get_f64();      // prior_scale
             (void)pr.get_f64();      // time_offset
-            for (int b = 0; b < 6; ++b) (void)pr.get_bool();   // 5 + rot3d commit flags
+            for (int b = 0; b < 7; ++b) (void)pr.get_bool();   // 5 + rot3d + scale2 (17b) flags
             (void)pr.get_f64(); (void)pr.get_f64(); (void)pr.get_f64();   // EMA triple
             (void)pr.get_i32();      // resid_n
             if (rid == 3) {
@@ -1144,8 +1144,10 @@ TEST_CASE("rot3d persistence guards: config-hash flip rejects; format v1 rejects
     // (b) FORMAT v1 REJECT: a blob stamped with the OLD format version (1) must reject
     // with VersionMismatch (version is checked BEFORE the checksum — the documented
     // order), exactly the "old blobs reject -> cold start" contract of the v2 bump.
+    // (Slice 17b bumped the live format to v3 — pinned in test_calib_joint_lever_scale —
+    // so the pin here is "past v1", keeping this test's v1-reject contract intact.)
     {
-        REQUIRE(persist::kFormatVersion == 2u);          // this slice's bump (pin it)
+        REQUIRE(persist::kFormatVersion > 1u);           // past this slice's bump
         unsigned char old_blob[4096];
         for (int i = 0; i < wr.value(); ++i) old_blob[i] = blob[i];
         old_blob[4] = 1u;                                 // version word (LE) -> 1

@@ -156,6 +156,18 @@ struct Config {
     // rank gate never opens, so behavior is unchanged. Default OFF = byte-identical (sim +
     // every existing config); in the persistence config-hash (a flip rejects stale restores).
     bool        rot3d_enabled     = false;
+    // Turn-regime JOINT lever + scale via the 4-unknown hand-eye LS (Slice 17b). When
+    // enabled, Phase 2's lever rows become J = [(R_A − I) | −(R_X t_B)] with rhs −t_A and
+    // unknowns [t_X; κ] (κ = 1/s_res, the residual-scale inverse — t_B arrives already
+    // prior-de-scaled, so the κ prior is 1). Observable lever axes vote into the existing
+    // xyz histograms; the κ axis votes s_res = 1/κ̂ into a per-source Phase-2 scale
+    // histogram (configured from scale_hist), giving a SECOND, turn-regime scale estimator
+    // (scale2) that commits/folds into prior_scale alongside Phase-1's straight-regime
+    // path. Recovers scale on rigs with no straight regime (drones) and immunizes the
+    // lever solve against an unrecovered scale. Default OFF = byte-identical 3-unknown
+    // lever numerics (this changes lever numbers even without scale activity, so it cannot
+    // ride an existing knob); in the persistence config-hash (a flip rejects stale restores).
+    bool        joint_lever_scale = false;
 
     // Histograms (per quantity)
     HistogramConfig so3_hist;

@@ -18,6 +18,7 @@
 //   cold_start (reference_only|median_from_start), commit_concentration, commit_min_votes,
 //   commit_drop, straight_omega_max, straight_trans_min, turn_omega_min, timesync_enabled,
 //   rot3d_enabled (bool — turn-regime FULL rotation extrinsic, Slice 17; default off),
+//   joint_lever_scale (bool — turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off),
 //   subbin_centroid (bool -> all five calibration histograms' HistogramConfig::subbin_centroid),
 //   adaptive_q (bool), q_scale (f), q_floor (1 number -> all 6 axes, or 6 numbers [trans;rot]).
 // SUPPORTED PER-SENSOR KEYS ([sensor.N]):

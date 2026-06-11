@@ -43,6 +43,14 @@ public:
     // carries the rot3d rotation when committed.)
     bool rot3d_committed(SourceId id) const;
 
+    // Diagnostic readout (Slice 17b): whether the source's turn-regime JOINT scale
+    // (the κ axis of the 4-unknown lever+scale hand-eye LS, voted as s_res = 1/κ̂) is
+    // currently committed — i.e. its residual has been folded into prior_scale by the
+    // rising-edge re-anchor and the latch is holding. Always false when
+    // Config::joint_lever_scale is off / id unknown. (Facade accessor like
+    // rot3d_committed; the snapshot's scale_committed OR-s this flag in.)
+    bool scale2_committed(SourceId id) const;
+
     // Warm-restart persistence (D23): serialize/deserialize into a fixed buffer.
     // File I/O + double-buffering live in an adapter.
     Expected<int> serialize(unsigned char* buf, int cap) const;  // bytes written
