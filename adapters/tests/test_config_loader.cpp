@@ -433,3 +433,71 @@ TEST_CASE("ConfigLoader: multi_bias_enabled + per-sensor bias_states/bias_proces
               == Status::OutOfRange);
     }
 }
+
+TEST_CASE("ConfigLoader: per-DOF bias_process_noise (1 or 6 numbers) + multi_bias_cov0 "
+          "(Slice 18 review/B2)") {
+    // SIX numbers -> per-DOF rates ([v; omega] order); needs multi_bias_enabled when the
+    // vector is non-uniform on a bias source (Option A is uniform-only).
+    const std::string per_dof =
+        "[global]\n"
+        "max_sources = 1\n"
+        "reference_sensor_id = 0\n"
+        "multi_bias_enabled = true\n"
+        "multi_bias_cov0 = 0.09\n"
+        "[sensor.0]\n"
+        "id = 0\n"
+        "is_reference = true\n"
+        "bias_states = true\n"
+        "bias_process_noise = 0 0 0 0 0 1e-5\n";   // pin all but the yaw-rate DOF
+    {
+        ConfigLoader loader;
+        REQUIRE(loader.parse(per_dof) == Status::Ok);
+        const Config& c = loader.config();
+        CHECK(c.multi_bias_cov0 == doctest::Approx(0.09));
+        REQUIRE(c.sensor_count == 1);
+        for (int d = 0; d < 5; ++d) CHECK(c.sensors[0].bias_process_noise[d] == 0.0);
+        CHECK(c.sensors[0].bias_process_noise[5] == doctest::Approx(1e-5));
+        CHECK_FALSE(c.sensors[0].bias_process_noise.uniform());
+    }
+
+    // ONE number still means uniform (the legacy form).
+    {
+        ConfigLoader loader;
+        REQUIRE(loader.parse("[sensor.0]\nid = 0\nbias_process_noise = 2e-5\n")
+                == Status::Ok);
+        for (int d = 0; d < 6; ++d) {
+            CHECK(loader.config().sensors[0].bias_process_noise[d]
+                  == doctest::Approx(2e-5));
+        }
+        CHECK(loader.config().sensors[0].bias_process_noise.uniform());
+    }
+
+    // Wrong arity rejects with a line diagnostic.
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid = 0\nbias_process_noise = 1e-5 1e-5\n")
+              == Status::InvalidConfig);
+        CHECK(loader.error().find("expected 1 or 6 numbers") != std::string::npos);
+    }
+
+    // A NON-UNIFORM vector on an Option-A (multi_bias_enabled off) bias source parses but
+    // fails the core validate() — the per-DOF form (incl. pinning) is an Option-B feature.
+    {
+        std::string off_text = per_dof;
+        const std::string flag_line = "multi_bias_enabled = true\n";
+        off_text.replace(off_text.find(flag_line), flag_line.size(), "");
+        ConfigLoader loader;
+        CHECK(loader.parse(off_text) == Status::InvalidConfig);
+    }
+
+    // multi_bias_cov0 must be positive (validate(): OutOfRange) and numeric (parse).
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nmulti_bias_cov0 = 0\n") == Status::OutOfRange);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nmulti_bias_cov0 = junk\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("expected number") != std::string::npos);
+    }
+}

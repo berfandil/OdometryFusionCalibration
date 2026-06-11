@@ -77,9 +77,11 @@ void Eskf::init(const SE3& pose0, const Mat12& cov0) {
     bias_prior_trace_ = Scalar(0);
     // Generalized multi-bias mode OFF on init (Slice 18).
     mb_count_         = 0;
-    for (int j = 0; j < kMaxBiasSources; ++j) mb_bias_[j] = Vec6::Zero();
+    for (int j = 0; j < kMaxBiasSources; ++j) {
+        mb_bias_[j]        = Vec6::Zero();
+        mb_prior_trace_[j] = Scalar(0);
+    }
     cov36_            = Mat36::Zero();
-    mb_prior_trace_   = Scalar(0);
 }
 
 void Eskf::enable_bias(Scalar bias_cov0) {
@@ -459,8 +461,13 @@ void Eskf::median_influence(const SE3& med, const SE3* A, const Scalar* w, int n
     // invalid. The documented limit: the coincident vertex set splits the identity by weight
     // (a single weight-dominant vertex -> Omega = I) and every non-coincident Omega_j -> 0.
     const Scalar eps_v = (eps > Scalar(0)) ? eps : Scalar(0);
-    Scalar d[/*n<=*/32];                 // bounded by the estimator's source cap
-    const int nc = (n < 32) ? n : 32;    // defensive clamp (callers never exceed the cap)
+    // Capacity = the shared kMaxMedianInputs (== the estimator's source cap; review MINOR —
+    // was a hard-coded 32 invisible to the estimator). Defensive clamp for n beyond the cap
+    // PLUS a zero-fill of the tail so an over-cap caller can never read uninitialized
+    // Omega blocks into F (garbage covariance); callers never exceed the cap today.
+    Scalar d[kMaxMedianInputs];
+    const int nc = (n < kMaxMedianInputs) ? n : kMaxMedianInputs;
+    for (int i = nc; i < n; ++i) Omega[i] = Mat6::Zero();
     Scalar coincident_w = Scalar(0);
     int    coincident_n = 0;
     for (int i = 0; i < nc; ++i) {
@@ -487,7 +494,7 @@ void Eskf::median_influence(const SE3& med, const SE3* A, const Scalar* w, int n
     Mat6 W = Mat6::Identity();
     W.topLeftCorner(3, 3) *= lambda;
     Mat6 M = Mat6::Zero();
-    Mat6 uP[32];
+    Mat6 uP[kMaxMedianInputs];
     const Mat3 RmT = med.R.transpose();
     for (int i = 0; i < nc; ++i) {
         Vec6 xi;
@@ -518,22 +525,33 @@ Mat6 Eskf::bias_coupling(const SE3& med, const SE3& A_i, const Mat6& Omega_i,
     return Tg * Omega_i * Ta * (-dt * se3::adjoint(X_i));
 }
 
-void Eskf::enable_multi_bias(int k, Scalar bias_cov0) {
+void Eskf::enable_multi_bias(int k, Scalar bias_cov0, const Vec6* bias_pn) {
     // Switch into the generalized augmented mode at the CURRENT 12-DOF state (mirrors
     // enable_bias()). All biases start at zero; the active covariance copies the live
     // pose+twist 12x12, seeds each bias block to bias_cov0*I6, zeroes every cross-block and
-    // all padding (the padding stays zero forever by construction).
+    // all padding (the padding stays zero forever by construction). PER-DOF PINNING (Slice
+    // 18 review/B2): a DOF whose bias_pn rate is NOT > 0 is seeded with ZERO prior variance
+    // — combined with predict_multi's zero walk + zeroed coupling column its P row/col stay
+    // exactly zero, so the gain never moves it: the bias DOF is pinned at 0 by construction.
     mb_count_ = (k < 1) ? 1 : ((k > kMaxBiasSources) ? kMaxBiasSources : k);
     bias_active_ = false;                 // the two augmented modes are mutually exclusive
-    for (int j = 0; j < kMaxBiasSources; ++j) mb_bias_[j] = Vec6::Zero();
+    for (int j = 0; j < kMaxBiasSources; ++j) {
+        mb_bias_[j]        = Vec6::Zero();
+        mb_prior_trace_[j] = Scalar(0);
+    }
     cov36_ = Mat36::Zero();
     cov36_.block<12, 12>(0, 0) = state_.cov;
     const Scalar bc = (bias_cov0 > Scalar(0)) ? bias_cov0 : Scalar(1e-6);
     for (int j = 0; j < mb_count_; ++j) {
-        cov36_.block<6, 6>(12 + 6 * j, 12 + 6 * j) = bc * Mat6::Identity();
+        for (int d = 0; d < 6; ++d) {
+            const bool pinned = (bias_pn != nullptr) && !(bias_pn[j](d) > Scalar(0));
+            if (!pinned) {
+                cov36_(12 + 6 * j + d, 12 + 6 * j + d) = bc;
+                mb_prior_trace_[j] += bc;     // unpinned DOFs only (for confidence)
+            }
+        }
     }
     cov36_ = Scalar(0.5) * (cov36_ + cov36_.transpose());
-    mb_prior_trace_ = Scalar(6) * bc;     // per-bias-block prior trace (for confidence)
 }
 
 Vec6 Eskf::multi_bias(int j) const {
@@ -542,14 +560,19 @@ Vec6 Eskf::multi_bias(int j) const {
 }
 
 Scalar Eskf::multi_bias_confidence(int j) const {
-    if (j < 0 || j >= mb_count_ || !(mb_prior_trace_ > Scalar(0))) return Scalar(0);
+    // Per-source prior trace (B2: counts only the unpinned DOFs; a fully-pinned source has
+    // no estimable bias subspace -> confidence 0). NOTE (review MINOR): this measures
+    // VARIANCE REDUCTION of the bias block below its prior — it is blind to misattribution
+    // ACROSS sources (a co-source absorbing part of a planted bias still reads "determined"),
+    // so it is an observability signal, not an attribution-correctness one.
+    if (j < 0 || j >= mb_count_ || !(mb_prior_trace_[j] > Scalar(0))) return Scalar(0);
     const Scalar cur = cov36_.block<6, 6>(12 + 6 * j, 12 + 6 * j).trace();
-    const Scalar reduced = Scalar(1) - cur / mb_prior_trace_;
+    const Scalar reduced = Scalar(1) - cur / mb_prior_trace_[j];
     return std::max(Scalar(0), std::min(Scalar(1), reduced));
 }
 
 void Eskf::predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
-                         const Mat6* J_bias, const Scalar* bias_pn) {
+                         const Mat6* J_bias, const Vec6* bias_pn) {
     if (mb_count_ <= 0) { predict(delta, dt, q_pose); return; }   // defensive routing
     const Scalar dt_eff = (dt > kMinDt) ? dt : kMinDt;
 
@@ -561,6 +584,10 @@ void Eskf::predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
     // bias means unchanged (random walk; only an update moves them).
 
     // --- covariance propagation: P <- F P F^T + Q (active 12+6k of 36) ------
+    // NOTE (strict-core/embedded posture): F/Q/Pn here (and IKH in update_multi) are
+    // fixed-size Mat36 STACK locals (~10 KB apiece, ~30-50 KB peak frame) — heap-free per
+    // the no-heap rule, but sized for desktop stacks; an embedded port should budget or
+    // hoist them.
     const Mat6 Ad_inv = se3::adjoint(se3::inverse(delta));
 
     Mat36 F = Mat36::Zero();
@@ -577,9 +604,18 @@ void Eskf::predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
     Q.block<6, 6>(0, 0) = q_pose;
     Q.block<6, 6>(6, 6) = q_pose / (dt_eff * dt_eff);
     for (int j = 0; j < mb_count_; ++j) {
-        const Scalar pn = (bias_pn != nullptr && bias_pn[j] > Scalar(0)) ? bias_pn[j]
-                                                                         : Scalar(0);
-        Q.block<6, 6>(12 + 6 * j, 12 + 6 * j) = (pn * dt_eff) * Mat6::Identity();
+        for (int d = 0; d < 6; ++d) {
+            const Scalar pn = (bias_pn != nullptr && bias_pn[j](d) > Scalar(0))
+                                  ? bias_pn[j](d) : Scalar(0);
+            // Per-DOF walk (B2). A PINNED DOF (rate not > 0 — see enable_multi_bias) gets
+            // zero walk AND its coupling column zeroed, so it never couples into the pose
+            // nor accrues cross-covariance: with its zero prior variance it stays exactly
+            // 0/0-variance forever (Option B's pinning contract; Option A is untouched).
+            Q(12 + 6 * j + d, 12 + 6 * j + d) = pn * dt_eff;
+            if (bias_pn != nullptr && !(bias_pn[j](d) > Scalar(0))) {
+                F.block<6, 1>(0, 12 + 6 * j + d).setZero();
+            }
+        }
     }
 
     const Mat36 Pn = F * cov36_ * F.transpose() + Q;

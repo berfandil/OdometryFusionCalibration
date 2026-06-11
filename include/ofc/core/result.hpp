@@ -66,8 +66,16 @@ struct CalibSnapshot {
     Scalar   extrinsic_confidence = 0.0; // rotation (yaw/pitch ∧ roll) concentration in [0,1]
     Scalar   scale_confidence     = 0.0; // scale concentration in [0,1]
     Scalar   translation_confidence = 0.0; // xyz lever-arm concentration in [0,1] (Slice 7)
-    Vec6     bias = Vec6::Zero();       // body-twist bias [v;omega] (Slice 11b; 0 unless bias src)
-    Scalar   bias_observable = 0.0;     // bias observability confidence: 1 - P_bias/P_bias_prior, in [0,1] (Slice 11b)
+    // Body-twist bias [v;omega] (Slice 11b; 0 unless a bias source). FRAME NOTE (Slice-18
+    // review): the published vector's FRAME depends on Config::multi_bias_enabled — Option
+    // A (off) learns a bias of the frame-ALIGNED delta (base-frame axes; de-bias after the
+    // align), Option B (on) learns a SOURCE-FRAME bias (de-bias before the align).
+    Vec6     bias = Vec6::Zero();
+    // Bias observability confidence: 1 - P_bias/P_bias_prior, in [0,1] (Slice 11b). This
+    // measures VARIANCE REDUCTION below the prior — NOT attribution correctness (it is
+    // blind to a co-source absorbing part of another source's bias; see
+    // Eskf::multi_bias_confidence).
+    Scalar   bias_observable = 0.0;
     bool     committed     = false;     // TIME-OFFSET commit (Slice 5)
     bool     extrinsic_committed     = false; // rotation commit: yaw/pitch OR rot3d (Slice 8/17)
     bool     scale_committed         = false; // scale commit (Slice 8)

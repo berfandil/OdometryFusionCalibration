@@ -58,6 +58,10 @@ namespace ofc {
 namespace {
 constexpr Scalar kNanosPerSec = Scalar(1e9);
 constexpr int    kMaxSourcesCap = 32;   // matches Result::calib/health array sizes
+// The median-influence capacity must cover every possible median participant set (review
+// MINOR: the two caps used to be duplicated literals that could silently diverge).
+static_assert(kMaxSourcesCap <= Eskf::kMaxMedianInputs,
+              "kMaxSourcesCap must not exceed Eskf::kMaxMedianInputs");
 // Absolute-reference corrections cap (Slice 11, D22). Fixed-capacity registry (strict
 // core: no post-init heap, bounded loops). 8 is generous for the GPS/INS/map-match
 // plugin count a single rig carries; past it add_correction returns CapacityExceeded.
@@ -194,6 +198,9 @@ std::uint64_t config_hash(const Config& cfg) {
     // bias_states flags MEAN -> calibration-shaping, hashed. Flipping it rejects a
     // cross-flag restore.
     w.put_bool(cfg.multi_bias_enabled);
+    // Slice 18 review/B2: the multi-bias prior seeds the learned-bias state a restore
+    // carries -> calibration-shaping, hashed.
+    w.put_f64(cfg.multi_bias_cov0);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -224,7 +231,9 @@ std::uint64_t config_hash(const Config& cfg) {
             w.put_f64(sc.modeled_noise_per_m);
             w.put_f64(sc.modeled_noise_per_rad);
             w.put_f64(sc.kf_process_noise);
-            w.put_f64(sc.bias_process_noise);
+            // Per-DOF since B2 (all 6 rates shape the bias states a restore carries —
+            // including which DOFs are pinned).
+            for (int d = 0; d < 6; ++d) w.put_f64(sc.bias_process_noise[d]);
             w.put_bool(sc.native_confidence);
             w.put_bool(sc.per_sensor_kf);
             w.put_bool(sc.scale_calib);
@@ -477,26 +486,10 @@ struct Estimator::Impl {
     // prior). Sized so the bias is observable but does not dominate; a fixed sensible default
     // keeps Option A knob-light (only bias_process_noise is exposed in Config).
     static constexpr Scalar kBiasCov0 = Scalar(1.0);
-    // Multi-bias prior (Slice 18): sigma ~ 0.32 m/s / rad/s — DELIBERATELY between Option
-    // A's uninformative 1.0 and a tight informative prior, chosen empirically against the
-    // separation sim. Both extremes fail concretely:
-    //   * 1.0 (Option-A parity): the per-window coupling linearizes a heavily NONLINEAR
-    //     median response (radial projectors fluctuate window to window), so the large prior
-    //     gain injects spurious corrections along the weakly-observable bias DIFFERENCES —
-    //     co-source biases blow up to ~0.5 garbage while the planted one overshoots.
-    //   * 0.01: the prior is INFORMATIVE against any real bias — the estimate is shrunk by
-    //     exactly the unresolved-variance fraction (the separation sim measured
-    //     recovered/planted == bias_observable to two digits), so the de-bias plateaus at
-    //     ~60% of the planted value over minutes of GPS.
-    // 0.04 (sigma = 0.2 m/s / rad/s) keeps every bias estimate INSIDE the coupling's
-    // linearization radius (the per-window bias displacement sigma*dt must stay below the
-    // window noise scale d_i, or the EKF's first-order median influence systematically
-    // mis-models the response and the junk self-sustains) while letting the observable
-    // combinations resolve >90% within a realistic GPS-rich learn phase. Pair with a SMALL
-    // per-sensor bias_process_noise (near-constant bias: 1e-6..1e-5); a fast walk (1e-3)
-    // re-inflates the weakly-observable subspace every step and the estimates wander at the
-    // prior scale instead of separating.
-    static constexpr Scalar kMultiBiasCov0 = Scalar(0.04);
+    // The multi-bias prior is Config::multi_bias_cov0 (Slice-18 review MAJOR-3: promoted
+    // from a compile-time constant here to a knob — it is a RIG-DEPENDENT stability
+    // parameter; the full 1.0-vs-0.01 failure-mode rationale lives at the knob in
+    // config.hpp and is pinned by the prior-sweep case in tests/test_multi_bias_sim.cpp).
 
     // ---- Median-coupled multi-source bias states (Slice 18, 11b Option B) -------------------
     // Active when cfg.multi_bias_enabled AND >= 1 registered source has bias_states. Each such
@@ -510,7 +503,8 @@ struct Estimator::Impl {
     // with the Option-A path: when multi_bias_enabled, bias_slot stays -1 (Option A inert).
     int    mb_count = 0;                            // registered bias sources (<= cap)
     int    mb_slot[Eskf::kMaxBiasSources];          // registered slot per bias index
-    Scalar mb_pn[Eskf::kMaxBiasSources];            // per-bias random-walk process noise
+    Vec6   mb_pn[Eskf::kMaxBiasSources];            // per-bias PER-DOF walk rates (B2; a
+                                                    // rate not > 0 PINS that bias DOF at 0)
     int    slot_mb[kMaxSourcesCap];                 // registered slot -> bias index (or -1)
     // Per-step scratch (no heap in step()): per-median-entry influence + per-bias coupling.
     Mat6   mb_omega[kMaxSourcesCap];
@@ -880,7 +874,7 @@ Status Estimator::init(const Config& cfg) {
     impl_->mb_count = 0;
     for (int j = 0; j < Eskf::kMaxBiasSources; ++j) {
         impl_->mb_slot[j] = -1;
-        impl_->mb_pn[j]   = Scalar(0);
+        impl_->mb_pn[j]   = Vec6::Zero();
         impl_->mb_J[j]    = Mat6::Zero();
     }
     for (int i = 0; i < kMaxSourcesCap; ++i) {
@@ -1014,16 +1008,24 @@ Status Estimator::add_source(const ISource* src) {
             if (impl_->mb_count < Eskf::kMaxBiasSources) {
                 const int j = impl_->mb_count;
                 impl_->mb_slot[j] = slot;
-                impl_->mb_pn[j]   = (sc->bias_process_noise >= Scalar(0))
-                                        ? sc->bias_process_noise : Scalar(0);
+                // Per-DOF walk rates (B2). Negative rates are validate()-rejected; the
+                // defensive clamp keeps an unvalidated caller safe. A rate of EXACTLY 0
+                // PINS that bias DOF at zero (zero prior variance, zero walk, zero
+                // coupling — see Eskf::enable_multi_bias / predict_multi).
+                for (int d = 0; d < 6; ++d) {
+                    impl_->mb_pn[j](d) = (sc->bias_process_noise[d] >= Scalar(0))
+                                             ? sc->bias_process_noise[d] : Scalar(0);
+                }
                 impl_->slot_mb[slot] = j;
                 ++impl_->mb_count;
             }
         } else {
+            // Option A: the uniform scalar rate (validate() rejects a non-uniform vector
+            // on an Option-A bias source, so DOF 0 IS the configured rate).
             impl_->bias_slot          = slot;
             impl_->bias_src_id        = src->id();
-            impl_->bias_process_noise = (sc->bias_process_noise >= Scalar(0))
-                                            ? sc->bias_process_noise : Scalar(0);
+            impl_->bias_process_noise = (sc->bias_process_noise[0] >= Scalar(0))
+                                            ? sc->bias_process_noise[0] : Scalar(0);
         }
     }
     // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
@@ -1581,9 +1583,12 @@ Status Estimator::step(Timestamp now) {
         (s.bias_slot >= 0) && (n == 1) && (s.med_slot[0] == s.bias_slot);
     if (use_multi) {
         // Enable the generalized augmented filter on the first fuse (biases start at zero
-        // with the kBiasCov0 prior — the de-bias site above already read those zeros).
+        // with the cfg.multi_bias_cov0 prior — review MINOR fix: this is the MULTI-bias
+        // prior knob, NOT Option A's kBiasCov0; the de-bias site above already read the
+        // zero biases). mb_pn carries the per-DOF pinning (B2): a rate not > 0 seeds zero
+        // prior variance for that DOF.
         if (!s.eskf.multi_bias_active()) {
-            s.eskf.enable_multi_bias(s.mb_count, Impl::kMultiBiasCov0);
+            s.eskf.enable_multi_bias(s.mb_count, cfg.multi_bias_cov0, s.mb_pn);
         }
         int  mb_med[Eskf::kMaxBiasSources];     // median entry index of bias j, or -1
         bool any_bias_in_median = false;
@@ -2155,13 +2160,26 @@ Status validate(const Config& cfg) {
         int bias_sources = 0;
         for (int i = 0; i < cfg.sensor_count; ++i) {
             if (cfg.sensors[i].bias_states) ++bias_sources;
-            if (cfg.sensors[i].bias_process_noise < 0.0) return Status::OutOfRange;
+            // Per-DOF since B2: each rate must be >= 0.
+            for (int d = 0; d < 6; ++d) {
+                if (cfg.sensors[i].bias_process_noise[d] < 0.0) return Status::OutOfRange;
+            }
+            // Option A supports only the UNIFORM rate (its augmented filter applies one
+            // scalar walk; the per-DOF form — incl. the pn==0 pinning contract — is an
+            // Option-B/multi_bias_enabled feature). Surface the mismatch at init.
+            if (!cfg.multi_bias_enabled && cfg.sensors[i].bias_states &&
+                !cfg.sensors[i].bias_process_noise.uniform()) {
+                return Status::InvalidConfig;
+            }
         }
         if (!cfg.multi_bias_enabled && bias_sources > 1)
             return Status::InvalidConfig;   // Option A: single bias source only
         if (cfg.multi_bias_enabled && bias_sources > Eskf::kMaxBiasSources)
             return Status::InvalidConfig;   // Option B: bounded by the compile-time cap
     }
+    // Multi-bias prior knob (Slice 18 review/B2-MAJOR-3): must be positive — a non-positive
+    // prior variance would make every bias unobservable by construction.
+    if (cfg.multi_bias_cov0 <= 0.0) return Status::OutOfRange;
 
     // Scale histogram range check (D19). The SCALE quantity is a strictly-positive RATIO
     // (bn/ref_mag) whose calibrated value clusters around a UNIT ratio (1.0). A scale_hist

@@ -35,6 +35,36 @@ struct HistogramConfig {
     bool   subbin_centroid = false;
 };
 
+// Per-DOF random-walk process-noise rates for a source's body-twist bias, in the codebase
+// [v; omega] = [trans; rot] order (Slice 18 review/B2). The SCALAR form — one rate for all
+// 6 DOFs — is accepted implicitly (the pre-B2 knob shape; every existing caller/config is
+// unchanged). PINNING CONTRACT (multi_bias_enabled ONLY): a DOF whose rate is EXACTLY 0 is
+// PINNED at zero — zero prior variance, zero walk, coupling column zero — excluded from
+// estimation entirely. This lets a deployment enable e.g. ONLY the yaw-rate bias
+// ("0 0 0 0 0 1e-5", the urban12 wheel −75°/h case) instead of opening 18 weakly-observable
+// junk-sink DOFs. Option A (multi_bias_enabled off) keeps its original semantics — a 0 rate
+// means "constant bias, still estimated under the prior" — and supports only the UNIFORM
+// form (validate() rejects a non-uniform vector on an Option-A bias source). Each rate must
+// be >= 0 (validate enforces per DOF).
+struct BiasProcessNoise {
+    Scalar dof[6];
+    // Implicit scalar -> uniform (back-compat: `bias_process_noise = 1e-5` still compiles
+    // and means the same thing it always did).
+    BiasProcessNoise(Scalar uniform = Scalar(1e-4)) {
+        for (int i = 0; i < 6; ++i) dof[i] = uniform;
+    }
+    Scalar& operator[](int i)       { return dof[i]; }
+    Scalar  operator[](int i) const { return dof[i]; }
+    bool uniform() const {
+        for (int i = 1; i < 6; ++i) { if (dof[i] != dof[0]) return false; }
+        return true;
+    }
+    // Back-compat scalar READ for legacy scalar contexts (comparisons in pre-B2 tests/
+    // adapters): the DOF-0 rate, which IS the uniform value for every scalar-form config.
+    // Per-DOF consumers must use operator[] — do not add scalar arithmetic on this type.
+    operator Scalar() const { return dof[0]; }
+};
+
 struct SensorConfig {
     SourceId id              = 0;
     SE3      prior_extrinsic;            // also the Phase-1 histogram basepoint
@@ -48,12 +78,14 @@ struct SensorConfig {
     Scalar   kf_process_noise = 1.0;
     bool     scale_calib     = true;
     bool     bias_states     = false;   // GPS/INS-style drift removal (D22; Slice 11b)
-    // Random-walk process-noise rate for this source's body-twist bias (Slice 11b, Option A).
-    // Only used when bias_states == true AND this is the single driving source: the augmented
-    // ESKF adds Q_bias = bias_process_noise * dt * I6 to the bias block each predict, letting an
-    // absolute-ref update slowly re-estimate the bias. Larger => the bias tracks faster but is
-    // noisier; >= 0 (validate enforces). Default small (slow constant-bias assumption).
-    Scalar   bias_process_noise = 1e-4;
+    // Random-walk process-noise rate(s) for this source's body-twist bias (Slice 11b Option
+    // A / Slice 18 Option B). Only used when bias_states == true. Option A adds Q_bias =
+    // rate * dt * I6 to the bias block each predict (uniform form only); Option B
+    // (multi_bias_enabled) applies the rate PER DOF — Q_bias = diag(rate) * dt — and a DOF
+    // whose rate is exactly 0 is PINNED at zero (see BiasProcessNoise above). Larger => the
+    // bias tracks faster but is noisier; >= 0 per DOF (validate enforces). Default small
+    // uniform (slow constant-bias assumption).
+    BiasProcessNoise bias_process_noise = BiasProcessNoise(Scalar(1e-4));
     bool     is_reference    = false;   // gauge anchor
 };
 
@@ -225,7 +257,41 @@ struct Config {
     // legacy behavior: the Option-A single-bias path is unchanged and >1 bias_states source
     // still rejects with InvalidConfig at validate(). In the persistence config-hash (a flip
     // rejects stale restores).
+    //
+    // FRAME NOTE (Slice-18 review MINOR): the published CalibSnapshot::bias changes FRAME
+    // with this flag — Option A (off) learns a bias of the frame-ALIGNED delta (de-bias
+    // after the align), Option B (on) learns a SOURCE-FRAME bias (de-bias before the
+    // align; the coupling carries Ad(X_i)). Consumers comparing the vector across modes
+    // must account for the extrinsic rotation.
+    //
+    // RELIABILITY INTERACTION (Slice-18 review MAJOR-4): the Slice-9 variance-EMA
+    // reliability and the bias learning transient FEED BACK on each other — a co-source
+    // whose bias is transiently mis-attributed scatters vs the consensus, gets
+    // down-weighted, loses median influence, and its bias error becomes LESS observable
+    // (it persists longer). The combination is covered by a dedicated acceptance case
+    // (no divergence; the coast still beats the unmodeled baseline) but converges slower
+    // than with reliability disabled; deployments wanting the fastest bias separation can
+    // pin reliability_floor == reliability_cap == 1 during a calibration phase.
     bool   multi_bias_enabled = false;
+    // Bias-prior variance seed per (unpinned) bias DOF for the multi-bias filter — Slice-18
+    // review MAJOR-3 promoted this from a compile-time constant to a knob: it is a
+    // RIG-DEPENDENT stability parameter, not a universal constant. sigma ~ 0.2 m/s / rad/s
+    // by default, deliberately between Option A's uninformative 1.0 and a tight informative
+    // prior; both extremes fail concretely (measured, tests/test_multi_bias_sim.cpp prior
+    // sweep):
+    //   * 1.0 (Option-A parity): the per-window coupling linearizes a heavily NONLINEAR
+    //     median response, so the large prior gain injects spurious corrections along the
+    //     weakly-observable bias DIFFERENCES — co-source biases blow up toward ~prior-scale
+    //     garbage while the planted one overshoots.
+    //   * 0.01: informative against any real bias — the estimate is shrunk by exactly the
+    //     unresolved-variance fraction (recovered/planted tracks bias_observable), so the
+    //     de-bias plateaus well short of the planted value.
+    // The safe scale is set by the coupling's linearization radius: the per-window bias
+    // displacement sigma*dt must stay below the per-window noise scale d_i for the rig
+    // (sensor noise floors, window length, source count) — RE-TUNE for rigs whose noise
+    // floor/cadence differs materially from the sim defaults. > 0 (validate). Hashed
+    // (calibration-shaping: it seeds the learned-bias state a restore carries).
+    Scalar multi_bias_cov0 = 0.04;
 
     // Output
     bool   emit_predicted_tip = true;

@@ -397,6 +397,47 @@ TEST_CASE("slice18 production: Eskf::median_influence/bias_coupling == the FD-pi
     // any re-derivation drift, sign flip, or transport reorder fails loudly).
     CHECK(worst_omega < 1e-9);
     CHECK(worst_J < 1e-9);
+
+    // w_of clamp paths (review NIT): the loop above feeds only strictly-positive weights,
+    // leaving median_influence's defensive clamps untested against the reference (which
+    // does not clamp). Unreachable from the estimator today (its weights are floor-clamped
+    // > 0) but pinned here so the mirror of median.cpp's w_of contract stays honest:
+    //   * a NEGATIVE weight clamps to 0 == the absent-source path (Omega = 0, rest as if
+    //     the weight were 0);
+    //   * an ALL-<=0 weight set falls back to UNIFORM weights.
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(4, 0.1, B, X, bias, w);
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_median(B, X, bias, w, 0.1, mp, &A);
+
+        // Negative weight == zero weight (clamped), other blocks unchanged.
+        std::vector<Scalar> w_neg = w, w_zero = w;
+        w_neg[2]  = -3.0;
+        w_zero[2] = 0.0;
+        Mat6 Om_neg[4], Om_zero[4];
+        Eskf::median_influence(med0, A.data(), w_neg.data(), 4, lambda, mp.eps, Om_neg);
+        Eskf::median_influence(med0, A.data(), w_zero.data(), 4, lambda, mp.eps, Om_zero);
+        Scalar worst_clamp = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            worst_clamp = std::max(worst_clamp, (Om_neg[i] - Om_zero[i]).norm());
+        }
+        CHECK(worst_clamp < 1e-12);
+        CHECK(Om_neg[2].norm() < 1e-12);     // the clamped source is influence-free
+
+        // All-<=0 falls back to uniform (mirrors median.cpp's w_of).
+        std::vector<Scalar> w_bad(4, -1.0), w_unit(4, 1.0);
+        Mat6 Om_bad[4], Om_unit[4];
+        Eskf::median_influence(med0, A.data(), w_bad.data(), 4, lambda, mp.eps, Om_bad);
+        Eskf::median_influence(med0, A.data(), w_unit.data(), 4, lambda, mp.eps, Om_unit);
+        Scalar worst_uniform = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            worst_uniform = std::max(worst_uniform, (Om_bad[i] - Om_unit[i]).norm());
+        }
+        CHECK(worst_uniform < 1e-12);
+    }
 }
 
 // ===========================================================================
@@ -463,6 +504,14 @@ TEST_CASE("slice18 production: influence edge cases — absent, sole, n==2, coin
     //     the limit point, so the test does not depend on the solver's vertex asymptotics).
     //     The influence must not blow up: the coincident set splits I by weight, the
     //     off-vertex source gets 0.
+    //     KNOWN GAP (review MINOR, accepted): the vertex branch (d_i <= eps -> weight-split
+    //     identity) is asserted against its ANALYTIC limit with the vertex pose PASSED IN as
+    //     the median — it is not FD-verified against the solver's converged iterate near a
+    //     weight-dominant vertex (the solver's VZ guard may converge to d_0 slightly ABOVE
+    //     eps and take the smooth branch instead; the near-vertex boundedness pin at d=1e-7
+    //     below partially covers that). Branch-selection consistency between solver and
+    //     influence is therefore an assumption backed by the documented non-smoothness
+    //     caveat (any first-order J degrades gracefully toward I there), not a pin.
     {
         std::vector<SE3> B, X;
         std::vector<Vec6> bias;

@@ -130,6 +130,7 @@ const char* kKnobDoc =
     "  rot3d_enabled=<bool>     (turn-regime FULL rotation extrinsic, Slice 17; default off)\n"
     "  joint_lever_scale=<bool> (turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off)\n"
     "  multi_bias_enabled=<bool> (median-coupled multi-source bias states, Slice 18; default off)\n"
+    "  multi_bias_cov0=<f>      (multi-bias per-DOF prior variance seed, > 0; default 0.04)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
@@ -137,7 +138,9 @@ const char* kKnobDoc =
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
     "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n"
-    "  bias_states=<bool>     bias_process_noise=<f>   (per-source body-twist bias, Slice 11b/18)\n";
+    "  bias_states=<bool>     bias_process_noise=<f | 6 f's [v;omega]>   (per-source body-twist\n"
+    "      bias, Slice 11b/18; 6-number per-DOF form needs multi_bias_enabled — a DOF rate of\n"
+    "      exactly 0 PINS that bias DOF at zero)\n";
 
 } // namespace
 
@@ -288,6 +291,11 @@ Status ConfigLoader::parse(const std::string& text) {
                 // Default off = byte-identical legacy behavior (Option A unchanged).
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.multi_bias_enabled = bv;
+            } else if (key == "multi_bias_cov0") {
+                // Slice 18 review/B2 (MAJOR-3): the per-DOF multi-bias prior variance seed
+                // (> 0; validate()). Rig-dependent stability knob; default 0.04.
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.multi_bias_cov0 = dv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
@@ -355,9 +363,15 @@ Status ConfigLoader::parse(const std::string& text) {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 sc.bias_states = bv;
             } else if (key == "bias_process_noise") {
-                // Slice 11b/18: the bias random-walk process-noise rate (>= 0; validate()).
-                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
-                sc.bias_process_noise = dv;
+                // Slice 11b/18: the bias random-walk process-noise rate(s) (>= 0 per DOF;
+                // validate()). ONE number = uniform across the 6 DOFs (the legacy form);
+                // SIX numbers = per-DOF [v; omega] order (Slice 18 review/B2 — a DOF rate
+                // of exactly 0 PINS that bias DOF under multi_bias_enabled). Reuses the
+                // q_floor 1-or-6 parse.
+                Scalar pn[6];
+                if (!parse_q_floor(val, pn))
+                    return fail("expected 1 or 6 numbers", line_no, raw);
+                for (int d = 0; d < 6; ++d) sc.bias_process_noise[d] = pn[d];
             } else {
                 return fail("unknown sensor key '" + key + "'", line_no, raw);
             }

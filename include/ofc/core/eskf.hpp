@@ -233,12 +233,28 @@ public:
     // dim <= 12 + 6*4 = 36).
     static constexpr int kMaxBiasSources = 4;
 
+    // Maximum number of median participants median_influence() supports — the shared
+    // constant the estimator's source cap must not exceed (review MINOR: was a hard-coded
+    // 32 duplicating estimator.cpp's kMaxSourcesCap, with the tail UNINITIALIZED if the
+    // caps ever diverged; the estimator static_asserts against this and the tail is now
+    // zero-filled defensively).
+    static constexpr int kMaxMedianInputs = 32;
+
     // Switch into the generalized k-bias augmented mode at the current 12-DOF state: all k
     // biases start at zero, each bias block of the 36x36 covariance is seeded to bias_cov0*I6
     // (> 0 required for observability), pose+twist copy the live 12x12, cross-blocks zero,
     // padding zero. Mutually exclusive with the Option-A enable_bias() mode (the estimator
     // routes one or the other; init() resets both). k is clamped to [1, kMaxBiasSources].
-    void enable_multi_bias(int k, Scalar bias_cov0);
+    //
+    // PER-DOF PINNING (Slice 18 review/B2): when `bias_pn` is non-null it points at k
+    // per-source 6-vectors of random-walk rates (the same array predict_multi consumes); a
+    // DOF whose rate is NOT > 0 is PINNED at zero — its prior variance is seeded to 0
+    // instead of bias_cov0 (and predict_multi adds no walk and zeroes its coupling column),
+    // so the DOF is excluded from estimation entirely: bias stays exactly 0 with exactly
+    // zero variance. The per-source confidence prior counts only the UNPINNED DOFs (a
+    // fully-pinned source reads multi_bias_confidence == 0 forever). nullptr = all DOFs
+    // free (the pre-B2 behavior).
+    void enable_multi_bias(int k, Scalar bias_cov0, const Vec6* bias_pn = nullptr);
     bool multi_bias_active() const { return mb_count_ > 0; }
     int  multi_bias_count()  const { return mb_count_; }
     // Current bias estimate of bias source j (zero when inactive / j out of range).
@@ -251,13 +267,18 @@ public:
     // consensus (the estimator de-biased each source before the median — no further de-bias
     // here, unlike Option A's predict_aug). J_bias[j] (j < multi_bias_count()) is the
     // pose<-bias_j coupling block for THIS step (bias_coupling() above; ZERO for a source
-    // absent from the window). bias_pn[j] is the per-source random-walk rate:
+    // absent from the window). bias_pn[j] is the per-source PER-DOF random-walk rate
+    // 6-vector (Slice 18 review/B2; a uniform vector reproduces the pre-B2 scalar numerics
+    // exactly):
     //   F (36x36 capacity, active 12+6k): pose row [Ad(delta^-1) | 0 | J_1 .. J_k];
     //       twist row 0 (re-read each step); bias rows identity (random walk).
-    //   Q = blkdiag(q_pose, q_pose/dt^2, pn_1*dt*I6, .., pn_k*dt*I6).
+    //   Q = blkdiag(q_pose, q_pose/dt^2, diag(pn_1)*dt, .., diag(pn_k)*dt).
+    // A DOF whose rate is NOT > 0 is PINNED (see enable_multi_bias): zero walk AND its
+    // column of J_bias[j] is zeroed before entering F, so the pinned bias DOF never couples
+    // into the pose and never accrues cross-covariance — it stays exactly 0/0-variance.
     // Mean: pose <- pose o delta; twist <- log(delta)/dt. dt <= 0 guarded as in predict().
     void predict_multi(const SE3& delta, Scalar dt, const Mat6& q_pose,
-                       const Mat6* J_bias, const Scalar* bias_pn);
+                       const Mat6* J_bias, const Vec6* bias_pn);
 
     // update_multi(): the generalized augmented measurement update — identical structure to
     // update_aug() at the 36 capacity (H pads zero bias columns; the gain's bias rows are
@@ -315,7 +336,9 @@ private:
     int    mb_count_ = 0;
     Vec6   mb_bias_[kMaxBiasSources];
     Mat36  cov36_ = Mat36::Zero();
-    Scalar mb_prior_trace_ = Scalar(0);   // per-bias-block trace at enable (for confidence)
+    // Per-source bias-block prior trace at enable (for confidence). Per-source since B2's
+    // per-DOF pinning: only the UNPINNED DOFs contribute (0 for a fully-pinned source).
+    Scalar mb_prior_trace_[kMaxBiasSources] = {};
 };
 
 } // namespace ofc

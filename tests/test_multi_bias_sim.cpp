@@ -100,9 +100,14 @@ std::vector<SourceParams> mb_sources(const Vec6& planted_bias_on_1) {
 
 // Config: 3-source median fusion, calibration off (priors == planted mounts), time-sync off,
 // per-source bias states per `bias_on`, the multi-bias flag per `multi_on`.
+// `bias_pn_dof` (B2): optional per-DOF walk-rate override (nullptr = uniform `bias_pn`; a
+// DOF rate of exactly 0 PINS that bias DOF). `cov0` (review MAJOR-3): the multi-bias prior
+// knob (<= 0 = leave the Config default 0.04).
 Config mb_config(const std::vector<SourceParams>& planted,
                  std::vector<SensorConfig>& sensors_out, bool multi_on, bool bias_on,
-                 Scalar bias_pn = 1e-6, bool bias_on_reference = true) {
+                 Scalar bias_pn = 1e-6, bool bias_on_reference = true,
+                 const Vec6* bias_pn_dof = nullptr, Scalar cov0 = 0.0,
+                 bool reliability_on = false) {
     // bias_pn 1e-6: the near-constant bias model. A fast random walk (the Option-A test's
     // 1e-3) keeps RE-INFLATING the bias covariance, so the weakly-observable bias
     // DIFFERENCES (only the influence-weighted SUM moves the consensus a position fix sees)
@@ -118,7 +123,11 @@ Config mb_config(const std::vector<SourceParams>& planted,
         sc.prior_scale        = 1.0;
         sc.weight_prior       = 1.0;
         sc.bias_states        = bias_on && (bias_on_reference || sp.id != 0);
-        sc.bias_process_noise = bias_pn;
+        if (bias_pn_dof != nullptr) {
+            for (int d = 0; d < 6; ++d) sc.bias_process_noise[d] = (*bias_pn_dof)(d);
+        } else {
+            sc.bias_process_noise = bias_pn;
+        }
         sc.is_reference       = (sp.id == 0);
         sensors_out.push_back(sc);
     }
@@ -133,13 +142,16 @@ Config mb_config(const std::vector<SourceParams>& planted,
     c.commit_min_votes    = 1000000000;          // calibration off the prior
     c.min_sources_warn    = 1;
     c.mahalanobis_chi2    = 100.0;
-    // Reliability EMA OFF (floor == cap == 1): the Slice-9 down-weighting interacts with the
-    // bias learning transient (a wrongly-de-biased co-source scatters -> gets down-weighted
-    // -> loses median influence -> its bias error becomes LESS observable -> persists). The
-    // acceptance tests isolate the bias mechanism; the interplay is a reported finding.
-    c.reliability_floor   = 1.0;
-    c.reliability_cap     = 1.0;
+    // Reliability EMA OFF by default (floor == cap == 1): the Slice-9 down-weighting
+    // interacts with the bias learning transient (a wrongly-de-biased co-source scatters ->
+    // gets down-weighted -> loses median influence -> its bias error becomes LESS
+    // observable -> persists). Most acceptance cases isolate the bias mechanism;
+    // `reliability_on` runs the DEPLOYMENT combination (review MAJOR-4 — the dedicated
+    // reliability-ON case below covers it with documented weaker bounds).
+    c.reliability_floor   = reliability_on ? Scalar(0.2) : Scalar(1.0);
+    c.reliability_cap     = reliability_on ? Scalar(5.0) : Scalar(1.0);
     c.multi_bias_enabled  = multi_on;
+    if (cov0 > 0.0) c.multi_bias_cov0 = cov0;
     c.sensors             = sensors_out.data();
     c.sensor_count        = static_cast<int>(sensors_out.size());
     return c;
@@ -201,13 +213,17 @@ private:
 };
 
 // Run the standard 3-source rig once. `ref` may be null (no absolute reference).
+// Optional B2/review knobs mirror mb_config's.
 void run_rig(const Trajectory& tr, const std::vector<SourceParams>& planted,
              bool multi_on, bool bias_on, const ICorrection* ref,
-             std::vector<Record>& out, bool bias_on_reference = true) {
+             std::vector<Record>& out, bool bias_on_reference = true,
+             const Vec6* bias_pn_dof = nullptr, Scalar cov0 = 0.0,
+             bool reliability_on = false) {
     std::vector<std::unique_ptr<SyntheticSource>> srcs;
     for (const auto& sp : planted) srcs.emplace_back(new SyntheticSource(tr, sp));
     std::vector<SensorConfig> sensors;
-    Config cfg = mb_config(planted, sensors, multi_on, bias_on, 1e-6, bias_on_reference);
+    Config cfg = mb_config(planted, sensors, multi_on, bias_on, 1e-6, bias_on_reference,
+                           bias_pn_dof, cov0, reliability_on);
     Rig rig; rig.set_trajectory(tr);
     REQUIRE(rig.init(cfg) == Status::Ok);
     for (auto& s : srcs) REQUIRE(rig.add_source(s.get()) == Status::Ok);
@@ -293,8 +309,22 @@ TEST_CASE("slice18 sim: 3-source separation — planted bias on source 1 recover
     // recovery on the planted source with co-source absorption bounded at <= half the planted
     // magnitude (a 4-6x separation factor on the driven yaw DOF). Empirically the split's
     // accuracy is limited by the coupling's linearization radius (bias*dt vs the window noise
-    // scale — see kMultiBiasCov0 in estimator.cpp), not by run length: doubling the learn
-    // phase left the values at this plateau while the coast benefit kept its 4x/14x margins.
+    // scale — see Config::multi_bias_cov0), not by run length: doubling the learn phase left
+    // the values at this plateau while the coast benefit kept its 4x/14x margins. The
+    // INDEPENDENT asymptotic cross-check of that diagnosis (planted/10 -> >95% recovery,
+    // review MAJOR-1) is the dedicated case below.
+    //
+    // HONESTY (review MAJOR-2): the separation property is PER-DRIVEN-DOF only. By NORM the
+    // co-source biases are NOT "~0" — the undriven DOFs carry junk at a sizable fraction of
+    // the prior sigma (measured: |b0| ~ 1.08x the planted norm; spurious omega_x on the
+    // planted source ~0.08 > the planted omega_z 0.05; b0 v_z ~ -0.12). During a coast every
+    // spurious component actively de-biases its source; the coast still wins because the
+    // junk partially cancels through the median. The bounds below pin BOTH facets: the
+    // driven-DOF separation AND an explicit ceiling on the undriven-DOF junk (vs the prior
+    // sigma = sqrt(multi_bias_cov0) = 0.2) plus the full co-source norms — so neither the
+    // junk nor the cancellation can silently grow. The DEPLOYMENT remedy for the junk is
+    // B2's per-DOF pinning (the dedicated pinned-DOF case below): pin everything but the
+    // DOFs you have a physical reason to free.
     CHECK(std::abs(b1(0) - planted(0)) < 0.25 * planted(0));   // v_x recovered (~80%+)
     CHECK(std::abs(b1(5) - planted(5)) < 0.20 * planted(5));   // omega_z recovered (~88%+)
     CHECK(obs1 > 0.5);                       // the bias became observable through GPS
@@ -305,6 +335,23 @@ TEST_CASE("slice18 sim: 3-source separation — planted bias on source 1 recover
     CHECK(std::abs(b0(5)) < 0.5 * planted(5));
     CHECK(std::abs(b2(0)) < 0.5 * planted(0));
     CHECK(std::abs(b2(5)) < 0.5 * planted(5));
+    // ALL-6-DOF junk ceilings (review MAJOR-2): every undriven DOF on every source stays
+    // below 0.8x the prior sigma (0.16; measured worst ~0.124 — b0 v_z), and the full
+    // co-source norms stay below 1.5x the planted norm (measured 1.08x / 0.77x). These are
+    // honest junk BOUNDS, not "~0" claims.
+    {
+        const Scalar sigma0 = std::sqrt(0.04);             // default multi_bias_cov0
+        const Scalar junk_cap = 0.8 * sigma0;
+        for (int d = 0; d < 6; ++d) {
+            if (d != 0 && d != 5) {                        // undriven DOFs everywhere
+                CHECK(std::abs(b0(d)) < junk_cap);
+                CHECK(std::abs(b1(d)) < junk_cap);
+                CHECK(std::abs(b2(d)) < junk_cap);
+            }
+        }
+        CHECK(b0.norm() < 1.5 * planted.norm());
+        CHECK(b2.norm() < 1.5 * planted.norm());
+    }
     // ...and the planted source carries the dominant driven-DOF estimate (the actual
     // separation ratio, ~4-6x on yaw).
     CHECK(std::abs(b1(5)) > 2.0 * std::abs(b0(5)));
@@ -315,6 +362,269 @@ TEST_CASE("slice18 sim: 3-source separation — planted bias on source 1 recover
     REQUIRE(off_te > 0.3);                   // the bias genuinely drags the OFF coast
     CHECK(on_te < 0.35 * off_te);
     CHECK(on_re < 0.25 * off_re);
+}
+
+// ===========================================================================
+// (2b) ASYMPTOTIC CROSS-CHECK (review MAJOR-1) — the independent discriminator for the
+// "linearization-radius plateau" diagnosis behind the relaxed acceptance-2 thresholds.
+// The alternative the review wanted falsified: a systematic ~15-20% MULTIPLICATIVE scale
+// error in the coupling chain (a wrong dt convention at one of the three dt sites, a
+// transport factor, an H mis-model) — the production==pin and per-window FD tests cannot
+// see an accumulated filter-level scale error; this can. The two hypotheses make sharply
+// different predictions under parameter scaling:
+//   * scale bug:  recovered = c * planted with c ~ 0.8-0.85 a CONSTANT — the recovery
+//     FRACTION is invariant to the planted size and to the sensor noise level, and it can
+//     never reach 1 anywhere;
+//   * radius:     the recovery error is governed by the ratio (bias displacement)/(d_i
+//     window noise scale) — it approaches 0 when the ratio shrinks (INSIDE the radius)
+//     and blows up when the ratio grows (outside).
+//
+// CONSTRUCTION NOTE — why this is NOT the review's literal "planted / 10, same rig": the
+// per-DOF junk floor (MAJOR-2; rectified through the nonlinear median response at the
+// prior scale) does not shrink with the planted bias, so planted/10 with the same noise
+// drowns: measured rec v_x = -0.57 (sign garbage; |error| 0.024 == the FULL-SIZE run's
+// absolute error 0.032 — itself the additive-floor signature, already incompatible with a
+// multiplicative bug, but unreadable as a fraction). And the review's "(or the source
+// noise / 10)" moves in the WRONG direction: SHRINKING the noise shrinks d_i and pushes
+// the same bias displacement OUTSIDE the radius — measured: src noise / 3 destroys
+// recovery (w_z -1.86), noise x3 perfects it (w_z 1.007). The full measured sweep (same
+// planted 0.15/0.05, dt, GPS; only the source noise scale k varies):
+//   k=1/3: w_z -1.86 | k=1: w_z 1.13 v_x 0.79 | k=3: w_z 1.007 v_x 0.83
+//   k=6: w_z 0.35 | k=10: w_z 0.10        (high k: per-window bias info ~ bias*dt/d_i
+//                                          collapses — the bias goes unobservable, the
+//                                          estimate stays near its zero prior)
+// and planted x2 at k=1 collapses too (w_z 0.18, v_x 0.62 — outside the radius from the
+// bias side). A constant-fraction bug is incompatible with EVERY row of that table; the
+// radius prediction matches every row. The committed pin below is the k=3 sweet spot —
+// inside the radius with the bias still observable — where the separable driven DOF
+// (omega_z: the 3D-distinct mounts make its per-source coupling directions distinct)
+// recovers to 1 within 1% (measured 1.007), which a 15-20% multiplicative bug can never
+// produce. v_x at the same point is 0.83: its residual is the MAJOR-2 ATTRIBUTION split
+// (forward motion maps every source's v_x bias to nearly the same base direction, so the
+// v_x DIFFERENCES stay weakly separable and the co-sources keep a share) — a DOF-SPECIFIC
+// deficit, which is itself incompatible with a coupling-chain scale factor (J multiplies
+// all 6 DOFs uniformly by -dt Tg Omega Ta Ad).
+// ===========================================================================
+TEST_CASE("slice18 sim: asymptotic cross-check — inside the linearization radius the "
+          "separable driven DOF recovers ~100%, outside it collapses (falsifies a "
+          "coupling-chain scale bug; review MAJOR-1)") {
+    Trajectory tr = mb_traj(32);                              // ~179 s (the same rig)
+    const Scalar cut_s = 165.0;
+    Vec6 planted; planted << 0.15, 0.0, 0.0,   0.0, 0.0, 0.05;     // acceptance-2 sizes
+
+    auto run_scaled = [&](const Vec6& p, Scalar noise_k, Vec6& b1_out) {
+        auto sps = mb_sources(p);
+        for (auto& s : sps) {                 // scale the per-source noise floor by k
+            s.noise_trans_per_m *= noise_k;
+            s.noise_rot_per_rad *= noise_k;
+            s.noise_trans_floor *= noise_k;
+            s.noise_rot_floor   *= noise_k;
+        }
+        AbsoluteRefParams rp;
+        rp.period_s = 0.2; rp.window_s = 0.10; rp.sigma_pos = 0.01; rp.seed = 11u;
+        SyntheticAbsoluteRef ref(tr, rp);
+        GatedRef gated(&ref, cut_s);
+        std::vector<Record> recs;
+        run_rig(tr, sps, /*multi_on=*/true, /*bias_on=*/true, &gated, recs);
+        b1_out = tail_mean_bias(recs, 1, 2000);
+    };
+
+    // INSIDE the radius (noise x3 -> d_i x3 vs the same bias displacement): the separable
+    // driven DOF must recover ~100%.
+    Vec6 b1_in;
+    run_scaled(planted, Scalar(3), b1_in);
+    MESSAGE("inside (noise x3): recovery omega_z=" << b1_in(5) / planted(5)
+            << "  v_x=" << b1_in(0) / planted(0)
+            << "  b1=[" << b1_in.transpose() << "]");
+    // omega_z -> 1 (measured 1.007): a ~15-20% multiplicative coupling-chain scale error
+    // caps this at ~0.85 EVERYWHERE and fails here loudly.
+    CHECK(b1_in(5) / planted(5) > 0.93);
+    CHECK(b1_in(5) / planted(5) < 1.10);
+    // v_x improves vs the k=1 plateau (0.79 -> 0.83) but keeps the attribution split —
+    // bounded, documented, NOT pinned ->1 (see the header).
+    CHECK(b1_in(0) / planted(0) > 0.75);
+    CHECK(b1_in(0) / planted(0) < 1.10);
+
+    // OUTSIDE the radius (planted x2, noise k=1): recovery must COLLAPSE — the plateau is
+    // the nonlinearity, not a constant fraction (a scale bug would read ~0.8 here too).
+    Vec6 b1_out;
+    run_scaled(planted * Scalar(2), Scalar(1), b1_out);
+    MESSAGE("outside (planted x2): recovery omega_z=" << b1_out(5) / (2 * planted(5))
+            << "  v_x=" << b1_out(0) / (2 * planted(0)));
+    CHECK(b1_out(5) / (2 * planted(5)) < 0.5);                 // measured 0.18
+}
+
+// ===========================================================================
+// (2c) PER-DOF PINNING (Slice 18 review/B2) — the deployment remedy for the MAJOR-2
+// undriven-DOF junk: free ONLY the DOFs with a physical reason (here the yaw-rate bias,
+// the urban12 wheel -75 deg/h use case) and PIN the other 5 per source. The pinning
+// contract: a pinned DOF stays EXACTLY zero (zero prior variance, zero walk, zero
+// coupling column -> its gain rows are exactly zero by construction), while the unpinned
+// DOF estimates as before. The "unpin" mutation (seeding the full prior on a pinned DOF)
+// puts measured junk ~0.05-0.12 on the pinned DOFs and the exact-zero CHECKs fail.
+// ===========================================================================
+TEST_CASE("slice18 sim: per-DOF pinning — pn[d]==0 pins bias DOF d at exactly zero; the "
+          "unpinned yaw-rate DOF still recovers (review/B2)") {
+    Trajectory tr = mb_traj(16);                              // ~90 s
+    const Scalar cut_s = 80.0;
+    Vec6 planted; planted << 0.0, 0.0, 0.0,   0.0, 0.0, 0.05;     // yaw-rate bias only
+    Vec6 pn_dof;  pn_dof  << 0.0, 0.0, 0.0,   0.0, 0.0, 1e-6;     // free ONLY omega_z
+
+    AbsoluteRefParams rp;
+    rp.period_s = 0.2; rp.window_s = 0.10; rp.sigma_pos = 0.01; rp.seed = 11u;
+
+    SyntheticAbsoluteRef ref(tr, rp);
+    GatedRef gated(&ref, cut_s);
+    std::vector<Record> recs;
+    run_rig(tr, mb_sources(planted), /*multi_on=*/true, /*bias_on=*/true, &gated, recs,
+            /*bias_on_reference=*/true, &pn_dof);
+
+    const Vec6 b0m = tail_mean_bias(recs, 0, 1000);
+    const Vec6 b1m = tail_mean_bias(recs, 1, 1000);
+    const Vec6 b2m = tail_mean_bias(recs, 2, 1000);
+    MESSAGE("pinned: recovered b1=[" << b1m.transpose() << "]"
+            << "\n  co b0=[" << b0m.transpose() << "]  co b2=[" << b2m.transpose() << "]");
+
+    // Pinned DOFs are EXACTLY zero on every source — the live snapshot, not a tail mean
+    // (zero prior variance + zero walk + zero coupling -> the gain rows are exactly zero).
+    for (SourceId id = 0; id < 3; ++id) {
+        const CalibSnapshot* cs = last_snap_by_id(recs, id);
+        REQUIRE(cs != nullptr);
+        for (int d = 0; d < 5; ++d) CHECK(cs->bias(d) == 0.0);
+    }
+    // The unpinned DOF estimates as before: the planted yaw-rate is recovered on source 1
+    // and the co-sources' (unpinned) omega_z stays well below it. With 5 of 6 DOFs pinned
+    // the junk sink is gone, so the single-DOF split is at least as good as acceptance-2's.
+    CHECK(std::abs(b1m(5) - planted(5)) < 0.25 * planted(5));
+    CHECK(std::abs(b0m(5)) < 0.5 * planted(5));
+    CHECK(std::abs(b2m(5)) < 0.5 * planted(5));
+    // Observability confidence accounts only the unpinned subspace (prior trace = 1 DOF).
+    const CalibSnapshot* s1 = last_snap_by_id(recs, 1);
+    REQUIRE(s1 != nullptr);
+    CHECK(s1->bias_observable > 0.5);
+}
+
+// ===========================================================================
+// (2d) PRIOR SWEEP PINS (review MAJOR-3 + MINOR) — the two failure extremes that justify
+// the multi_bias_cov0 default, regression-guarded now that the constant is a knob:
+//   * cov0 = 1.0 (Option-A parity): the linearized coupling of the heavily nonlinear
+//     median response pumps junk at the prior scale — co-source biases blow up far beyond
+//     the 0.04 run's junk ceiling.
+//   * cov0 = 0.01 (tight): the prior is INFORMATIVE against the real bias — the estimate
+//     is shrunk by ~the unresolved-variance fraction, i.e. recovered/planted tracks
+//     bias_observable (the consistency property quoted in the 0.04 rationale), and
+//     recovery sits well BELOW the 0.04 run's.
+// ===========================================================================
+TEST_CASE("slice18 sim: multi_bias_cov0 sweep — 1.0 blows up co-source junk; 0.01 shrinks "
+          "recovery to ~bias_observable (review MAJOR-3)") {
+    Trajectory tr = mb_traj(16);                              // ~90 s (cheap pin)
+    const Scalar cut_s = 80.0;
+    Vec6 planted; planted << 0.15, 0.0, 0.0,   0.0, 0.0, 0.05;
+
+    AbsoluteRefParams rp;
+    rp.period_s = 0.2; rp.window_s = 0.10; rp.sigma_pos = 0.01; rp.seed = 11u;
+
+    auto run_prior = [&](Scalar cov0, Vec6& b0, Vec6& b1, Vec6& b2, Scalar& obs1) {
+        SyntheticAbsoluteRef ref(tr, rp);
+        GatedRef gated(&ref, cut_s);
+        std::vector<Record> recs;
+        run_rig(tr, mb_sources(planted), /*multi_on=*/true, /*bias_on=*/true, &gated, recs,
+                /*bias_on_reference=*/true, /*bias_pn_dof=*/nullptr, cov0);
+        b0 = tail_mean_bias(recs, 0, 1000);
+        b1 = tail_mean_bias(recs, 1, 1000);
+        b2 = tail_mean_bias(recs, 2, 1000);
+        const CalibSnapshot* s1 = last_snap_by_id(recs, 1);
+        REQUIRE(s1 != nullptr);
+        obs1 = s1->bias_observable;
+    };
+
+    Vec6 b0_hi, b1_hi, b2_hi, b0_lo, b1_lo, b2_lo;
+    Scalar obs_hi = 0.0, obs_lo = 0.0;
+    run_prior(1.0,  b0_hi, b1_hi, b2_hi, obs_hi);
+    run_prior(0.01, b0_lo, b1_lo, b2_lo, obs_lo);
+
+    const Scalar junk_hi = std::max(b0_hi.cwiseAbs().maxCoeff(), b2_hi.cwiseAbs().maxCoeff());
+    const Scalar rec_lo  = b1_lo(5) / planted(5);
+    MESSAGE("prior sweep: cov0=1.0 co-source junk max=" << junk_hi
+            << " (b0=[" << b0_hi.transpose() << "])"
+            << "\n  cov0=0.01 recovery omega_z=" << rec_lo << " obs1=" << obs_lo
+            << "  recovery v_x=" << b1_lo(0) / planted(0));
+    // 1.0-divergence claim: the co-source junk exceeds the 0.04 run's entire junk ceiling
+    // (0.16 = 0.8 sigma at 0.04) — the prior-scale pumping is real.
+    CHECK(junk_hi > 0.16);
+    // 0.01-shrinkage claim: recovered/planted tracks bias_observable (the variance-
+    // reduction fraction), well below full recovery.
+    CHECK(rec_lo < 0.85);
+    CHECK(std::abs(rec_lo - obs_lo) < 0.15);
+}
+
+// ===========================================================================
+// (4b) RELIABILITY-ON DEPLOYMENT COMBINATION (review MAJOR-4). Every other flag-ON sim
+// case disables the Slice-9 reliability EMA (floor == cap == 1) to isolate the bias
+// mechanism from a diagnosed adverse feedback loop (wrongly-de-biased co-source scatters
+// -> down-weighted -> loses median influence -> its bias error becomes LESS observable ->
+// persists). The recommended real-data config runs reliability ON, so the combination
+// needs coverage: DOCUMENTED WEAKER BOUNDS — no divergence (biases bounded by the prior
+// scale, errors finite and sane) and the coast still beats the unmodeled baseline, though
+// by a smaller margin than the isolated 2x/2x. The interaction is recorded at
+// Config::multi_bias_enabled (config.hpp), not only here.
+// ===========================================================================
+TEST_CASE("slice18 sim: reliability-ON + multi-bias (deployment combination) — no "
+          "divergence; coast still beats the unmodeled baseline (review MAJOR-4)") {
+    Trajectory tr = mb_traj(16);                              // ~90 s
+    const Scalar cut_s = 65.0;                                // learn 0..65 s, coast ~25 s
+    Vec6 planted; planted << 0.15, 0.0, 0.0,   0.0, 0.0, 0.05;
+
+    AbsoluteRefParams rp;
+    rp.period_s = 0.2; rp.window_s = 0.10; rp.sigma_pos = 0.05; rp.seed = 11u;
+
+    auto final_errors = [](const std::vector<Record>& recs, Scalar& te, Scalar& re) {
+        te = 0.0; re = 0.0;
+        for (auto it = recs.rbegin(); it != recs.rend(); ++it) {
+            if (it->fused) { Rig::pose_error(*it, te, re); return; }
+        }
+    };
+
+    // Baseline: reliability ON, no bias states (the unmodeled-bias deployment).
+    Scalar off_te = 0.0, off_re = 0.0;
+    {
+        SyntheticAbsoluteRef ref(tr, rp);
+        GatedRef gated(&ref, cut_s);
+        std::vector<Record> recs;
+        run_rig(tr, mb_sources(planted), /*multi_on=*/false, /*bias_on=*/false, &gated,
+                recs, /*bias_on_reference=*/true, nullptr, 0.0, /*reliability_on=*/true);
+        final_errors(recs, off_te, off_re);
+    }
+
+    // Deployment combination: reliability ON + multi-bias ON.
+    Scalar on_te = 0.0, on_re = 0.0;
+    Vec6 b0, b1, b2;
+    {
+        SyntheticAbsoluteRef ref(tr, rp);
+        GatedRef gated(&ref, cut_s);
+        std::vector<Record> recs;
+        run_rig(tr, mb_sources(planted), /*multi_on=*/true, /*bias_on=*/true, &gated,
+                recs, /*bias_on_reference=*/true, nullptr, 0.0, /*reliability_on=*/true);
+        final_errors(recs, on_te, on_re);
+        b0 = tail_mean_bias(recs, 0, 1000);
+        b1 = tail_mean_bias(recs, 1, 1000);
+        b2 = tail_mean_bias(recs, 2, 1000);
+    }
+
+    MESSAGE("reliability-ON coast: OFF final trans/rot err=" << off_te << " m / " << off_re
+            << " rad  ON final=" << on_te << " m / " << on_re << " rad"
+            << "\n  b1=[" << b1.transpose() << "]  |b0|=" << b0.norm()
+            << "  |b2|=" << b2.norm());
+
+    // NO DIVERGENCE: every bias stays bounded by the prior scale (the feedback loop must
+    // not pump junk past sigma0 = 0.2), and the coast errors stay sane.
+    CHECK(b0.cwiseAbs().maxCoeff() < 0.2);
+    CHECK(b1.cwiseAbs().maxCoeff() < 0.2);
+    CHECK(b2.cwiseAbs().maxCoeff() < 0.2);
+    REQUIRE(off_re > 0.05);                  // the baseline genuinely drifts
+    // WEAKER BOUNDS than the isolated coast case (documented): still a clear win.
+    CHECK(on_re < 0.8 * off_re);
+    CHECK(on_te < 0.8 * off_te);
 }
 
 // ===========================================================================
@@ -393,10 +703,14 @@ TEST_CASE("slice18 sim: coast after a GPS-rich learn phase — de-biased heading
 }
 
 // ===========================================================================
-// (6) DEFAULT-OFF IDENTITY + GUARDS
+// (6) DEFAULT-OFF DETERMINISM + GUARDS. NOTE (review MINOR): the determinism leg proves
+// flag-OFF run A == run B of the SAME build + zero bias fields — it CANNOT detect an
+// off-path numeric change ("byte-identical legacy behavior" rests on diff hygiene of the
+// off path plus the unmodified pre-existing suite, not on this case).
 // ===========================================================================
-TEST_CASE("slice18 sim: multi_bias_enabled=false is deterministic with zero bias fields; the "
-          "multi-bias InvalidConfig guard is intact when false and lifted (capped) when true") {
+TEST_CASE("slice18 sim: multi_bias_enabled=false is DETERMINISTIC (same-build run A == run "
+          "B) with zero bias fields; the multi-bias InvalidConfig guard is intact when "
+          "false and lifted (capped) when true") {
     // --- the Option-A multi-bias guard is INTACT when the flag is false (the default) and
     //     LIFTED when true, up to the compile-time cap.
     {
@@ -500,6 +814,28 @@ TEST_CASE("slice18 sim: flipping multi_bias_enabled flips the config hash (resto
     REQUIRE(on_est.init(c_on) == Status::Ok);
     CHECK(on_est.deserialize(blob, n.value()) == Status::InvalidConfig);
 
+    // REVERSE direction (review MINOR — the likelier field scenario, downgrading a
+    // config): a blob written by the flag-ON estimator must not restore into a flag-OFF
+    // one.
+    unsigned char blob_on[4096];
+    const Expected<int> n_on = on_est.serialize(blob_on, static_cast<int>(sizeof(blob_on)));
+    REQUIRE(n_on.ok());
+    {
+        Estimator off_from_on;
+        REQUIRE(off_from_on.init(c) == Status::Ok);
+        CHECK(off_from_on.deserialize(blob_on, n_on.value()) == Status::InvalidConfig);
+    }
+
+    // The multi_bias_cov0 knob is hashed too (review/B2: it seeds the learned-bias state a
+    // restore carries) — a changed prior rejects a stale restore.
+    {
+        Config c_cov = c;
+        c_cov.multi_bias_cov0 = 0.09;
+        Estimator cov_est;
+        REQUIRE(cov_est.init(c_cov) == Status::Ok);
+        CHECK(cov_est.deserialize(blob, n.value()) == Status::InvalidConfig);
+    }
+
     // Sanity: the same-flag restore is accepted.
     Estimator off_est2;
     REQUIRE(off_est2.init(c) == Status::Ok);
@@ -569,13 +905,16 @@ TEST_CASE("slice18 sim: flag-ON NEES never overconfident; 12-DOF marginals stay 
     const Scalar nees_on  = mb_ensemble_nees(tr, /*multi_on=*/true,  /*bias_on=*/true,  M);
     MESSAGE("flag-OFF (unmodeled bias) ensemble pose NEES=" << nees_off
             << "   flag-ON (bias states) NEES=" << nees_on
-            << "   (hard cap: < 6 never overconfident)");
+            << "   (hard cap: < 5.5 never overconfident; band floor 1.5)");
     // NEVER overconfident — the hard safety constraint, both configurations.
     CHECK(nees_on < 5.5);
-    CHECK(nees_on < 6.0);
     CHECK(nees_off < 6.0);
-    // Sanity floor: the flag-ON marginals are a usable covariance, not a blown-up one (the
-    // bias prior adds honest pose uncertainty while the biases converge, so the flag-ON NEES
-    // sits BELOW the flag-OFF one, but must stay well off zero).
-    CHECK(nees_on > 0.05);
+    // BAND floor (review MINOR): the measured flag-ON NEES is ~2.6 — BELOW the cov-cal
+    // consistency band [4.0, 5.6], i.e. the flag-ON pose marginals are ~1.9x PESSIMISTIC.
+    // This is honest (safe-direction) but a real consistency cost: the bias prior injects
+    // pose uncertainty through the coupling while the biases converge, and acceptance item
+    // 7's "must not corrupt the 12-DOF marginals" is met only in this weak sense — any
+    // "in-band" phrasing about the flag-ON NEES is WRONG. The 1.5 floor makes further
+    // drift toward pessimism loud instead of silent.
+    CHECK(nees_on > 1.5);
 }
