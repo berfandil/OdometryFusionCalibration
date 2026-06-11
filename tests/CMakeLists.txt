@@ -28,6 +28,7 @@ add_executable(ofc_tests
     test_correction.cpp
     test_chi2_gate.cpp
     test_bias.cpp
+    test_multi_bias.cpp
     test_persistence.cpp
     test_cov_calibration.cpp
 )
