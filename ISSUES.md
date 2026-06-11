@@ -173,6 +173,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Validated**: EuRoC rotation extrinsic err **9.1e-6° COMMITTED**; lever **µm-exact** with unit-scale sources; KAIST planar byte-identical with flag ON (gate honest). **Finding → next-slice candidate**: with an unrecovered source scale the lever reads ~3.5 cm off (raw `t_B` in the rows; scale unobservable on drone — no straight windows); the row is linear in `(t_X, 1/s)` → turn-regime JOINT lever+scale LS would close the last calib DOF on 3D motion. D26; `SLICE17_TURN_REGIME_ROTATION_EXTRINSIC.md`.
 **Deps**: Slices 7/8 (Phase-2, commit machinery), 16 (centroid readout for the precision claims).
 
+## Slice 17b — Turn-regime joint lever+scale (4-unknown hand-eye LS)  `[x]` DONE — last calib DOF closed; ALL precision targets met
+**Goal**: per-source scale without the straight regime (drone-unobservable; an unrecovered scale degraded the Slice-17 lever to ~3.5 cm). **Math**: the hand-eye translation row is LINEAR in `[t_X; κ=1/s_res]` — prototype `tools/proto_lever_scale.py` (EuRoC lever 1.8e-8 mm + scale 2.7e-12 vs the 3-unknown control's 88 mm; KAIST planar κ well-conditioned).
+**Shipped** (`4138c3d` + review fixes `0ea764a`): Phase-2 4×4 joint ridge LS behind `joint_lever_scale` (default OFF, byte-identical), marginal-information (Schur) vote gating (`kJointMarginMin`, ≥3 distinct excitations or conf 0), scale2 histogram + out-of-range skip guard + `scale2_skipped` diagnostic, either-path scale fold into `prior_scale` (both hists + joint accumulator reset, no double-fold), persistence v3. Review: 3 MAJOR (mixed near-null vote bias; silent out-of-range; guard untested) + 4 MINOR + 1 NIT — all fixed, mutation-pinned. Unit 255/16899 + adapters 41/693 green.
+**Validated (full recipe)**: EuRoC **scale 1.07962 committed from the turn regime** + **lever sub-mm with scale unknown**; KAIST turn-scale agrees with straight-scale (1.10008), lever ~10× tighter. **ALL calib DOFs now meet the precision targets on both regimes.** D27; `SLICE17B_JOINT_LEVER_SCALE.md`.
+**Deps**: Slice 17 (rot3d R̂ in the rows), 16 (centroid), 8 (commit machinery).
+
 ---
 
 ## Suggested order

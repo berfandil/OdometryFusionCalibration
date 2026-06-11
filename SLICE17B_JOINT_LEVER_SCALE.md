@@ -66,7 +66,22 @@ Real-data (orchestrator):
 
 ## 4. Status
 
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed (`reviews/slice-17b-findings.md`) + findings fixed
-- [ ] Real-data validation table filled in
-- [ ] Docs updated (CONFIG/DECISIONS/DESIGN/ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed) — `4138c3d`
+- [x] Reviewed (`reviews/slice-17b-findings.md`: APPROVE WITH FINDINGS, 3 MAJOR + 4 MINOR + 1 NIT) + all fixed — `0ea764a`; unit 255 cases / 16899 asserts
+- [x] Real-data validation — table below
+- [x] Docs updated (CONFIG/DECISIONS D27/DESIGN/ISSUES) — orchestrator
+
+### §2 amendments from review (authoritative)
+
+- **Joint-conditioning vote gate**: per-axis votes (lever AND κ) additionally require the axis's marginal (Schur-complement) information to retain ≥ `kJointMarginMin` (1e-2) of its raw diagonal — a lever/κ mixed near-null direction (≤2 distinct turn excitations) yields conf 0, never a confident wrong commit. Joint votes need **≥3 distinct turn excitations**.
+- **scale2 out-of-range SKIP guard** (not in original §2): an `s_res` outside the `scale_hist` range is skipped, never edge-clamped (clamped transient mass commits and poisons `prior_scale` irreversibly — mutation-pinned). `scale2_skipped(id)` makes it diagnosable. Deliberate cost: a true out-of-range residual never commits on a turn-only rig (Phase-1's iterating clamp differs; widen `scale_hist` if needed).
+- `reset_scale2` also drops the joint accumulator (a fold moves the de-scale epoch; single-κ model can't mix epochs) but NOT `rows_`/xyz state (lever gate progress survives folds).
+
+### Real-data validation (2026-06-11, full recipe: rot3d + joint_lever_scale + subbin_centroid + vote_weight=one)
+
+| Probe | result |
+|---|---|
+| EuRoC drone, scale-1.08 injection | **scale 1.07962 COMMITTED from the turn regime** (err 3.8e-4; previously conf 0 — unobservable); **lever [0.299868, −0.199952, 0.14995] — sub-mm with the scale UNKNOWN** (was 3.5 cm); rotation 9.1e-6° / toff 1.3 µs unchanged |
+| KAIST planar | turn-path scale 1.10008 agrees with the straight path; lever [0.4997, 0.1999] (~10× tighter than 17); yaw/toff unchanged |
+
+**ALL calibration DOFs (rotation extrinsic, lever, scale, time-offset) now meet the user precision targets (rot < 0.1°, trans < 1 cm) on both ground and 3D motion.**
