@@ -244,7 +244,7 @@ Status ReplayHarness::write_results_csv(std::ostream& os) const {
           "has_gt,gt_x,gt_y,gt_z,trans_err_m,rot_err_rad,pose_nees,"
           "source_count";
     // A fixed-width per-source block header (up to 8 sources covers the default max_sources).
-    os << ",[per-source: id,scale,off_s,conf,extr_conf...]\n";
+    os << ",[per-source: id,scale,off_s,conf,extr_conf,bias_wz,bias_obs...]\n";
 
     for (const ReplayRecord& r : records_) {
         if (!r.fused) continue;
@@ -269,7 +269,8 @@ Status ReplayHarness::write_results_csv(std::ostream& os) const {
         for (int s = 0; s < r.result.source_count; ++s) {
             const CalibSnapshot& c = r.result.calib[s];
             os << ',' << static_cast<int>(c.id) << ',' << c.scale << ',' << c.time_offset_s
-               << ',' << c.confidence << ',' << c.extrinsic_confidence;
+               << ',' << c.confidence << ',' << c.extrinsic_confidence
+               << ',' << c.bias[5] << ',' << c.bias_observable;
         }
         os << '\n';
     }
