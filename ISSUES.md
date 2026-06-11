@@ -167,6 +167,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 **Validated (KAIST urban07 calib_test, flag ON)**: yaw err sub-bin-phase-INDEPENDENT +0.015° across all probes; **committed yaw 0.0102°** (target <0.1°), committed scale err ~8e-5, time-offset err **2.6 µs** (was 2.2 ms), committed lever ~2.5 mm. Design doc `SLICE16_CENTROID_SUBBIN_READOUT.md`; review `reviews/slice-16-findings.md`; DECISIONS D25.
 **Deps**: Slices 8 (commit/re-anchor), 15c (`vote_weight=one` commit enabler).
 
+## Slice 17 — Turn-regime full rotation-extrinsic (rot3d axis-correspondence hand-eye)  `[x]` DONE — 9.1e-6° on drone, committed
+**Goal**: recover the FULL rotation extrinsic on 3D/multi-axis motion (the EuRoC gap: conf 0 on drone; the wrong rotation also corrupted the lever rows ~|t|·θ). **Math validated by prototype first** (`euroc_run/proto_rot_handeye.py`): hand-eye axis correspondence `a = R_X·b` over windowed deltas + Wahba/Kabsch; KAIST yaw-only → `Σbbᵀ` rank 1 with the missing yaw EXACTLY the about-axis blind DOF → complementary to Phase-1 by construction (the spine); gate = two distinct axes (`λ_mid ≥ 1e-2·λ_max`).
+**Shipped** (`f1eee59` + review fixes `2d22c28` + lever-reset `f013320`): Phase-2 per-slot decay-aged `Mw`/`BBw`, running Kabsch vote into 3 so(3) channels (reuse `so3_hist`, contractive rising-edge re-anchor), `rot3d_committed` commit/feedback (supersedes ext/roll publish; joins the median under `ReferenceOnly`), lever rows driven by the running R̂ once the gate opens + lever-accumulator reset on the rising edge, `rot3d_enabled` default OFF (byte-identical), persistence format v2. Review: 2 MAJOR (lever-row coupling, ReferenceOnly join) + 3 MINOR + 2 NIT — all fixed, mutation-pinned. Unit 239/14591 + adapters 40/687 green.
+**Validated**: EuRoC rotation extrinsic err **9.1e-6° COMMITTED**; lever **µm-exact** with unit-scale sources; KAIST planar byte-identical with flag ON (gate honest). **Finding → next-slice candidate**: with an unrecovered source scale the lever reads ~3.5 cm off (raw `t_B` in the rows; scale unobservable on drone — no straight windows); the row is linear in `(t_X, 1/s)` → turn-regime JOINT lever+scale LS would close the last calib DOF on 3D motion. D26; `SLICE17_TURN_REGIME_ROTATION_EXTRINSIC.md`.
+**Deps**: Slices 7/8 (Phase-2, commit machinery), 16 (centroid readout for the precision claims).
+
 ---
 
 ## Suggested order

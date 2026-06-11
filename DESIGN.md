@@ -152,7 +152,7 @@ Every gate, vote weight, and reliability term derives from this table.
 |---|---|
 | Confidence combine (native ⊕ modeled Σ) | **sum**; {native-only, modeled-only, sum, max, weighted} |
 | Histogram aging | {exponential-decay `γ`, sliding-window `K`} |
-| Phase-2 histograms | roll = circular S¹, xyz = 3×1-D ℝ³ |
+| Phase-2 histograms | roll = circular S¹, xyz = 3×1-D ℝ³; rot3d (D26, opt-in) = 3-channel so(3) @ re-anchorable basepoint |
 | Commit gate | peak-concentration ≥ τ_commit ∧ votes ≥ N_min; hysteresis τ_drop |
 | Weiszfeld | bounded `max_iters` + tol; ε-regularized `1/d`; split-metric weight `λ` |
 | Gates | straight (ε_ω, δ_v), turn (θ_ω), excitation (σ²_ω min) |

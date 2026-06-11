@@ -75,7 +75,20 @@ Real-data (orchestrator, post-merge):
 
 ## 4. Status
 
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed (`reviews/slice-17-findings.md`) + findings fixed
-- [ ] Real-data validation table filled in
-- [ ] Docs updated (CONFIG/DECISIONS/DESIGN/ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed) — `f1eee59`; unit 232 cases
+- [x] Reviewed (`reviews/slice-17-findings.md`: APPROVE WITH FIXES, 2 MAJOR + 3 MINOR + 2 NIT) + all fixed — `2d22c28` (+ `f013320` lever-accumulator reset on the rot3d rising edge); unit 239 cases / 14591 asserts
+- [x] Real-data validation — table below
+- [x] Docs updated (CONFIG/DECISIONS D26/DESIGN/ISSUES) — orchestrator
+
+### Real-data validation (2026-06-11, `rot3d_enabled=true` + centroid + one)
+
+| Probe | result |
+|---|---|
+| EuRoC rotation extrinsic (truth yaw 8° pitch 5° roll 4°) | log read [0.0635633, 0.0919568, 0.136435] vs truth [0.0635633, 0.0919567, 0.1364349] → err **1.6e-7 rad = 9.1e-6°**, COMMITTED |
+| EuRoC lever, unit-scale injection (truth [0.3, −0.2, 0.15]) | **[0.299988, −0.200001, 0.150000]** — µm-level, committed |
+| EuRoC lever, scale-1.08 injection | [0.265, −0.201, 0.163] — the 3.5 cm x-residual is ENTIRELY the unrecovered source scale inflating `t_B` in the rows (scale unobservable on a drone: no straight windows) |
+| KAIST urban07 planar, flag ON | byte-identical to flag OFF (yaw 0.174711 / scale 1.10008 / toff −0.0500026) — gate honest, inert on ground |
+
+Implementer note kept §2's wording honest: the lever-row coupling is realized calibrator-internally (rows use the running R̂ once the BBw gate opens), and "decay per accepted window" means per rot3d-row-accepted (depositing) window.
+
+**Follow-up identified (next slice candidate)**: the hand-eye translation row is linear in `(t_X, 1/s)` → a turn-regime **joint lever+scale** 4-unknown LS would recover scale WITHOUT the straight regime, closing the last calibration DOF on 3D motion (and the EuRoC lever-under-scale case above).
