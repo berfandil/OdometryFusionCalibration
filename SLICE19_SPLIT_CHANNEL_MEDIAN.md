@@ -38,7 +38,7 @@ Split path: `q_trans = q_scale·spread_trans²·I₃ + q_floor[0:3]`, `q_rot = q
 - `split_median` routes the fusion solve to `solve_split`; consensus motion/omega/trans, calibrator feeds, timesync, lifecycle — all consume `SplitResult.value` exactly where `Result.value` flows today.
 - Adaptive-Q consumes the two spreads (1.3).
 - **Slice-18 Ω_i under split**: the per-channel solvers are independent ⇒ the median influence is block-diagonal `Ω_i = blkdiag(Ω_trans_i, Ω_rot_i)`, each 3×3 from the per-channel Weiszfeld fixed point (same IFT structure per channel with that channel's FINAL weights — including any veto scaling). Extend the FD pin (`tests/test_multi_bias.cpp` harness exists) for the split path; `multi_bias_enabled + split_median` together must be FD-consistent. Coupled path's 6×6 Ω_i untouched.
-- Slice-9 reliability stays scalar and multiplies both channels (per-channel reliability = layer (b), out of scope).
+- Slice-9 reliability stays scalar and multiplies both channels (per-channel reliability = layer (b), out of scope). **SUPERSEDED — layer (b) shipped as Slice 19b (`51b86bf`)**: per-channel residual EMAs → `rel_rot`/`rel_trans` under split; legacy `SourceHealth.reliability`/`.bias` mirror the translation channel; coupled path byte-identical; see DECISIONS D17 Slice-19b impl note.
 
 ## 2. Acceptance
 
@@ -80,4 +80,4 @@ Real-data (orchestrator, post-merge — KAIST urban07/12/17, recommended urban c
 | urban12 | 0.0133 → **0.0041 rad (0.23°)** | 0.0308 → **0.0183 (1.05°)** | 0.477 → **0.194 m** | full-drive rms rot 5.4° ≈ the FOG floor (4.6°); the 5–30°/61°-spike band GONE; tail ~same (1.88 m); ONE worst window regressed 120→211 m (recorded; everything else better) |
 | urban17 | 0.0055 (=) | 0.0087 (=) | 0.533 (=) | neutral — no regression |
 
-**The fused heading now tracks the best heading source.** Acceptance (<10° full-drive) met. Follow-ups logged: layer (b) per-channel scatter reliability (the Slice-9 residual is still the mixed split_distance on the split path), layer (c) GPS-course drift monitor (auto-discovery of the FOG), the one urban12 window regression, veto floors vs ≫1 s windows.
+**The fused heading now tracks the best heading source.** Acceptance (<10° full-drive) met. Follow-ups logged: ~~layer (b) per-channel scatter reliability~~ (DONE — Slice 19b `51b86bf`), layer (c) GPS-course drift monitor (auto-discovery of the FOG), the one urban12 window regression, veto floors vs ≫1 s windows.
