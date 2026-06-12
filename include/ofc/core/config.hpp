@@ -73,9 +73,10 @@ struct SensorConfig {
     Scalar   weight_prior    = 1.0;
     // ROTATION-channel weight multiplier (Slice 19, split-median policy layer (a) — config
     // priors). Only consumed when Config::split_median is on; multiplies this source's
-    // effective weight in the ROTATION channel only:
-    //   w_rot_i   = clamp(weight_prior_i * reliability_i * sigma_conf_i) * rot_weight_prior_i
-    //   w_trans_i = clamp(weight_prior_i * reliability_i * sigma_conf_i)
+    // effective weight in the ROTATION channel only (Slice 19b: the reliability factor is
+    // the PER-CHANNEL scatter reliability, layer (b)):
+    //   w_rot_i   = clamp(weight_prior_i * reliability_rot_i   * sigma_conf_i) * rot_weight_prior_i
+    //   w_trans_i = clamp(weight_prior_i * reliability_trans_i * sigma_conf_i)
     // (applied OUTSIDE the [weight_floor, weight_cap] clamp: the clamp bounds the noisy
     // Sigma-confidence placeholder, while this is a deliberate datasheet declaration — e.g.
     // a FOG-grade heading source carries rot_weight_prior ~ 10 so fusion's rotation channel
@@ -208,6 +209,8 @@ struct Config {
     //   * reliability_floor in (0, 1] — a NOISY source can never collapse to 0 (always
     //     recoverable); a multiplier of 1 disables down-weighting.
     //   * reliability_cap   in [1, ∞) — a quiet source never DOMINATES the median.
+    // Under split_median (Slice 19b) the SAME three knobs govern BOTH per-channel tracks
+    // (rotation + translation) — deliberately no per-channel knobs.
     Scalar      reliability_floor = 0.2;   // min reliability multiplier (0, 1]
     Scalar      reliability_cap   = 5.0;   // max reliability multiplier [1, ∞)
     Scalar      weight_floor  = 0.05;

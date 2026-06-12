@@ -101,12 +101,33 @@ struct CalibSnapshot {
 //                   biased high or low both read positive; even a zero-mean noisy source
 //                   accrues positive bias). The VARIANCE (resid_var), not bias, is what the
 //                   weight uses to distinguish noise from a systematic offset.
+//
+// PER-CHANNEL reliability/bias (Slice 19b — split-median policy layer (b)). Under
+// Config::split_median the residual feed is PER CHANNEL against the split consensus
+// (d_rot = ||log(R_m^T R_i)|| in rad, d_trans = ||t_i - t_m|| in m), each channel with its
+// own variance-EMA track, so a source noisy in rotation but clean in translation is
+// downweighted ONLY in the rotation channel (and vice versa):
+//   * reliability_rot / reliability_trans — the per-channel reliability multipliers (same
+//                   clamp/warmup semantics as the scalar field). Applied to the matching
+//                   channel weight of the split solve: w_trans = clamp(prior x rel_trans x
+//                   Σ-conf), w_rot = clamp(prior x rel_rot x Σ-conf) x rot_weight_prior.
+//   * bias_rot / bias_trans — the per-channel EMA-mean residual magnitudes (rad / m; the
+//                   same unsigned-magnitude caveat as `bias` above, but unit-pure per
+//                   channel — no lambda mixing).
+// BACK-COMPAT under split: the legacy scalar fields mirror the TRANSLATION channel
+// (`reliability` = reliability_trans, `bias` = bias_trans) — existing consumers read the
+// translation-flavoured quality. On the COUPLED path (split_median = false) the four new
+// fields KEEP THEIR DEFAULTS (1, 1, 0, 0): only the scalar mixed-metric track exists there.
 struct SourceHealth {
     SourceId id          = 0;
     Scalar   weight      = 0.0;
     Scalar   residual    = 0.0;         // to consensus
     Scalar   reliability = 1.0;         // variance-EMA reliability multiplier (Slice 9)
     Scalar   bias        = 0.0;         // EMA-mean residual = systematic component (Slice 9)
+    Scalar   reliability_rot   = 1.0;   // split path: rotation-channel reliability (19b)
+    Scalar   reliability_trans = 1.0;   // split path: translation-channel reliability (19b)
+    Scalar   bias_rot          = 0.0;   // split path: rotation-channel EMA-mean (rad)
+    Scalar   bias_trans        = 0.0;   // split path: translation-channel EMA-mean (m)
     bool     in_window   = false;
     bool     straight    = false;
     bool     turning     = false;

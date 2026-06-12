@@ -469,8 +469,25 @@ struct Estimator::Impl {
     Scalar resid_var[kMaxSourcesCap];
     int    resid_n[kMaxSourcesCap];
     Scalar reliability[kMaxSourcesCap];
+    // PER-CHANNEL variance-EMA reliability state (Slice 19b — split policy layer (b)).
+    // Used ONLY when cfg.split_median: two independent EMA tracks per source, fed from the
+    // per-channel distances to the SPLIT consensus (d_rot = ||log(R_m^T R_i)|| rad,
+    // d_trans = ||t_i - t_m|| m — the channels the split solver actually solved, no lambda
+    // unit-mixing). Same D17 bias/variance split, same alpha/warmup/eps as the scalar
+    // track above; one shared sample count (both channels accrue together each fused
+    // step). Under split the MIXED track above is FROZEN (never updated) and the per-
+    // channel reliabilities replace the scalar one in the channel weights. NOT persisted
+    // (re-warms over kRelWarmup after a restore; only the scalar track is in the payload).
+    Scalar resid_mean_rot[kMaxSourcesCap];
+    Scalar resid_var_rot[kMaxSourcesCap];
+    Scalar resid_mean_trans[kMaxSourcesCap];
+    Scalar resid_var_trans[kMaxSourcesCap];
+    int    resid_n_split[kMaxSourcesCap];
+    Scalar reliability_rot[kMaxSourcesCap];
+    Scalar reliability_trans[kMaxSourcesCap];
     // Fixed stack scratch for the robust baseline (median of warmed-up variances). Sized at
-    // the cap so the per-step median selection is heap-free + bounded (strict core).
+    // the cap so the per-step median selection is heap-free + bounded (strict core). The
+    // split path reuses it SEQUENTIALLY (one channel's pass at a time).
     Scalar rel_scratch[kMaxSourcesCap];
 
     // Lifecycle state (Slice 3, D23). Persisted across steps; the phase is
@@ -931,6 +948,15 @@ Status Estimator::init(const Config& cfg) {
         impl_->resid_var[i]         = Scalar(0);
         impl_->resid_n[i]           = 0;
         impl_->reliability[i]       = Scalar(1);
+        // Per-channel reliability reset (Slice 19b, split path): same clean-EMA/neutral-
+        // multiplier contract as the scalar track.
+        impl_->resid_mean_rot[i]    = Scalar(0);
+        impl_->resid_var_rot[i]     = Scalar(0);
+        impl_->resid_mean_trans[i]  = Scalar(0);
+        impl_->resid_var_trans[i]   = Scalar(0);
+        impl_->resid_n_split[i]     = 0;
+        impl_->reliability_rot[i]   = Scalar(1);
+        impl_->reliability_trans[i] = Scalar(1);
         // Per-sensor smoother gate (Slice 10): bound in add_source(); default off.
         impl_->smooth_source[i]     = false;
         impl_->calib_slot[i]        = -1;
@@ -1184,6 +1210,12 @@ Status Estimator::step(Timestamp now) {
         h.residual    = Scalar(0);
         h.reliability = Scalar(1);
         h.bias        = Scalar(0);
+        // Per-channel diagnostics (Slice 19b) reset to their neutral defaults; re-published
+        // below for the split path's participating slots only (coupled path: stay defaults).
+        h.reliability_rot   = Scalar(1);
+        h.reliability_trans = Scalar(1);
+        h.bias_rot          = Scalar(0);
+        h.bias_trans        = Scalar(0);
 
         if (!q.ok()) continue;
 
@@ -1232,14 +1264,26 @@ Status Estimator::step(Timestamp now) {
 
         // Fusion median: only participating sources (cold-start switch, D6).
         if (s.participates(i)) {
-            s.aligned[n]  = A;
-            s.weights[n]  = w;
-            // Slice 19: the rotation channel's weight = the clamped fusion weight times
-            // the per-source rotation prior. Written only when the split path will read
-            // it (review NIT: the coupled path never reads weights_rot — don't dead-store).
-            if (cfg.split_median) s.weights_rot[n] = w * s.rot_weight_prior[i];
+            s.aligned[n] = A;
+            if (cfg.split_median) {
+                // Slice 19b (policy layer b): PER-CHANNEL weights. The scalar Slice-9
+                // reliability does not apply under split (its mixed EMA is frozen — the
+                // per-channel tracks replace it): each channel's weight carries its OWN
+                // reliability, clamped exactly like the coupled w, with the rotation
+                // datasheet prior composing OUTSIDE the clamp (SensorConfig contract).
+                const Scalar w_base = s.weight_prior[i] * sigma_conf;
+                const Scalar wt = std::max(cfg.weight_floor, std::min(cfg.weight_cap,
+                                           w_base * s.reliability_trans[i]));
+                const Scalar wr = std::max(cfg.weight_floor, std::min(cfg.weight_cap,
+                                           w_base * s.reliability_rot[i]));
+                s.weights[n]     = wt;
+                s.weights_rot[n] = wr * s.rot_weight_prior[i];
+                h.weight         = wt;   // legacy diagnostic = the translation channel
+            } else {
+                s.weights[n] = w;
+                h.weight     = w;
+            }
             s.med_slot[n] = i;
-            h.weight      = w;
             ++n;
         }
     }
@@ -1290,20 +1334,87 @@ Status Estimator::step(Timestamp now) {
     // median); a covered source not in the median keeps its residual at 0.
     //
     // VARIANCE-EMA RELIABILITY (Slice 9, D17). Each fused step, attribute the consensus
-    // distance d to the participating slot and accrue an EMA mean (bias) + EMA variance
-    // (zero-mean scatter) of d. Then recompute the reliability multiplier from a robust
+    // distance to the participating slot and accrue an EMA mean (bias) + EMA variance
+    // (zero-mean scatter). Then recompute the reliability multiplier from a robust
     // baseline (the median of the warmed-up participants' variances). The update is
     // strictly AFTER the median + weights are formed (causal — this step's residual never
-    // weights this step's median). Bounded by n (<= max_sources); no heap.
+    // weights this step's median). Bounded by n (<= max_sources); no heap. The residual is
+    // PATH-DEPENDENT: coupled = the MIXED split_distance feeding the scalar track; split =
+    // PER-CHANNEL distances feeding two independent tracks (Slice 19b, layer (b)).
     const Scalar alpha = cfg.reliability_ema_alpha;
+    if (cfg.split_median) {
+        // ---- PER-CHANNEL residuals + reliability (Slice 19b, split policy layer b) ----
+        // The split path feeds TWO independent EMA tracks per source from the PER-CHANNEL
+        // distances to the split consensus — the channels the solver actually solved:
+        //   d_rot = ||log(R_m^T R_i)|| (rad),  d_trans = ||t_i - t_m|| (m).
+        // Same D17 bias/variance split, same causal ordering, same warmup/eps semantics as
+        // the scalar pass in the else-branch below (see its commentary); the MIXED
+        // split_distance EMA (resid_mean/var) deliberately does NOT update under split —
+        // the per-channel state replaces it (the coupled path stays byte-identical).
+        for (int k = 0; k < n; ++k) {
+            const int i = s.med_slot[k];
+            SourceHealth& h = s.result.health[i];
+            const Scalar d_rot   = so3::log(med.value.R.transpose() * s.aligned[k].R).norm();
+            const Scalar d_trans = (s.aligned[k].t - med.value.t).norm();
+            // The published residual diagnostic keeps the mixed metric (the same scalar
+            // the coupled path reports): sqrt(rot^2 + lambda*trans^2) == split_distance.
+            h.residual = std::sqrt(d_rot * d_rot
+                                   + cfg.metric_lambda * d_trans * d_trans);
+            if (s.resid_n_split[i] == 0) {
+                s.resid_mean_rot[i]   = d_rot;
+                s.resid_var_rot[i]    = Scalar(0);
+                s.resid_mean_trans[i] = d_trans;
+                s.resid_var_trans[i]  = Scalar(0);
+            } else {
+                const Scalar dr = d_rot - s.resid_mean_rot[i];
+                s.resid_mean_rot[i] += alpha * dr;
+                s.resid_var_rot[i]  += alpha * (dr * dr - s.resid_var_rot[i]);
+                const Scalar dt_ = d_trans - s.resid_mean_trans[i];
+                s.resid_mean_trans[i] += alpha * dt_;
+                s.resid_var_trans[i]  += alpha * (dt_ * dt_ - s.resid_var_trans[i]);
+            }
+            ++s.resid_n_split[i];
+        }
+        // Per-channel reliability recompute: the scalar pass (robust median-of-variances
+        // baseline over this step's warmed-up participants, kRelVarEps conditioning,
+        // [floor, cap] clamp — see the coupled branch's commentary) run ONCE PER CHANNEL
+        // with that channel's variance track, reusing the fixed scratch sequentially.
+        const Scalar* const var_of[2] = {s.resid_var_rot, s.resid_var_trans};
+        Scalar* const       rel_of[2] = {s.reliability_rot, s.reliability_trans};
+        for (int ch = 0; ch < 2; ++ch) {
+            int qn = 0;
+            for (int k = 0; k < n; ++k) {
+                const int i = s.med_slot[k];
+                if (s.resid_n_split[i] >= kRelWarmup) s.rel_scratch[qn++] = var_of[ch][i];
+            }
+            if (qn < 2) continue;   // warmup / low-data: hold the prior channel reliability
+            const int mid = qn / 2;
+            std::nth_element(s.rel_scratch, s.rel_scratch + mid, s.rel_scratch + qn);
+            const Scalar ref_var = std::max(s.rel_scratch[mid], kRelVarEps);
+            for (int k = 0; k < n; ++k) {
+                const int i = s.med_slot[k];
+                if (s.resid_n_split[i] < kRelWarmup) continue;   // stays 1.0 pre-warmup
+                const Scalar ratio = ref_var / std::max(var_of[ch][i], kRelVarEps);
+                rel_of[ch][i] = std::max(cfg.reliability_floor,
+                                         std::min(cfg.reliability_cap, ratio));
+            }
+        }
+        // Surface the per-channel diagnostics; the LEGACY scalar fields mirror the
+        // TRANSLATION channel under split (back-compat — see SourceHealth).
+        for (int k = 0; k < n; ++k) {
+            const int i = s.med_slot[k];
+            SourceHealth& h     = s.result.health[i];
+            h.reliability_rot   = s.reliability_rot[i];
+            h.reliability_trans = s.reliability_trans[i];
+            h.bias_rot          = s.resid_mean_rot[i];
+            h.bias_trans        = s.resid_mean_trans[i];
+            h.reliability       = s.reliability_trans[i];
+            h.bias              = s.resid_mean_trans[i];
+        }
+    } else {
     for (int k = 0; k < n; ++k) {
         const int i = s.med_slot[k];
         SourceHealth& h = s.result.health[i];
-        // Slice-19 NIT (known wart, deliberate): on the SPLIT path this residual — and the
-        // reliability EMA it feeds — is still the MIXED split_distance (rot^2 + lambda*
-        // trans^2) against a consensus the mixed metric never solved for. Per-channel
-        // residual/reliability is policy layer (b), the explicit Slice-19 follow-up; when
-        // layer (b) lands, replace this with per-channel distances under split_median.
         const Scalar d = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
         h.residual = d;
 
@@ -1369,6 +1480,7 @@ Status Estimator::step(Timestamp now) {
         h.reliability = s.reliability[i];
         h.bias        = s.resid_mean[i];
     }
+    }   // end coupled-path (mixed-metric) reliability branch
 
     // ---- Calibration stage (Phase 1 Slice 6 + Phase 2 Slice 7; D5/D10/D11/D20/D21) ----
     // The fused body angular SPEED is log(med.R)/dt (rad/s); the fused translation is the

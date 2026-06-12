@@ -26,6 +26,7 @@ add_executable(ofc_tests
     test_smoother.cpp
     test_smoother_calib.cpp
     test_weights.cpp
+    test_weights_split.cpp
     test_sim.cpp
     test_validation.cpp
     test_correction.cpp
