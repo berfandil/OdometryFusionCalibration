@@ -229,6 +229,29 @@ public:
     static Mat6 bias_coupling(const SE3& med, const SE3& A_i, const Mat6& Omega_i,
                               const SE3& X_i, Scalar dt);
 
+    // ---- Split-median influence (Slice 19, D3 amendment) --------------------------------
+    // The per-channel counterpart of median_influence() for the split solver
+    // (median::solve_split): the rotation and translation medians are INDEPENDENT
+    // Weiszfeld fixed points, so the median influence is BLOCK-DIAGONAL on the
+    // [trans; rot] tangent — Omega_i = blkdiag(Omega_trans_i, Omega_rot_i), each 3x3
+    // from that channel's own IFT at its fixed point with that channel's FINAL weights
+    // (the veto-scaled effective weights solve_split reports via w_*_final — the
+    // influence must describe the median ACTUALLY solved):
+    //     channel fixed point:  sum_i u_i x_i = 0,  u_i = w_i / d_i
+    //       trans: x_i = t_i - t_m,            d_i = |x_i|        (Euclidean)
+    //       rot:   x_i = log(R_m^T R_i),       d_i = |x_i|        (geodesic)
+    //     Omega_chan_i = M^-1 u_i P_i,  P_i = I3 - x_i x_i^T / d_i^2,  M = sum_j u_j P_j.
+    // Same per-channel regimes as the coupled influence (all FD-pinned in
+    // tests/test_multi_bias.cpp): n == 1 -> I3; n == 2 -> the FIXED interpolation weight
+    // (w_i / sum w) * I3; absent (w = 0) -> 0; coincident vertex (d <= eps) -> the
+    // coincident set splits I3 by weight, others -> 0 (no 1/d blow-up). Channels may take
+    // different branches independently. w_of clamp/uniform-fallback mirrors the solver per
+    // channel. bias_coupling() above consumes the assembled 6x6 unchanged (its transports
+    // are themselves [trans; rot] block-diagonal).
+    static void median_influence_split(const SE3& med, const SE3* A, const Scalar* w_rot,
+                                       const Scalar* w_trans, int n, Scalar eps,
+                                       Mat6* Omega);
+
     // Maximum number of simultaneously-tracked bias sources (compile-time; augmented error
     // dim <= 12 + 6*4 = 36).
     static constexpr int kMaxBiasSources = 4;
@@ -314,6 +337,15 @@ public:
     // fudge that compensated for the OLD pinning median's INFLATED spread; with the fixed
     // median it over-divides Q and makes the filter overconfident.)
     static Mat6 adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor);
+
+    // Per-channel adaptive process noise for the SPLIT median path (Slice 19, §1.3):
+    //   q_pose[0:3] (trans) = (q_scale * spread_trans^2) * I3 + diag(q_floor[0:3])
+    //   q_pose[3:6] (rot)   = (q_scale * spread_rot^2)   * I3 + diag(q_floor[3:6])
+    // One SHARED q_scale knob (the split-ON cov-cal sweep showed no per-channel scale is
+    // needed to meet the band); the two spreads are the split solver's per-channel RMS
+    // distances (m / rad — no lambda unit-mixing). [trans; rot] order as adaptive_q().
+    static Mat6 adaptive_q_split(Scalar spread_trans, Scalar spread_rot, Scalar q_scale,
+                                 const Scalar* q_floor);
 
     const State& state() const { return state_; }
     Mat12        cov()   const { return state_.cov; }

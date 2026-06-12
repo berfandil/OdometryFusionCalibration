@@ -568,3 +568,440 @@ TEST_CASE("slice18 production: influence edge cases — absent, sole, n==2, coin
         CHECK((sum - Mat6::Identity()).norm() < 1e-6);    // the sum rule still holds
     }
 }
+
+// ===========================================================================================
+// SLICE 19 — split-median (per-channel) coupling FD pins. The split solver's two channels
+// are INDEPENDENT Weiszfeld fixed points, so the median influence is BLOCK-DIAGONAL
+// Omega_i = blkdiag(Omega_trans_i, Omega_rot_i) (each 3x3 from that channel's own IFT with
+// that channel's FINAL — veto-scaled — weights). Per the Slice-18 discipline these pins run
+// against the PRODUCTION blocks (Eskf::median_influence_split + the unchanged
+// Eskf::bias_coupling) THROUGH the actual de-bias + frame-align + solve_split pipeline,
+// BEFORE the estimator wires them into F. The coupled path's 6x6 pins above are untouched.
+// ===========================================================================================
+namespace {
+
+// The split pipeline under test: per-source de-bias, frame-align, per-channel split median
+// (production veto path included). Returns the split consensus; optionally the aligned
+// inputs and the FINAL per-channel weights the solve consumed (veto-scaled).
+SE3 debias_align_split_median(const std::vector<SE3>& B, const std::vector<SE3>& X,
+                              const std::vector<Vec6>& bias, const std::vector<Scalar>& w_rot,
+                              const std::vector<Scalar>& w_trans, Scalar dt,
+                              const median::Params& mp, bool veto, std::vector<SE3>* A_out,
+                              std::vector<Scalar>* wr_final, std::vector<Scalar>* wt_final) {
+    const int n = static_cast<int>(B.size());
+    std::vector<SE3> A(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const SE3 Bp = se3::compose(B[static_cast<size_t>(i)],
+                                    se3::exp(-bias[static_cast<size_t>(i)] * dt));
+        A[static_cast<size_t>(i)] =
+            se3::compose(se3::compose(X[static_cast<size_t>(i)], Bp),
+                         se3::inverse(X[static_cast<size_t>(i)]));
+    }
+    if (A_out != nullptr) *A_out = A;
+    std::vector<Scalar> wrf(static_cast<size_t>(n)), wtf(static_cast<size_t>(n));
+    const median::SplitResult r = median::solve_split(A.data(), w_rot.data(), w_trans.data(),
+                                                      n, mp, veto, wrf.data(), wtf.data());
+    if (wr_final != nullptr) *wr_final = wrf;
+    if (wt_final != nullptr) *wt_final = wtf;
+    return r.value;
+}
+
+// FD Jacobian d(right-tangent of the split median)/d(bias_i) (central differences),
+// through the FULL production split pipeline (veto included).
+Mat6 fd_jacobian_split(const std::vector<SE3>& B, const std::vector<SE3>& X,
+                       const std::vector<Vec6>& bias, const std::vector<Scalar>& w_rot,
+                       const std::vector<Scalar>& w_trans, Scalar dt,
+                       const median::Params& mp, bool veto, const SE3& med0, int i, Scalar e) {
+    Mat6 J;
+    for (int j = 0; j < 6; ++j) {
+        std::vector<Vec6> bp = bias, bm = bias;
+        bp[static_cast<size_t>(i)](j) += e;
+        bm[static_cast<size_t>(i)](j) -= e;
+        const SE3 gp = debias_align_split_median(B, X, bp, w_rot, w_trans, dt, mp, veto,
+                                                 nullptr, nullptr, nullptr);
+        const SE3 gm = debias_align_split_median(B, X, bm, w_rot, w_trans, dt, mp, veto,
+                                                 nullptr, nullptr, nullptr);
+        const Vec6 xp = se3::log(se3::compose(se3::inverse(med0), gp));
+        const Vec6 xm = se3::log(se3::compose(se3::inverse(med0), gm));
+        J.col(j) = (xp - xm) / (2.0 * e);
+    }
+    return J;
+}
+
+// Per-channel rig statistics at a channel median, used to SELECT smooth-regime rigs for
+// the FD pins (the same discipline as the coupled pin's KNOWN-GAP note): FD is only a
+// valid oracle where the pipeline is differentiable, i.e.
+//   (a) no source sits near the veto threshold (a FD-flipped flag is a discontinuity), and
+//   (b) the channel median is INTERIOR (a 3-point R^3/SO(3) median frequently sits ON a
+//       vertex — the documented non-smooth limit, pinned separately via the limit branch).
+// Production behavior at/near a vertex is the bounded graceful-degradation caveat of the
+// design; the smooth IFT pin deliberately samples away from it.
+struct ChanStats {
+    Scalar max_ratio = 0.0;    // max_i d_i / leave-one-out spread (veto margin probe)
+    Scalar min_d     = 1e30;   // min_i d_i (interiority probe)
+    Scalar spread    = 0.0;    // weighted RMS distance
+};
+ChanStats chan_stats(const std::vector<Vec3>& x, const std::vector<Scalar>& w) {
+    const int n = static_cast<int>(x.size());
+    ChanStats s;
+    Scalar Sw = 0.0, Sd2 = 0.0;
+    std::vector<Scalar> d(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        d[static_cast<size_t>(i)] = x[static_cast<size_t>(i)].norm();
+        Sw  += w[static_cast<size_t>(i)];
+        Sd2 += w[static_cast<size_t>(i)] * d[static_cast<size_t>(i)] * d[static_cast<size_t>(i)];
+        s.min_d = std::min(s.min_d, d[static_cast<size_t>(i)]);
+    }
+    s.spread = (Sw > 0.0) ? std::sqrt(Sd2 / Sw) : 0.0;
+    for (int i = 0; i < n; ++i) {
+        const Scalar den = Sw - w[static_cast<size_t>(i)];
+        const Scalar num = Sd2 - w[static_cast<size_t>(i)] * d[static_cast<size_t>(i)] *
+                                     d[static_cast<size_t>(i)];
+        const Scalar loo = (den > 0.0 && num > 0.0) ? std::sqrt(num / den) : 0.0;
+        const Scalar ratio = (loo > 0.0) ? (d[static_cast<size_t>(i)] / loo)
+                                         : ((d[static_cast<size_t>(i)] > 0.0) ? 1e30 : 0.0);
+        s.max_ratio = std::max(s.max_ratio, ratio);
+    }
+    return s;
+}
+
+// Channel tangents of the aligned inputs at a split median.
+void split_tangents(const SE3& med, const std::vector<SE3>& A, std::vector<Vec3>& xt,
+                    std::vector<Vec3>& xr) {
+    const int n = static_cast<int>(A.size());
+    xt.resize(static_cast<size_t>(n));
+    xr.resize(static_cast<size_t>(n));
+    const Mat3 RmT = med.R.transpose();
+    for (int i = 0; i < n; ++i) {
+        xt[static_cast<size_t>(i)] = A[static_cast<size_t>(i)].t - med.t;
+        xr[static_cast<size_t>(i)] = so3::log(RmT * A[static_cast<size_t>(i)].R);
+    }
+}
+
+} // namespace
+
+// ===========================================================================
+// Split path, n >= 3 (per-channel Weiszfeld, distinct channel weights, no outlier — the
+// veto is ON but must not fire): the production block-diagonal influence matches FD.
+// ===========================================================================
+TEST_CASE("slice19 FD pin: split-median n>=3 coupling — production blkdiag(Omega_t, Omega_r) "
+          "block verified through the split pipeline (veto on, not firing)") {
+    const Scalar dt = 0.1;
+    const median::Params mp = tight_params(1.0);   // lambda unused by the split channels
+
+    Scalar worst_exact = 0.0, worst_fd_consistency = 0.0, worst_sum_rule = 0.0;
+    Scalar worst_offdiag = 0.0;
+    int blocks = 0, accepted = 0, attempts = 0;
+
+    while (accepted < 8 && attempts < 200) {
+        ++attempts;
+        const int n = 3 + (accepted % 2);
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(n, dt, B, X, bias, w);
+        // DISTINCT per-channel weights (the split capability under test).
+        std::vector<Scalar> w_rot = w, w_trans = w;
+        for (int i = 0; i < n; ++i) {
+            w_rot[static_cast<size_t>(i)]   = urand(0.5, 2.0);
+            w_trans[static_cast<size_t>(i)] = urand(0.5, 2.0);
+        }
+
+        std::vector<SE3> A;
+        std::vector<Scalar> wrf, wtf;
+        const SE3 med0 = debias_align_split_median(B, X, bias, w_rot, w_trans, dt, mp,
+                                                   /*veto=*/true, &A, &wrf, &wtf);
+
+        // SMOOTH-REGIME RIG SELECTION (see chan_stats): every source comfortably below the
+        // veto threshold (no FD-flipped flag) and both channel medians comfortably interior
+        // (the vertex limit is non-smooth — pinned via its limit branch in the edge-case
+        // test below). A random draw failing either is RE-DRAWN, not asserted against.
+        std::vector<Vec3> xt, xr;
+        split_tangents(med0, A, xt, xr);
+        const ChanStats st = chan_stats(xt, wtf);
+        const ChanStats sr = chan_stats(xr, wrf);
+        const bool no_fire  = st.max_ratio < 2.5 && sr.max_ratio < 2.5;
+        const bool interior = st.min_d > 0.25 * st.spread && sr.min_d > 0.25 * sr.spread;
+        if (!no_fire || !interior) continue;
+
+        // FD SELF-CONSISTENCY as the final acceptance step: FD is only a valid oracle
+        // where the two epsilons agree (a derivative KINK inside the FD ball — a channel
+        // median near its smooth/vertex regime boundary, which the structural screens
+        // above cannot always see — makes BOTH FD reads meaningless; the median VALUE is
+        // continuous there, only its derivative is not, the design's documented caveat).
+        // A kinked draw is RE-DRAWN; the accepted/attempts counts keep the screen honest.
+        std::vector<Mat6> J_fd(static_cast<size_t>(n));
+        bool fd_ok = true;
+        Scalar rig_fd_consistency = 0.0;
+        for (int i = 0; i < n; ++i) {
+            J_fd[static_cast<size_t>(i)] = fd_jacobian_split(B, X, bias, w_rot, w_trans, dt,
+                                                             mp, true, med0, i, kFdEps);
+            const Mat6 J_fd2 = fd_jacobian_split(B, X, bias, w_rot, w_trans, dt, mp, true,
+                                                 med0, i, kFdEps * 10.0);
+            const Scalar scale = std::max(J_fd[static_cast<size_t>(i)].norm(), 1e-12);
+            const Scalar c = (J_fd[static_cast<size_t>(i)] - J_fd2).norm() / scale;
+            rig_fd_consistency = std::max(rig_fd_consistency, c);
+            if (c > 0.02) { fd_ok = false; break; }
+        }
+        if (!fd_ok) continue;
+        ++accepted;
+
+        // The accepted (no-fire) rig's final weights equal the inputs by construction.
+        for (int i = 0; i < n; ++i) {
+            REQUIRE(wrf[static_cast<size_t>(i)] ==
+                    doctest::Approx(w_rot[static_cast<size_t>(i)]));
+            REQUIRE(wtf[static_cast<size_t>(i)] ==
+                    doctest::Approx(w_trans[static_cast<size_t>(i)]));
+        }
+
+        // Production influence from the FINAL weights the solve consumed.
+        std::vector<Mat6> Om(static_cast<size_t>(n));
+        Eskf::median_influence_split(med0, A.data(), wrf.data(), wtf.data(), n, mp.eps,
+                                     Om.data());
+
+        // Block-diagonality + the per-channel sum rule.
+        Mat6 sumO = Mat6::Zero();
+        for (int i = 0; i < n; ++i) {
+            sumO += Om[static_cast<size_t>(i)];
+            worst_offdiag = std::max(worst_offdiag,
+                                     Om[static_cast<size_t>(i)].topRightCorner(3, 3).norm());
+            worst_offdiag = std::max(worst_offdiag,
+                                     Om[static_cast<size_t>(i)].bottomLeftCorner(3, 3).norm());
+        }
+        worst_sum_rule = std::max(worst_sum_rule, (sumO - Mat6::Identity()).norm());
+
+        for (int i = 0; i < n; ++i) {
+            const Scalar scale = std::max(J_fd[static_cast<size_t>(i)].norm(), 1e-12);
+            const Mat6 J_prod = Eskf::bias_coupling(med0, A[static_cast<size_t>(i)],
+                                                    Om[static_cast<size_t>(i)],
+                                                    X[static_cast<size_t>(i)], dt);
+            const Scalar e_exact = (J_fd[static_cast<size_t>(i)] - J_prod).norm() / scale;
+            worst_exact          = std::max(worst_exact, e_exact);
+            ++blocks;
+            MESSAGE("split rig " << accepted << " src " << i << "  rel-err prod=" << e_exact);
+        }
+        worst_fd_consistency = std::max(worst_fd_consistency, rig_fd_consistency);
+    }
+
+    MESSAGE("split FD summary over " << blocks << " blocks (" << accepted << " rigs / "
+            << attempts << " draws): worst prod-err=" << worst_exact
+            << "  worst fd-consistency=" << worst_fd_consistency
+            << "  worst |sum Omega - I|=" << worst_sum_rule
+            << "  worst off-diag block norm=" << worst_offdiag);
+
+    REQUIRE(accepted == 8);                   // enough smooth-regime rigs found
+    REQUIRE(worst_fd_consistency < 0.02);     // FD trustworthy on every accepted rig
+    CHECK(worst_offdiag == 0.0);              // EXACTLY block-diagonal by construction
+    CHECK(worst_sum_rule < 1e-6);             // per-channel sum rule (LU solve precision)
+    // VERIFIED: the production per-channel IFT blocks match FD (residual = the small-angle
+    // tangent-transport terms, same order as the coupled pin).
+    CHECK(worst_exact < 0.05);
+}
+
+// ===========================================================================
+// Split path, VETO-SCALED weights: a both-channel outlier trips the veto; the production
+// influence built from the FINAL (scaled) weights must still match FD through the FULL
+// veto-active pipeline — incl. the vetoed source's own block.
+// ===========================================================================
+TEST_CASE("slice19 FD pin: split-median coupling under an ACTIVE veto — production blocks "
+          "from the veto-scaled FINAL weights match FD") {
+    const Scalar dt = 0.1;
+    const median::Params mp = tight_params(1.0);
+
+    Scalar worst = 0.0, worst_fd_consistency = 0.0;
+    int accepted = 0, attempts = 0;
+    while (accepted < 4 && attempts < 200) {
+        ++attempts;
+        const int n = 4;
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(n, dt, B, X, bias, w);
+        std::vector<Scalar> w_rot = w, w_trans = w;
+        // Make source 3 a gross BOTH-channel outlier (far beyond 3x the leave-one-out
+        // spreads, far from any threshold edge so the FD perturbation cannot flip a flag).
+        {
+            SE3 Afault;
+            Afault.R = so3::exp(Vec3(1.2, -0.8, 0.6));
+            Afault.t = Vec3(8.0, -5.0, 3.0);
+            // Plant it in the source frame: B = X^-1 A X.
+            B[3] = se3::compose(se3::compose(se3::inverse(X[3]), Afault), X[3]);
+        }
+
+        std::vector<SE3> A;
+        std::vector<Scalar> wrf, wtf;
+        const SE3 med0 = debias_align_split_median(B, X, bias, w_rot, w_trans, dt, mp,
+                                                   /*veto=*/true, &A, &wrf, &wtf);
+        // The veto FIRED on the outlier (both directions: its gross rotation scaled its
+        // translation weight and vice versa) — deterministic given the gross plant.
+        REQUIRE(wtf[3] == doctest::Approx(w_trans[3] * median::kVetoWeightScale));
+        REQUIRE(wrf[3] == doctest::Approx(w_rot[3] * median::kVetoWeightScale));
+
+        // SMOOTH-REGIME SELECTION over the INLIERS at the final (post-veto) medians: the
+        // inlier sub-rig must be interior in both channels (a vertex-pinned 3-point channel
+        // median is the documented non-smooth limit — not FD-pinnable; see chan_stats).
+        // The inliers' veto margins are guaranteed by the gross outlier (it dominates their
+        // leave-one-out spreads), so only interiority is screened here.
+        {
+            std::vector<SE3> A_in(A.begin(), A.begin() + 3);
+            std::vector<Scalar> wt_in(wtf.begin(), wtf.begin() + 3);
+            std::vector<Vec3> xt, xr;
+            split_tangents(med0, A_in, xt, xr);
+            const ChanStats st = chan_stats(xt, wt_in);
+            std::vector<Scalar> wr_in(wrf.begin(), wrf.begin() + 3);
+            const ChanStats sr = chan_stats(xr, wr_in);
+            if (!(st.min_d > 0.25 * st.spread && sr.min_d > 0.25 * sr.spread)) continue;
+        }
+        ++accepted;
+
+        std::vector<Mat6> Om(static_cast<size_t>(n));
+        Eskf::median_influence_split(med0, A.data(), wrf.data(), wtf.data(), n, mp.eps,
+                                     Om.data());
+        // Per-trial FD blocks first (the error metric normalizes a TINY block — the vetoed
+        // source's — by the trial's LARGEST block, not by itself: at a ~2 rad geodesic
+        // offset the small-angle transport residual is O(1) RELATIVE on that near-zero
+        // block while being negligible ABSOLUTELY; the design's documented small-angle
+        // caveat, not a coupling error).
+        std::vector<Mat6> J_fd(static_cast<size_t>(n));
+        Scalar maxJ = 1e-12;
+        for (int i = 0; i < n; ++i) {
+            J_fd[static_cast<size_t>(i)] = fd_jacobian_split(B, X, bias, w_rot, w_trans, dt,
+                                                             mp, true, med0, i, kFdEps);
+            maxJ = std::max(maxJ, J_fd[static_cast<size_t>(i)].norm());
+        }
+        for (int i = 0; i < n; ++i) {
+            const Mat6 J_fd2 = fd_jacobian_split(B, X, bias, w_rot, w_trans, dt, mp, true,
+                                                 med0, i, kFdEps * 10.0);
+            const Scalar scale = std::max(J_fd[static_cast<size_t>(i)].norm(),
+                                          Scalar(0.25) * maxJ);
+            worst_fd_consistency = std::max(
+                worst_fd_consistency, (J_fd[static_cast<size_t>(i)] - J_fd2).norm() / scale);
+            const Mat6 J_prod = Eskf::bias_coupling(med0, A[static_cast<size_t>(i)],
+                                                    Om[static_cast<size_t>(i)],
+                                                    X[static_cast<size_t>(i)], dt);
+            const Scalar err = (J_fd[static_cast<size_t>(i)] - J_prod).norm() / scale;
+            worst = std::max(worst, err);
+            MESSAGE("veto rig " << accepted << " src " << i << " rel-err=" << err);
+        }
+    }
+    MESSAGE("veto FD summary: accepted=" << accepted << " / attempts=" << attempts
+            << "  worst err=" << worst << "  worst fd-consistency=" << worst_fd_consistency);
+    REQUIRE(accepted == 4);
+    REQUIRE(worst_fd_consistency < 0.02);
+    CHECK(worst < 0.05);
+}
+
+// ===========================================================================
+// Split regime pins: n == 1 (Omega = I -> Option A exact), n == 2 (per-channel FIXED
+// interpolation weights — DIFFERENT per channel), absent-in-one-channel, vertex limits.
+// ===========================================================================
+TEST_CASE("slice19 production: split influence edge cases — sole, n==2 per-channel "
+          "interpolation, channel-absent source, vertex no-blow-up") {
+    const Scalar dt = 0.1, eps = 1e-12;
+    const median::Params mp = tight_params(1.0);
+
+    // --- sole participant: Omega = I6, J = -dt*Ad(X).
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(1, dt, B, X, bias, w);
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_split_median(B, X, bias, w, w, dt, mp, true, &A,
+                                                   nullptr, nullptr);
+        Mat6 Om;
+        Eskf::median_influence_split(med0, A.data(), w.data(), w.data(), 1, eps, &Om);
+        CHECK((Om - Mat6::Identity()).norm() < 1e-12);
+        const Mat6 J = Eskf::bias_coupling(med0, A[0], Om, X[0], dt);
+        CHECK((J - (-dt * se3::adjoint(X[0]))).norm() < 1e-9);
+    }
+
+    // --- n == 2: per-channel FIXED interpolation weights, DIFFERENT per channel — the
+    //     block diag carries two different scalars (impossible for the coupled influence).
+    //     FD-pinned through the split pipeline.
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(2, dt, B, X, bias, w);
+        std::vector<Scalar> w_rot = w, w_trans = w;
+        w_rot[0] = 2.0; w_rot[1] = 0.5;       // rot interp 0.8 / 0.2
+        w_trans[0] = 0.5; w_trans[1] = 2.0;   // trans interp 0.2 / 0.8
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_split_median(B, X, bias, w_rot, w_trans, dt, mp, true,
+                                                   &A, nullptr, nullptr);
+        Mat6 Om[2];
+        Eskf::median_influence_split(med0, A.data(), w_rot.data(), w_trans.data(), 2, eps, Om);
+        CHECK((Om[0].bottomRightCorner(3, 3) - (2.0 / 2.5) * Mat3::Identity()).norm() < 1e-12);
+        CHECK((Om[0].topLeftCorner(3, 3) - (0.5 / 2.5) * Mat3::Identity()).norm() < 1e-12);
+        CHECK((Om[1].bottomRightCorner(3, 3) - (0.5 / 2.5) * Mat3::Identity()).norm() < 1e-12);
+        CHECK((Om[1].topLeftCorner(3, 3) - (2.0 / 2.5) * Mat3::Identity()).norm() < 1e-12);
+        Scalar worst = 0.0;
+        for (int i = 0; i < 2; ++i) {
+            const Mat6 J_fd = fd_jacobian_split(B, X, bias, w_rot, w_trans, dt, mp, true,
+                                                med0, i, kFdEps);
+            const Mat6 J_prod = Eskf::bias_coupling(med0, A[static_cast<size_t>(i)], Om[i],
+                                                    X[static_cast<size_t>(i)], dt);
+            worst = std::max(worst, (J_fd - J_prod).norm() / std::max(J_fd.norm(), 1e-12));
+        }
+        MESSAGE("split n==2 worst rel-err=" << worst);
+        CHECK(worst < 0.06);
+    }
+
+    // --- channel-absent source: zero weight in ONE channel only -> that channel's block is
+    //     0 while the other block stays live (the per-channel absence the coupled influence
+    //     cannot express); both channel sum rules still hold.
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(4, dt, B, X, bias, w);
+        std::vector<Scalar> w_rot = w, w_trans = w;
+        w_rot[2] = 0.0;                        // absent from the ROTATION channel only
+        std::vector<SE3> A;
+        const SE3 med0 = debias_align_split_median(B, X, bias, w_rot, w_trans, dt, mp, true,
+                                                   &A, nullptr, nullptr);
+        Mat6 Om[4];
+        Eskf::median_influence_split(med0, A.data(), w_rot.data(), w_trans.data(), 4, eps, Om);
+        CHECK(Om[2].bottomRightCorner(3, 3).norm() < 1e-12);   // rot block: absent
+        CHECK(Om[2].topLeftCorner(3, 3).norm() > 1e-3);        // trans block: live
+        Mat6 sum = Mat6::Zero();
+        for (int i = 0; i < 4; ++i) sum += Om[i];
+        CHECK((sum - Mat6::Identity()).norm() < 1e-6);   // sum rule (LU solve precision —
+                                                          // a near-vertex channel median
+                                                          // leaves M mildly ill-conditioned)
+    }
+
+    // --- weight-dominant vertex per channel: exactly ON the vertex -> the limit branch
+    //     (Omega_chan -> I for the dominant source, 0 for the rest); just OFF the vertex ->
+    //     finite + bounded (no 1/d blow-up into the covariance).
+    {
+        std::vector<SE3> B, X;
+        std::vector<Vec6> bias;
+        std::vector<Scalar> w;
+        random_rig(3, dt, B, X, bias, w);
+        std::vector<SE3> A;
+        (void)debias_align_split_median(B, X, bias, w, w, dt, mp, false, &A, nullptr, nullptr);
+        std::vector<Scalar> wd = {10.0, 0.3, 0.3};
+        Mat6 Om[3];
+        Eskf::median_influence_split(A[0], A.data(), wd.data(), wd.data(), 3, eps, Om);
+        bool finite = true;
+        for (int i = 0; i < 3; ++i) finite = finite && Om[i].allFinite();
+        CHECK(finite);
+        CHECK((Om[0] - Mat6::Identity()).norm() < 1e-9);
+        CHECK(Om[1].norm() < 1e-12);
+        CHECK(Om[2].norm() < 1e-12);
+        SE3 med_near = A[0];
+        med_near.t += Vec3(1e-7, 0, 0);                        // off-vertex in TRANS only
+        Eskf::median_influence_split(med_near, A.data(), wd.data(), wd.data(), 3, eps, Om);
+        finite = true;
+        for (int i = 0; i < 3; ++i) finite = finite && Om[i].allFinite();
+        CHECK(finite);
+        CHECK(Om[0].norm() < 10.0);                            // bounded, no 1/d blow-up
+        Mat6 sum = Mat6::Zero();
+        for (int i = 0; i < 3; ++i) sum += Om[i];
+        // Rot channel sits exactly ON the vertex (limit branch), trans just off (smooth
+        // branch) — the channels take DIFFERENT branches and both sum rules still hold.
+        CHECK((sum - Mat6::Identity()).norm() < 1e-6);
+    }
+}

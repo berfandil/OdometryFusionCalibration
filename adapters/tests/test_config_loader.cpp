@@ -501,3 +501,54 @@ TEST_CASE("ConfigLoader: per-DOF bias_process_noise (1 or 6 numbers) + multi_bia
         CHECK(loader.error().find("expected number") != std::string::npos);
     }
 }
+
+TEST_CASE("ConfigLoader: split_median / split_veto / rot_weight_prior parse (Slice 19); "
+          "defaults preserved; bad values reject") {
+    // All three set: the split path enabled, veto disabled, a 10x FOG rotation prior.
+    {
+        const std::string text =
+            "[global]\nmax_sources=2\nreference_sensor_id=0\n"
+            "split_median = true\n"
+            "split_veto = false\n"
+            "[sensor.0]\nid=0\nis_reference=true\n"
+            "[sensor.1]\nid=1\nrot_weight_prior = 10.0\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().split_median);
+        CHECK_FALSE(loader.config().split_veto);
+        CHECK(loader.sensors()[0].rot_weight_prior == doctest::Approx(1.0));   // default
+        CHECK(loader.sensors()[1].rot_weight_prior == doctest::Approx(10.0));
+    }
+    // Keys absent -> defaults (split off = byte-identical coupled; veto on; prior 1).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK_FALSE(loader.config().split_median);
+        CHECK(loader.config().split_veto);
+        CHECK(loader.sensors()[0].rot_weight_prior == doctest::Approx(1.0));
+    }
+    // Bad values: non-bool / non-number reject loudly; a NEGATIVE rot_weight_prior parses
+    // but fails the core validate() (OutOfRange) — surfaced as the validate status.
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nsplit_median = banana\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("split_median") != std::string::npos);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nsplit_veto = banana\n") == Status::InvalidConfig);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid=0\nrot_weight_prior = junk\n")
+              == Status::InvalidConfig);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[sensor.0]\nid=0\nrot_weight_prior = -1.0\n")
+              == Status::OutOfRange);
+    }
+}

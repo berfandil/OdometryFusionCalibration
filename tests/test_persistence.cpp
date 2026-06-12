@@ -485,6 +485,66 @@ TEST_CASE("persistence config-hash guard: flipping subbin_centroid rejects a cro
 }
 
 // ===========================================================================
+// Slice 19: split_median / split_veto / rot_weight_prior are calibration-shaping ->
+// they join the config-hash stream. A blob written under the defaults must be REJECTED
+// by a rig that flips the solver flag, the veto policy, or a sensor's rotation prior
+// (the persisted committed calibration was converged against a DIFFERENT consensus).
+// ===========================================================================
+TEST_CASE("persistence config-hash guard: flipping split_median / split_veto / "
+          "rot_weight_prior rejects a cross-flag restore") {
+    std::vector<unsigned char> blob;
+    converge_and_serialize_scale(blob);    // written with the defaults (split off, veto on)
+
+    static const Trajectory tr = bootstrap_traj();
+
+    // (a) split_median flipped ON -> different hash -> reject.
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.split_median = true;
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (b) split_veto flipped OFF -> different hash -> reject (the veto policy shapes the
+    // consensus the calibration converged against, even though it is split-path-only).
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.split_veto = false;
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (c) A sensor's rot_weight_prior changed -> different hash -> reject.
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        sensors[1].rot_weight_prior = 10.0;
+        Config cfg = make_scale_cfg(sensors);
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (d) POSITIVE CONTROL: a blob written WITH split_median=true restores into an
+    // identical split-ON rig (same-flag hash equality on the new fields).
+    {
+        std::vector<unsigned char> blob_s;
+        converge_and_serialize_scale(blob_s, [](Config& c) { c.split_median = true; });
+
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.split_median = true;                 // SAME flag on the restoring rig
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob_s.data(), static_cast<int>(blob_s.size())) == Status::Ok);
+    }
+}
+
+// ===========================================================================
 // Framing rejections: checksum (flipped byte), version, magic, capacity, NotInitialized.
 // ===========================================================================
 TEST_CASE("persistence framing: checksum / version / magic / capacity / not-initialized") {

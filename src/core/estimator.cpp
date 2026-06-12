@@ -201,6 +201,11 @@ std::uint64_t config_hash(const Config& cfg) {
     // Slice 18 review/B2: the multi-bias prior seeds the learned-bias state a restore
     // carries -> calibration-shaping, hashed.
     w.put_f64(cfg.multi_bias_cov0);
+    // Slice 19: the split-median flag changes WHICH solver forms the consensus (per-channel
+    // Weiszfeld vs the coupled split-metric median) and the veto flag changes its outlier
+    // policy -> both calibration-shaping, hashed. A flip rejects a cross-flag restore.
+    w.put_bool(cfg.split_median);
+    w.put_bool(cfg.split_veto);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -228,6 +233,9 @@ std::uint64_t config_hash(const Config& cfg) {
             w.put_f64(sc.prior_scale);
             w.put_f64(sc.prior_time_offset_s);
             w.put_f64(sc.weight_prior);
+            // Slice 19: the rotation-channel weight prior shapes the split consensus the
+            // calibrators vote against -> calibration-shaping, hashed.
+            w.put_f64(sc.rot_weight_prior);
             w.put_f64(sc.modeled_noise_per_m);
             w.put_f64(sc.modeled_noise_per_rad);
             w.put_f64(sc.kf_process_noise);
@@ -275,6 +283,9 @@ struct Estimator::Impl {
     SE3    prior_extrinsic[kMaxSourcesCap];
     Scalar prior_scale[kMaxSourcesCap];
     Scalar weight_prior[kMaxSourcesCap];
+    // Per-source ROTATION-channel weight multiplier (Slice 19; SensorConfig::
+    // rot_weight_prior). Only consumed by the split-median path; 1.0 default.
+    Scalar rot_weight_prior[kMaxSourcesCap];
     // Per-source prior clock offset (seconds). Sign per D21 / CONFIG §9: positive =>
     // source clock ahead of base; its reported [t0,t1] reads true [t0+off, t1+off].
     Scalar prior_time_offset[kMaxSourcesCap];
@@ -414,6 +425,14 @@ struct Estimator::Impl {
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
     Scalar weights[kMaxSourcesCap];
+    // Split-median per-step scratch (Slice 19; written only when cfg.split_median):
+    // weights_rot = weights * rot_weight_prior (the rotation channel's weight set);
+    // wrot_final / wtrans_final receive the FINAL (veto-scaled effective) channel weights
+    // from solve_split — fed to the block-diagonal median influence so the Slice-18
+    // coupling describes the median actually solved.
+    Scalar weights_rot[kMaxSourcesCap];
+    Scalar wrot_final[kMaxSourcesCap];
+    Scalar wtrans_final[kMaxSourcesCap];
     // Maps median entry k -> registered source slot (cold-start may exclude sources from
     // the median, so the median index no longer matches the covered order). Used by the
     // per-source residual diagnostics to attribute the consensus distance correctly.
@@ -882,6 +901,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->prior_extrinsic[i]   = SE3{};
         impl_->prior_scale[i]       = Scalar(1);
         impl_->weight_prior[i]      = Scalar(1);
+        impl_->rot_weight_prior[i]  = Scalar(1);   // Slice 19: neutral rotation prior
         impl_->prior_time_offset[i] = Scalar(0);
         impl_->offset_committed[i]  = false;
         impl_->offset_restored[i]   = false;
@@ -986,6 +1006,12 @@ Status Estimator::add_source(const ISource* src) {
     const SensorConfig* sc = impl_->sensor_for(src->id());
     impl_->prior_extrinsic[slot] = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
     impl_->weight_prior[slot]    = (sc != nullptr) ? sc->weight_prior    : Scalar(1);
+    // Slice 19: rotation-channel weight multiplier (validate() rejects < 0; defensive
+    // clamp keeps an unvalidated caller neutral). Only the split path reads it.
+    {
+        const Scalar rw = (sc != nullptr) ? sc->rot_weight_prior : Scalar(1);
+        impl_->rot_weight_prior[slot] = (rw >= Scalar(0)) ? rw : Scalar(1);
+    }
     // prior_scale must be positive (validate is expected to enforce this, but be safe:
     // a non-positive scale would blow up the de-scale division in step()).
     const Scalar ps = (sc != nullptr) ? sc->prior_scale : Scalar(1);
@@ -1196,6 +1222,9 @@ Status Estimator::step(Timestamp now) {
         if (s.participates(i)) {
             s.aligned[n]  = A;
             s.weights[n]  = w;
+            // Slice 19: the rotation channel's weight = the clamped fusion weight times
+            // the per-source rotation prior (read only when split_median is on).
+            s.weights_rot[n] = w * s.rot_weight_prior[i];
             s.med_slot[n] = i;
             h.weight      = w;
             ++n;
@@ -1222,7 +1251,26 @@ Status Estimator::step(Timestamp now) {
     mp.tol       = cfg.weiszfeld_tol;
     mp.eps       = cfg.weiszfeld_eps;
     mp.lambda    = cfg.metric_lambda;
-    const median::Result med = median::solve(s.aligned, s.weights, n, mp);
+    // SPLIT-MEDIAN ROUTING (Slice 19). split_median OFF (the default): the coupled solve
+    // below runs with EXACTLY the Slice-2 arguments — byte-identical. ON: the per-channel
+    // split solve forms the consensus (rotation channel weighted by w * rot_weight_prior,
+    // translation by w; cross-channel veto per cfg.split_veto); med.value carries the
+    // split consensus into every downstream consumer (residuals/reliability, calibrators,
+    // time-sync capture, lifecycle, predict) exactly where the coupled value flows, and
+    // the PER-CHANNEL spreads drive the adaptive Q below (med.spread stays 0, unused).
+    median::Result med;
+    median::SplitResult smed;
+    if (cfg.split_median) {
+        smed = median::solve_split(s.aligned, s.weights_rot, s.weights, n, mp,
+                                   cfg.split_veto, s.wrot_final, s.wtrans_final);
+        med.value     = smed.value;
+        med.spread    = Scalar(0);          // split path: per-channel spreads drive Q
+        med.iters     = (smed.iters_rot > smed.iters_trans) ? smed.iters_rot
+                                                            : smed.iters_trans;
+        med.converged = smed.converged_rot && smed.converged_trans;
+    } else {
+        med = median::solve(s.aligned, s.weights, n, mp);
+    }
 
     // Per-source residual to the consensus (diagnostics). Indexed by the median set via
     // med_slot (cold-start may exclude covered-but-non-participating sources from the
@@ -1513,7 +1561,13 @@ Status Estimator::step(Timestamp now) {
     // adaptive branch passes spread = 0 -> floor only (the spread term vanishes).
     Mat6 q_pose;
     if (cfg.adaptive_q) {
-        q_pose = Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor);
+        // Split path (Slice 19, §1.3): the two PER-CHANNEL spreads drive a per-channel Q
+        // (q_trans from spread_trans in m^2, q_rot from spread_rot in rad^2 — no lambda
+        // unit-mixing), shared q_scale. Coupled path: untouched.
+        q_pose = cfg.split_median
+                     ? Eskf::adaptive_q_split(smed.spread_trans, smed.spread_rot,
+                                              cfg.q_scale, cfg.q_floor)
+                     : Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor);
     } else {
         q_pose = Eskf::adaptive_q(Scalar(0), cfg.q_scale, cfg.q_floor);
     }
@@ -1603,8 +1657,18 @@ Status Estimator::step(Timestamp now) {
             }
         }
         if (any_bias_in_median) {
-            Eskf::median_influence(med.value, s.aligned, s.weights, n,
-                                   cfg.metric_lambda, cfg.weiszfeld_eps, s.mb_omega);
+            // Slice 19: under the split median the influence is BLOCK-DIAGONAL per channel,
+            // built from the FINAL (veto-scaled) weights the split solve consumed — the
+            // FD-pinned production block (tests/test_multi_bias.cpp slice19 cases). The
+            // coupled path keeps the FD-pinned 6x6 influence untouched.
+            if (cfg.split_median) {
+                Eskf::median_influence_split(med.value, s.aligned, s.wrot_final,
+                                             s.wtrans_final, n, cfg.weiszfeld_eps,
+                                             s.mb_omega);
+            } else {
+                Eskf::median_influence(med.value, s.aligned, s.weights, n,
+                                       cfg.metric_lambda, cfg.weiszfeld_eps, s.mb_omega);
+            }
         }
         for (int j = 0; j < s.mb_count; ++j) {
             if (mb_med[j] >= 0) {
@@ -2159,6 +2223,9 @@ Status validate(const Config& cfg) {
     if (cfg.sensors != nullptr) {
         int bias_sources = 0;
         for (int i = 0; i < cfg.sensor_count; ++i) {
+            // Slice 19: the rotation-channel weight prior must be >= 0 (0 = "never trust
+            // this source's rotation" is legitimate; negative would flip the median pull).
+            if (cfg.sensors[i].rot_weight_prior < 0.0) return Status::OutOfRange;
             if (cfg.sensors[i].bias_states) ++bias_sources;
             // Per-DOF since B2: each rate must be >= 0.
             for (int d = 0; d < 6; ++d) {

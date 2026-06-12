@@ -512,6 +512,115 @@ void Eskf::median_influence(const SE3& med, const SE3* A, const Scalar* w, int n
     for (int i = 0; i < nc; ++i) Omega[i] = Mlu.solve(uP[i]);
 }
 
+namespace {
+
+// One CHANNEL's IFT influence for the split median (Slice 19): the 3x3 blocks
+// Omega_chan_i = M^-1 u_i P_i at that channel's own Weiszfeld fixed point, with the same
+// regime structure as the coupled median_influence (n==1 passthrough, n==2 fixed
+// interpolation, coincident-vertex weight-split, smooth interior projector form). `x` are
+// the channel tangents x_i (trans: t_i - t_m; rot: log(R_m^T R_i)), `w` the channel's
+// FINAL weights (veto-scaled effective weights). Writes n 3x3 blocks into Omega3.
+// Mirrors median.cpp's per-channel w_of contract (clamp negatives; all-<=0 -> uniform).
+void channel_influence(const Vec3* x, const Scalar* w, int n, Scalar eps, Mat3* Omega3) {
+    if (n <= 0 || x == nullptr || Omega3 == nullptr) return;
+
+    Scalar wsum_all = Scalar(0);
+    for (int i = 0; i < n; ++i) wsum_all += (w != nullptr && w[i] > Scalar(0)) ? w[i] : Scalar(0);
+    const bool uniform = (wsum_all <= Scalar(0));
+    auto w_of = [&](int i) -> Scalar {
+        if (uniform) return Scalar(1);
+        return (w[i] > Scalar(0)) ? w[i] : Scalar(0);
+    };
+
+    // n == 1: the sole participant IS the channel median.
+    if (n == 1) {
+        Omega3[0] = Mat3::Identity();
+        return;
+    }
+
+    // n == 2: solve_split interpolates each channel with FIXED weights -> the influence is
+    // the interpolation weight (the same n==2 regime FD-pinned for the coupled solver).
+    if (n == 2) {
+        const Scalar w0 = w_of(0), w1 = w_of(1);
+        const Scalar denom = w0 + w1;
+        const Scalar a0 = (denom > Scalar(0)) ? (w0 / denom) : Scalar(0.5);
+        Omega3[0] = a0 * Mat3::Identity();
+        Omega3[1] = (Scalar(1) - a0) * Mat3::Identity();
+        return;
+    }
+
+    // n >= 3: vertex (non-smooth) limit first — the channel median ON one or more inputs
+    // (d <= eps, the solver's own VZ exclusion threshold): the coincident set splits the
+    // identity by weight, every other block -> 0 (no 1/d blow-up).
+    const Scalar eps_v = (eps > Scalar(0)) ? eps : Scalar(0);
+    Scalar d[Eskf::kMaxMedianInputs];
+    const int nc = (n < Eskf::kMaxMedianInputs) ? n : Eskf::kMaxMedianInputs;
+    for (int i = nc; i < n; ++i) Omega3[i] = Mat3::Zero();   // over-cap tail: defensive zero
+    Scalar coincident_w = Scalar(0);
+    int    coincident_n = 0;
+    for (int i = 0; i < nc; ++i) {
+        d[i] = x[i].norm();
+        if (d[i] <= eps_v) { coincident_w += w_of(i); ++coincident_n; }
+    }
+    if (coincident_n > 0) {
+        for (int i = 0; i < nc; ++i) {
+            if (d[i] <= eps_v) {
+                const Scalar share = (coincident_w > Scalar(0))
+                                         ? (w_of(i) / coincident_w)
+                                         : (Scalar(1) / static_cast<Scalar>(coincident_n));
+                Omega3[i] = share * Mat3::Identity();
+            } else {
+                Omega3[i] = Mat3::Zero();
+            }
+        }
+        return;
+    }
+
+    // Smooth interior case: Omega_i = M^-1 u_i P_i with the Euclidean radial projector
+    // (W = I per channel — no lambda; the channel metric is unit). sum_i Omega_i = I.
+    Mat3 M = Mat3::Zero();
+    Mat3 uP[Eskf::kMaxMedianInputs];
+    for (int i = 0; i < nc; ++i) {
+        const Scalar d2 = std::max(d[i] * d[i], Scalar(1e-30));
+        const Scalar u  = w_of(i) / d[i];
+        const Mat3 P = Mat3::Identity() - (x[i] * x[i].transpose()) / d2;
+        uP[i] = u * P;
+        M += uP[i];
+    }
+    const Eigen::FullPivLU<Mat3> Mlu = M.fullPivLu();
+    for (int i = 0; i < nc; ++i) Omega3[i] = Mlu.solve(uP[i]);
+}
+
+} // namespace
+
+void Eskf::median_influence_split(const SE3& med, const SE3* A, const Scalar* w_rot,
+                                  const Scalar* w_trans, int n, Scalar eps, Mat6* Omega) {
+    if (n <= 0 || A == nullptr || Omega == nullptr) return;
+
+    // Channel tangents at the split median: trans x_i = t_i - t_m (ambient R^3), rot
+    // x_i = log(R_m^T R_i) (geodesic tangent at R_m) — exactly the per-channel fixed-point
+    // residuals of solve_split. Channels are independent -> Omega is block-diagonal.
+    Vec3 xt[kMaxMedianInputs];
+    Vec3 xr[kMaxMedianInputs];
+    const int nc = (n < kMaxMedianInputs) ? n : kMaxMedianInputs;
+    const Mat3 RmT = med.R.transpose();
+    for (int i = 0; i < nc; ++i) {
+        xt[i] = A[i].t - med.t;
+        xr[i] = so3::log(RmT * A[i].R);
+    }
+    Mat3 Ot[kMaxMedianInputs];
+    Mat3 Or[kMaxMedianInputs];
+    channel_influence(xt, w_trans, nc, eps, Ot);
+    channel_influence(xr, w_rot, nc, eps, Or);
+    for (int i = 0; i < n; ++i) {
+        Omega[i] = Mat6::Zero();
+        if (i < nc) {
+            Omega[i].topLeftCorner(3, 3)     = Ot[i];   // [trans; rot] tangent order
+            Omega[i].bottomRightCorner(3, 3) = Or[i];
+        }
+    }
+}
+
 Mat6 Eskf::bias_coupling(const SE3& med, const SE3& A_i, const Mat6& Omega_i,
                          const SE3& X_i, Scalar dt) {
     // J_i = blkdiag(R_m^T, I) * Omega_i * blkdiag(R_{A_i}, I) * (-dt * Ad(X_i)). The blkdiag
@@ -724,6 +833,23 @@ Mat6 Eskf::adaptive_q(Scalar spread, Scalar q_scale, const Scalar* q_floor) {
     // == 0 -> the whole term vanishes, so the result is exactly the floor (noise-free / single-
     // source invariant), keeping the noise-free golden committed values unchanged.
     Mat6 Q = (q_scale * spread * spread) * Mat6::Identity();
+    if (q_floor != nullptr) {
+        for (int i = 0; i < 6; ++i) Q(i, i) += q_floor[i];
+    }
+    return Q;
+}
+
+Mat6 Eskf::adaptive_q_split(Scalar spread_trans, Scalar spread_rot, Scalar q_scale,
+                            const Scalar* q_floor) {
+    // Per-channel spread term (Slice 19, §1.3): the translation axes carry the translation
+    // channel's RMS (m^2), the rotation axes the rotation channel's RMS (rad^2) — no lambda
+    // unit-mixing. Shared q_scale; same additive per-axis floor as adaptive_q(). Both
+    // spreads 0 -> exactly the floor (the noise-free invariant adaptive_q() keeps).
+    Mat6 Q = Mat6::Zero();
+    const Scalar qt = q_scale * spread_trans * spread_trans;
+    const Scalar qr = q_scale * spread_rot * spread_rot;
+    for (int i = 0; i < 3; ++i) Q(i, i) = qt;
+    for (int i = 3; i < 6; ++i) Q(i, i) = qr;
     if (q_floor != nullptr) {
         for (int i = 0; i < 6; ++i) Q(i, i) += q_floor[i];
     }

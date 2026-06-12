@@ -131,12 +131,17 @@ const char* kKnobDoc =
     "  joint_lever_scale=<bool> (turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off)\n"
     "  multi_bias_enabled=<bool> (median-coupled multi-source bias states, Slice 18; default off)\n"
     "  multi_bias_cov0=<f>      (multi-bias per-DOF prior variance seed, > 0; default 0.04)\n"
+    "  split_median=<bool>      (per-channel split median, Slice 19; default off = coupled)\n"
+    "  split_veto=<bool>        (split-path cross-channel outlier veto; default on)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
     "[sensor.N]\n"
     "  id=<int>   prior_extrinsic=<yaw pitch roll x y z>   prior_scale=<f>\n"
     "  prior_time_offset_s=<f>   weight_prior=<f>\n"
+    "  rot_weight_prior=<f>     (ROTATION-channel weight multiplier, Slice 19; >= 0,\n"
+    "      default 1; only read when [global] split_median is on — e.g. 10 for a\n"
+    "      FOG-grade heading source)\n"
     "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n"
     "  bias_states=<bool>     bias_process_noise=<f | 6 f's [v;omega]>   (per-source body-twist\n"
     "      bias, Slice 11b/18; 6-number per-DOF form needs multi_bias_enabled — a DOF rate of\n"
@@ -296,6 +301,16 @@ Status ConfigLoader::parse(const std::string& text) {
                 // (> 0; validate()). Rig-dependent stability knob; default 0.04.
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 cfg_.multi_bias_cov0 = dv;
+            } else if (key == "split_median") {
+                // Slice 19: per-channel split median (rotation/translation consensus with
+                // per-channel weights). Default off = byte-identical coupled solver.
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.split_median = bv;
+            } else if (key == "split_veto") {
+                // Slice 19: the split path's cross-channel outlier veto (default on;
+                // only read when split_median is on).
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.split_veto = bv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
@@ -348,6 +363,11 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "weight_prior") {
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 sc.weight_prior = dv;
+            } else if (key == "rot_weight_prior") {
+                // Slice 19: ROTATION-channel weight multiplier (>= 0; validate()). Only
+                // read when [global] split_median is on.
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                sc.rot_weight_prior = dv;
             } else if (key == "per_sensor_kf") {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 sc.per_sensor_kf = bv;

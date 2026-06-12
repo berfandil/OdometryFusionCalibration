@@ -71,6 +71,17 @@ struct SensorConfig {
     Scalar   prior_scale     = 1.0;
     Scalar   prior_time_offset_s = 0.0;
     Scalar   weight_prior    = 1.0;
+    // ROTATION-channel weight multiplier (Slice 19, split-median policy layer (a) — config
+    // priors). Only consumed when Config::split_median is on; multiplies this source's
+    // effective weight in the ROTATION channel only:
+    //   w_rot_i   = clamp(weight_prior_i * reliability_i * sigma_conf_i) * rot_weight_prior_i
+    //   w_trans_i = clamp(weight_prior_i * reliability_i * sigma_conf_i)
+    // (applied OUTSIDE the [weight_floor, weight_cap] clamp: the clamp bounds the noisy
+    // Sigma-confidence placeholder, while this is a deliberate datasheet declaration — e.g.
+    // a FOG-grade heading source carries rot_weight_prior ~ 10 so fusion's rotation channel
+    // tracks it without distorting translation). >= 0 (validate; 0 = "never trust this
+    // source's rotation"). INERT (byte-identical) when split_median is off. Hashed.
+    Scalar   rot_weight_prior = 1.0;
     bool     native_confidence = true;
     Scalar   modeled_noise_per_m   = 0.01;
     Scalar   modeled_noise_per_rad = 0.01;
@@ -139,6 +150,29 @@ struct Config {
     // covariance grows between fixes and the absolute-fix Kalman gain can actually pull — the
     // adapters/GPS drift tests do exactly this test-locally. Left small here as the no-ref default.
     Scalar     q_floor[6]     = {1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6};
+
+    // Per-channel SPLIT median (Slice 19, D3 amendment). When enabled, the fusion solve
+    // routes to median::solve_split — TWO independent Weiszfeld medians (rotation on SO(3)
+    // geodesic, translation on R^3) with per-channel weights (w_rot additionally carries
+    // SensorConfig::rot_weight_prior), per-channel spreads driving a per-channel adaptive Q
+    // (q_trans from spread_trans, q_rot from spread_rot — shared q_scale, no lambda
+    // unit-mixing), and a block-diagonal Slice-18 median influence. Lets fusion express
+    // per-channel source quality: the fused heading can track the best heading source
+    // without distorting translation (the KAIST urban12 FOG case). Default OFF = the
+    // coupled solver runs BYTE-IDENTICALLY (the split solver is mathematically different
+    // even at equal weights — the coupled IRLS couples the channels — hence opt-in,
+    // flip-default-later after real-data soak). Hashed (a flip rejects stale restores).
+    bool       split_median   = false;
+    // Cross-channel outlier veto for the split path (Slice 19; only read when split_median
+    // is on). A source whose channel distance exceeds kVetoNormDist x the leave-one-out
+    // channel spread in EITHER channel gets its OTHER-channel weight scaled by
+    // kVetoWeightScale and that channel is re-solved once (median.hpp) — recovers the
+    // coupled solver's whole-source rejection for hard (usually both-channel) faults while
+    // keeping graceful per-channel weighting for quality differences. Default ON for the
+    // split path (the safe policy); turn OFF only when a deliberately rotation-faulty-but-
+    // translation-good source must keep full translation participation. Constants are
+    // fixed (median.hpp) — only this bool is a knob. Hashed.
+    bool       split_veto     = true;
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;

@@ -50,6 +50,75 @@ struct Result {
 // `deltas` and `weights` point to caller-owned arrays of length >= n.
 Result solve(const SE3* deltas, const Scalar* weights, int n, const Params& p);
 
+// ---- Per-channel split median (Slice 19, D3 amendment) -----------------------------------
+//
+// solve_split() runs TWO independent Weiszfeld medians — rotation on SO(3) under the
+// geodesic distance ||log(R_m^T R_i)|| with weights `w_rot`, translation on R^3 under the
+// Euclidean distance with weights `w_trans` — so fusion can express PER-CHANNEL source
+// quality (a heading-grade source can dominate rotation without distorting translation).
+// The coupled solve() above stays bit-untouched (the default path); the split solver is
+// mathematically different even at equal weights (the coupled IRLS couples the channels
+// through the shared 1/d reweight).
+//
+// Both channel solvers carry the SAME D3 safeguards as the fixed coupled solver:
+//   * OFF-VERTEX INIT — rotation: one weighted Karcher (tangent-mean) step about the
+//     highest-weight R; translation: the weighted arithmetic mean. A vertex start made
+//     iter-0 see d=0 -> w/eps self-weight -> pinned on that vertex (the D3 pinning bug);
+//     the interior init keeps every d_i > 0 so the 1/d reweight engages.
+//   * VARDI-ZHANG coincident-vertex guard — a d <= eps self-term is skipped per iteration.
+//   * eps-regularized 1/d, max_iters hard cap (bounded WCET), n <= 2 closed forms
+//     (n == 2 = weighted geodesic/linear interpolation; no rejection possible).
+// Per-channel weights are clamped to >= 0 with a PER-CHANNEL uniform fallback when a
+// channel's whole set is <= 0 (mirrors solve()'s w_of contract).
+//
+// Per-channel spreads: weighted RMS geodesic distance (rad) and weighted RMS Euclidean
+// distance (m) of the inputs to the channel median — NO lambda unit-mixing (resolves the
+// D21 scalar-spread wart for the split path). They drive the per-channel adaptive Q.
+//
+// CROSS-CHANNEL OUTLIER VETO (`veto`, the Config::split_veto knob — default ON for the
+// split path). Hard sensor faults usually corrupt BOTH channels; the veto recovers the
+// coupled solver's whole-source rejection for gross outliers while leaving graceful
+// per-channel weighting for quality differences. After the two base solves, a source whose
+// channel distance d_i exceeds kVetoNormDist x the channel spread in EITHER channel gets
+// its weight in the OTHER channel scaled by kVetoWeightScale, and that other channel is
+// re-solved ONCE (bounded WCET: at most one extra IRLS per channel per step; at most
+// 2 base solves + 2 veto re-solves total).
+//   NORMALIZATION NOTE (implementation choice, documented): the veto threshold normalizes
+//   d_i by the LEAVE-ONE-OUT spread (the weighted RMS over the OTHER inputs). The naive
+//   full-set RMS includes the outlier's own d_i^2, which bounds d_i/spread by
+//   sqrt(sum_w/w_i) (< 3 for any rig under ~10 equal-weight sources) — i.e. a single gross
+//   outlier could NEVER trip the 3.0 threshold. Leave-one-out is the minimal normalization
+//   that makes the guard live at small n while keeping the fixed constants.
+// The veto needs >= 3 inputs (rejection is undefined below that, as in the coupled solver)
+// and at most kMaxSplitInputs (the fixed scratch capacity, == the estimator's source cap).
+//
+// `w_rot_final` / `w_trans_final` (optional, length >= n, n <= kMaxSplitInputs): receive
+// the EFFECTIVE per-channel weights the FINAL channel solves consumed — clamped/uniform-
+// resolved and veto-scaled. The estimator feeds these to Eskf::median_influence_split so
+// the Slice-18 coupling blocks describe the median ACTUALLY solved (veto included).
+constexpr int kMaxSplitInputs = 32;
+
+// Fixed veto policy constants (Slice 19 — deliberately NOT config knobs; only the
+// split_veto bool is). See the veto contract above.
+constexpr Scalar kVetoNormDist    = 3.0;   // flag: d_i > 3 x leave-one-out channel spread
+constexpr Scalar kVetoWeightScale = 0.1;   // flagged source's OTHER-channel weight scale
+
+// Output of the split solve. `value` = { R = rotation-channel median, t = translation-
+// channel median }; the per-channel spreads/iters/convergence mirror Result's fields.
+struct SplitResult {
+    SE3    value;
+    Scalar spread_rot      = Scalar(0);   // weighted RMS geodesic distance (rad)
+    Scalar spread_trans    = Scalar(0);   // weighted RMS Euclidean distance (m)
+    int    iters_rot       = 0;           // total rotation-channel iterations (base + veto re-solve)
+    int    iters_trans     = 0;           // total translation-channel iterations
+    bool   converged_rot   = true;
+    bool   converged_trans = true;
+};
+
+SplitResult solve_split(const SE3* deltas, const Scalar* w_rot, const Scalar* w_trans,
+                        int n, const Params& p, bool veto = true,
+                        Scalar* w_rot_final = nullptr, Scalar* w_trans_final = nullptr);
+
 } // namespace median
 } // namespace ofc
 #endif // OFC_CORE_MEDIAN_HPP
