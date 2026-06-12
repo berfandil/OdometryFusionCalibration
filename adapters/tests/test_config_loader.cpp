@@ -502,24 +502,30 @@ TEST_CASE("ConfigLoader: per-DOF bias_process_noise (1 or 6 numbers) + multi_bia
     }
 }
 
-TEST_CASE("ConfigLoader: split_median / split_veto / rot_weight_prior parse (Slice 19); "
-          "defaults preserved; bad values reject") {
-    // All three set: the split path enabled, veto disabled, a 10x FOG rotation prior.
+TEST_CASE("ConfigLoader: split_median / split_veto / q_scale_split / rot_weight_prior "
+          "parse (Slice 19); defaults preserved; bad values reject") {
+    // All four set: the split path enabled, veto disabled, a re-tuned split Q scale, a
+    // 10x FOG rotation prior.
     {
         const std::string text =
             "[global]\nmax_sources=2\nreference_sensor_id=0\n"
             "split_median = true\n"
             "split_veto = false\n"
+            "q_scale_split = 2.5\n"
             "[sensor.0]\nid=0\nis_reference=true\n"
             "[sensor.1]\nid=1\nrot_weight_prior = 10.0\n";
         ConfigLoader loader;
         REQUIRE(loader.parse(text) == Status::Ok);
         CHECK(loader.config().split_median);
         CHECK_FALSE(loader.config().split_veto);
+        CHECK(loader.config().q_scale_split == doctest::Approx(2.5));
+        CHECK(loader.config().q_scale == doctest::Approx(0.7));   // coupled, untouched
         CHECK(loader.sensors()[0].rot_weight_prior == doctest::Approx(1.0));   // default
         CHECK(loader.sensors()[1].rot_weight_prior == doctest::Approx(10.0));
     }
-    // Keys absent -> defaults (split off = byte-identical coupled; veto on; prior 1).
+    // Keys absent -> defaults (split off = byte-identical coupled; veto on; q_scale_split
+    // at its CALIBRATED default 3.0 — review MAJOR-2: flipping split_median on with no
+    // further tuning runs the in-band value, never the coupled 0.7; prior 1).
     {
         const std::string text =
             "[global]\nmax_sources=1\nreference_sensor_id=0\n"
@@ -528,10 +534,12 @@ TEST_CASE("ConfigLoader: split_median / split_veto / rot_weight_prior parse (Sli
         REQUIRE(loader.parse(text) == Status::Ok);
         CHECK_FALSE(loader.config().split_median);
         CHECK(loader.config().split_veto);
+        CHECK(loader.config().q_scale_split == doctest::Approx(3.0));
         CHECK(loader.sensors()[0].rot_weight_prior == doctest::Approx(1.0));
     }
     // Bad values: non-bool / non-number reject loudly; a NEGATIVE rot_weight_prior parses
-    // but fails the core validate() (OutOfRange) — surfaced as the validate status.
+    // but fails the core validate() (OutOfRange) — surfaced as the validate status; a
+    // non-positive q_scale_split likewise rejects at validate().
     {
         ConfigLoader loader;
         CHECK(loader.parse("[global]\nsplit_median = banana\n") == Status::InvalidConfig);
@@ -540,6 +548,15 @@ TEST_CASE("ConfigLoader: split_median / split_veto / rot_weight_prior parse (Sli
     {
         ConfigLoader loader;
         CHECK(loader.parse("[global]\nsplit_veto = banana\n") == Status::InvalidConfig);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nq_scale_split = junk\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("expected number") != std::string::npos);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nq_scale_split = 0\n") == Status::OutOfRange);
     }
     {
         ConfigLoader loader;

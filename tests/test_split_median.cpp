@@ -164,8 +164,8 @@ TEST_CASE("split estimator HEADLINE: rotation-faulty source's translation still 
 // DEFAULT-OFF byte-identity (SLICE19 §2 item 4): split_median=false is bit-identical,
 // and the new knobs are inert while off.
 // ---------------------------------------------------------------------------
-TEST_CASE("split default-off: byte-identical fused output; split_veto/rot_weight_prior "
-          "inert while split_median is false") {
+TEST_CASE("split default-off: byte-identical fused output; split_veto/q_scale_split/"
+          "rot_weight_prior inert while split_median is false") {
     Vec6 xi0; xi0 << 2.0, 0, 0, 0, 0, 0.3;
     Vec6 xi1; xi1 << 2.1, 0.05, 0, 0, 0, 0.32;
     Vec6 xi2; xi2 << 1.9, -0.05, 0, 0, 0, 0.28;
@@ -188,8 +188,9 @@ TEST_CASE("split default-off: byte-identical fused output; split_veto/rot_weight
         cfg.sensor_count = 3;
         if (set_new_knobs) {
             // split_median stays FALSE — every new knob must be inert.
-            cfg.split_median = false;
-            cfg.split_veto   = false;             // non-default
+            cfg.split_median  = false;
+            cfg.split_veto    = false;            // non-default
+            cfg.q_scale_split = 50.0;             // non-default (read only when split on)
             sensors[1].rot_weight_prior = 10.0;   // non-default
         }
 
@@ -280,6 +281,74 @@ TEST_CASE("split rot_weight_prior: 10x rotation prior pulls the rotation median;
 }
 
 // ---------------------------------------------------------------------------
+// rot_weight_prior == 0 semantics (review MINOR): a single source at 0 is excluded from
+// the rotation consensus; ALL sources at 0 fall back to the UNWEIGHTED (uniform) rotation
+// median — the per-channel mirror of the coupled solver's all-<=0 w_of contract (see
+// SensorConfig::rot_weight_prior). Estimator-level pins for both.
+// ---------------------------------------------------------------------------
+TEST_CASE("split rot_weight_prior=0: the source's rotation is excluded from the consensus; "
+          "ALL-zero falls back to the uniform rotation median (no NaN)") {
+    // Three sources, SAME translation, disagreeing yaw rates. Source 2 carries a HIGH
+    // fusion weight (2.5 > the others' combined mass) and a WRONG yaw rate — under a
+    // rotation prior of 1 its rotation mass drags the consensus onto it; at 0 its
+    // rotation is fully excluded and the consensus stays on the clean pair.
+    Vec6 xi0; xi0 << 2.0, 0, 0, 0, 0, 0.0;
+    Vec6 xi1; xi1 << 2.0, 0, 0, 0, 0, 0.0;
+    Vec6 xi2; xi2 << 2.0, 0, 0, 0, 0, 1.0;
+
+    auto one_step = [&](Scalar rw0, Scalar rw1, Scalar rw2) -> Scalar {
+        std::vector<std::unique_ptr<BufferSource>> srcs;
+        for (int i = 0; i < 3; ++i)
+            srcs.emplace_back(new BufferSource(static_cast<SourceId>(i), 1024));
+        fill_twist(*srcs[0], 0.5, 200.0, xi0);
+        fill_twist(*srcs[1], 0.5, 200.0, xi1);
+        fill_twist(*srcs[2], 0.5, 200.0, xi2);
+
+        SensorConfig sensors[3];
+        for (int i = 0; i < 3; ++i) sensors[i].id = static_cast<SourceId>(i);
+        sensors[0].rot_weight_prior = rw0;
+        sensors[1].rot_weight_prior = rw1;
+        sensors[2].rot_weight_prior = rw2;
+        sensors[2].weight_prior     = 2.5;
+        Config cfg = split_base_config(3);
+        cfg.split_median = true;
+        // Veto OFF: the semantics under test are the per-channel WEIGHTING (a gross
+        // rotation deviation would otherwise also trip the cross-channel veto, which is
+        // its own pinned policy).
+        cfg.split_veto   = false;
+        cfg.sensors      = sensors;
+        cfg.sensor_count = 3;
+
+        Estimator est;
+        REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& s : srcs) REQUIRE(est.add_source(s.get()) == Status::Ok);
+        REQUIRE(est.step(secs(cfg.fusion_delay_s + cfg.window_s)) == Status::Ok);
+        const State& f = est.latest().frontier;
+        REQUIRE(f.pose.R.allFinite());                       // no NaN in any variant
+        return so3::log(f.pose.R).z();
+    };
+
+    // Control (prior 1 everywhere): source 2's 2.5 rotation mass holds the majority of
+    // the weighted median -> the fused yaw follows the WRONG source (~1.0 rad/s * 0.1 s).
+    const Scalar yaw_followed = one_step(1.0, 1.0, 1.0);
+    CHECK(yaw_followed > 0.05);
+    // Source 2's rotation prior 0: its rotation is EXCLUDED -> the clean pair carries the
+    // consensus (yaw ~ 0) while its weight_prior still participates in translation.
+    const Scalar yaw_excluded = one_step(1.0, 1.0, 0.0);
+    CHECK(std::abs(yaw_excluded) < 0.005);
+
+    // ALL-zero rotation priors: the rotation channel's weight set is all-zero -> the
+    // solver's UNIFORM fallback (documented at SensorConfig::rot_weight_prior). With
+    // uniform weights the 2-vs-1 median rejects the lone wrong rotation, equal to the
+    // equal-priors-without-the-2.5-fusion-weight consensus; pinned against the explicit
+    // uniform run (all priors 1, equal weight_priors would need a 4th rig — instead pin
+    // the VALUE: uniform fallback = the clean pair wins).
+    const Scalar yaw_allzero = one_step(0.0, 0.0, 0.0);
+    MESSAGE("rot prior all-zero: yaw=" << yaw_allzero);
+    CHECK(std::abs(yaw_allzero) < 0.005);                    // uniform 2-vs-1: pair wins
+}
+
+// ---------------------------------------------------------------------------
 // SPLIT-ON observability self-tests (SLICE19 §2 item 6): the calibrators consume the
 // split consensus — every DOF still converges in its regime and NOT in others.
 // ---------------------------------------------------------------------------
@@ -344,6 +413,7 @@ struct CalibOut {
     Scalar scale;
     Scalar trans_conf;   // lever (xyz) confidence
     Vec3   fwd_err;      // recovered-vs-planted forward axis error
+    Mat3   ext_R;        // recovered extrinsic rotation (roll-DOF assertions)
 };
 CalibOut run_split_calib(const sim::Trajectory& tr, const SE3& X_planted, Scalar scale_p) {
     std::vector<sim::SourceParams> planted(3);
@@ -372,6 +442,7 @@ CalibOut run_split_calib(const sim::Trajectory& tr, const SE3& X_planted, Scalar
     out.trans_conf = r.calib[1].translation_confidence;
     const Vec3 want = X_planted.R.transpose() * Vec3(1, 0, 0);
     out.fwd_err = r.calib[1].extrinsic.R.transpose() * Vec3(1, 0, 0) - want;
+    out.ext_R   = r.calib[1].extrinsic.R;
     return out;
 }
 } // namespace
@@ -438,6 +509,49 @@ TEST_CASE("split-ON observability: turn regime converges the lever arm; straight
     }
 }
 
+TEST_CASE("split-ON observability: turn regime converges the ROLL DOF; straight-only does "
+          "NOT (review MINOR — the silently-absent roll regime pair)") {
+    // Planted ROLL-ONLY mount (rotation about the forward axis). Roll leaves the forward
+    // axis fixed, so Phase 1 (straight regime) sees a zero yaw/pitch residual and can
+    // never observe it; Phase 2's turn-regime hand-eye recovers it. The planted yaw/pitch
+    // are 0, so the published extrinsic rotation isolates the roll DOF.
+    const Scalar roll_p = 0.25;
+    SE3 X_roll;
+    {
+        Mat3 Rx; Rx << 1, 0, 0,
+                       0, std::cos(roll_p), -std::sin(roll_p),
+                       0, std::sin(roll_p),  std::cos(roll_p);
+        X_roll.R = Rx;
+    }
+
+    // POSITIVE: multi-axis turning — the roll histogram concentrates on the planted roll
+    // and the published extrinsic rotation lands on the planted mount.
+    {
+        sim::Trajectory tr;
+        Vec6 t1; t1 << 2.0, 0, 0, 0,  0.3,  0.6;
+        Vec6 t2; t2 << 2.0, 0, 0, 0, -0.3,  0.6;
+        for (int rep = 0; rep < 2; ++rep) {
+            tr.add_segment(t1, 2.0);
+            tr.add_segment(t2, 2.0);
+        }
+        const CalibOut o = run_split_calib(tr, X_roll, 1.0);
+        const Scalar rerr = so3::log(X_roll.R.transpose() * o.ext_R).norm();
+        MESSAGE("split turn roll: rot_err=" << rerr);
+        CHECK(rerr < 0.05);                                  // planted roll recovered
+        CHECK(so3::log(o.ext_R).norm() > 0.15);              // genuinely moved off identity
+    }
+    // NEGATIVE: straight-only — the turn gate starves Phase 2; the published rotation
+    // stays at the (identity) prior, the full planted roll away from truth.
+    {
+        sim::Trajectory tr = sim::Trajectory::straight(2.0, 6.0);
+        const CalibOut o = run_split_calib(tr, X_roll, 1.0);
+        const Scalar rerr = so3::log(X_roll.R.transpose() * o.ext_R).norm();
+        MESSAGE("split straight roll: rot_err=" << rerr);
+        CHECK(so3::log(o.ext_R).norm() < 0.03);              // stayed at the prior
+        CHECK(rerr > 0.2);                                   // i.e. roll NOT recovered
+    }
+}
+
 // ---------------------------------------------------------------------------
 // multi_bias + split smoke (item 7's estimator side; the FD pin is test_multi_bias.cpp):
 // the block-diagonal coupling path runs end-to-end — finite state, bias unobservable
@@ -482,4 +596,70 @@ TEST_CASE("split + multi_bias: block-diagonal coupling path runs sane (finite, b
     // multi-bias observability contract, unchanged under the split coupling).
     CHECK(r.calib[1].bias_observable < 0.05);
     CHECK(r.calib[1].bias.norm() < 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// split + multi_bias with the veto ACTIVE end-to-end (review MINOR): a BOTH-channel
+// faulty source runs through the veto-scaled block-diagonal coupling into F over many
+// steps. A wrong veto-scaled Omega would surface here as bias misattribution or
+// covariance corruption over the run (the unit-level FD pin in test_multi_bias.cpp only
+// sees one window) — the fault must stay rejected, every bias must stay ~0 unobservable,
+// and the state must stay finite for the whole run.
+// ---------------------------------------------------------------------------
+TEST_CASE("split + multi_bias + veto ACTIVE end-to-end: both-channel fault stays rejected, "
+          "biases stay ~0 unobservable, state finite across the run") {
+    // GT body motion: 2.0 m/s forward, no rotation. Sources 0, 1: clean (they carry the
+    // truth). Source 2: BOTH-channel fault — +45% translation (2.9 m/s -> 0.09 m/window
+    // vs the inliers' 0.20, far past the 3 x kVetoSpreadFloorTrans = 0.06 m trip point
+    // against the near-coincident clean pair) AND a gross yaw rate (1.5 rad/s -> 0.15
+    // rad/window > the 0.03 rad trip point). BOTH veto flags fire EVERY fused step, so
+    // the block-diagonal Omega is built from veto-scaled weights for the whole run.
+    Vec6 xi0; xi0 << 2.0, 0, 0, 0, 0, 0;
+    Vec6 xi1; xi1 << 2.0, 0, 0, 0, 0, 0;
+    Vec6 xi2; xi2 << 2.9, 0, 0, 0, 0, 1.5;
+
+    std::vector<std::unique_ptr<BufferSource>> srcs;
+    for (int i = 0; i < 3; ++i)
+        srcs.emplace_back(new BufferSource(static_cast<SourceId>(i), 4096));
+    fill_twist(*srcs[0], 3.0, 200.0, xi0);
+    fill_twist(*srcs[1], 3.0, 200.0, xi1);
+    fill_twist(*srcs[2], 3.0, 200.0, xi2);
+
+    SensorConfig sensors[3];
+    for (int i = 0; i < 3; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[1].bias_states = true;     // a CLEAN bias source (misattribution watch) ...
+    sensors[2].bias_states = true;     // ... AND the FAULTY source carries bias states
+    Config cfg = split_base_config(3);
+    cfg.split_median       = true;
+    cfg.split_veto         = true;     // the policy under test
+    cfg.multi_bias_enabled = true;
+    cfg.sensors      = sensors;
+    cfg.sensor_count = 3;
+
+    Estimator est;
+    REQUIRE(est.init(cfg) == Status::Ok);
+    for (auto& s : srcs) REQUIRE(est.add_source(s.get()) == Status::Ok);
+
+    double now_s = cfg.fusion_delay_s + cfg.window_s;
+    double last_t1 = 0.0;
+    while (now_s <= 2.5) {
+        REQUIRE(est.step(secs(now_s)) == Status::Ok);
+        const Result& r = est.latest();
+        REQUIRE(r.frontier.pose.t.allFinite());        // finite EVERY step, not just last
+        REQUIRE(r.frontier.cov.allFinite());
+        last_t1 = now_s - cfg.fusion_delay_s;
+        now_s += cfg.window_s;
+    }
+    const Result& r = est.latest();
+    // The fault stays REJECTED across the run: the fused pose tracks the clean pair (GT
+    // x = 2 t, yaw = 0), not the faulty translation/heading.
+    CHECK(so3::log(r.frontier.pose.R).norm() < 0.05);
+    CHECK(std::abs(r.frontier.pose.t.x() - 2.0 * last_t1) < 0.1);
+    // No absolute ref: NO bias becomes observable and nothing is misattributed into the
+    // bias states — neither the clean source's (the fault must not leak through the
+    // veto-scaled coupling) nor the faulty source's own.
+    CHECK(r.calib[1].bias_observable < 0.05);
+    CHECK(r.calib[1].bias.norm() < 1e-6);
+    CHECK(r.calib[2].bias_observable < 0.05);
+    CHECK(r.calib[2].bias.norm() < 1e-6);
 }

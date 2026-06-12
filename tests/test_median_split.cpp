@@ -384,6 +384,45 @@ TEST_CASE("split median veto: a gross BOTH-channel fault is rejected as complete
     CHECK(voff_terr > coupled_terr + 0.02);              // the drag the veto removes
 }
 
+TEST_CASE("split median veto FLOOR: near-coincident other inputs + honest noise -> NO veto "
+          "(MAJOR-1 regression; mutation: removing kVetoSpreadFloor* fails this)") {
+    // The target-rig shape (KAIST): sources SHARE wheel translation, so two of the three
+    // translations are near-coincident (sub-mm scatter) — the leave-one-out spread of the
+    // third source's "others" is ~0. Without the absolute floor the flag degenerates to
+    // d_i > ~0 and HONEST noise (~1.5 cm translation, ~7 mrad rotation — normal per-window
+    // sensor scatter) flags the source EVERY step, permanently scaling its other-channel
+    // weight x0.1 (on the real rig: trivial translation deviations would veto the FOG's
+    // ROTATION, defeating the slice's purpose). With the floor, the veto must stay silent.
+    SE3 xs[3];
+    xs[0] = make_se3(Vec3(0.0000, 0.0, 0.3000), Vec3(1.0000, 0.0000, 0.0));
+    xs[1] = make_se3(Vec3(0.0000, 0.0, 0.3003), Vec3(1.0008, 0.0004, 0.0));  // ~coincident
+    xs[2] = make_se3(Vec3(0.0015, 0.0, 0.3070), Vec3(1.0140, 0.0080, 0.0));  // honest noise
+    const Scalar w[3] = {1.0, 1.0, 1.0};
+
+    Scalar wr_on[3], wt_on[3];
+    const median::SplitResult v_on =
+        median::solve_split(xs, w, w, 3, params(), /*veto=*/true, wr_on, wt_on);
+    const median::SplitResult v_off =
+        median::solve_split(xs, w, w, 3, params(), /*veto=*/false);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(wr_on[i] == doctest::Approx(w[i]));     // NO veto fired in either channel
+        CHECK(wt_on[i] == doctest::Approx(w[i]));
+    }
+    CHECK((v_on.value.t.array() == v_off.value.t.array()).all());   // bit-identical
+    CHECK((v_on.value.R.array() == v_off.value.R.array()).all());
+
+    // The floor must NOT deafen the veto on the SAME near-coincident rig: a source that is
+    // GROSSLY off in translation (0.5 m — far beyond kVetoNormDist x the floor) still trips
+    // the flag and has its ROTATION weight scaled (the true-fault contract, see also the
+    // parity test above).
+    SE3 xg[3] = {xs[0], xs[1], xs[2]};
+    xg[2].t = Vec3(1.5, 0.0, 0.0);                                  // gross trans fault
+    Scalar wr_g[3], wt_g[3];
+    median::solve_split(xg, w, w, 3, params(), /*veto=*/true, wr_g, wt_g);
+    CHECK(wr_g[2] == doctest::Approx(1.0 * median::kVetoWeightScale));
+    CHECK(wt_g[2] == doctest::Approx(1.0));           // its own channel weight untouched
+}
+
 TEST_CASE("split median veto: does NOT fire on clean quality differences (graceful "
           "per-channel weighting preserved)") {
     // Sources that disagree only within their normal scatter: no channel distance exceeds
@@ -409,6 +448,77 @@ TEST_CASE("split median veto: does NOT fire on clean quality differences (gracef
     CHECK((v_on.value.R.array() == v_off.value.R.array()).all());
     CHECK(v_on.spread_rot == v_off.spread_rot);
     CHECK(v_on.spread_trans == v_off.spread_trans);
+}
+
+TEST_CASE("split median veto: EVERY source flagged somewhere -> all weights stay > 0, "
+          "output finite and sane (the veto scales, never zeroes)") {
+    // Maximal reachable flag pattern (all-flagged-in-ONE-channel is provably unreachable
+    // under the LOO normalization — see the solve_split veto comment; this rig flags every
+    // source in SOME channel): source 0 carries a gross ROTATION fault (rot-flagged ->
+    // its translation weight scales), sources 1 and 2 carry gross opposite TRANSLATION
+    // faults at low weight against source 0's high-weight clean translation (each
+    // trans-flagged -> their rotation weights scale).
+    SE3 xs[3];
+    xs[0] = make_se3(Vec3(1.20, -0.80, 0.60), Vec3(1.0, 0.0, 0.0));   // rot fault, clean t
+    xs[1] = make_se3(Vec3(0.00, 0.00, 0.30), Vec3(21.0, 0.0, 0.0));   // clean R, t fault +
+    xs[2] = make_se3(Vec3(0.00, 0.00, 0.31), Vec3(1.0, 20.0, 0.0));   // clean R, t fault y
+    const Scalar w_rot[3]   = {0.5, 5.0, 5.0};
+    const Scalar w_trans[3] = {10.0, 0.5, 0.5};
+
+    Scalar wr_fin[3], wt_fin[3];
+    const median::SplitResult r =
+        median::solve_split(xs, w_rot, w_trans, 3, params(), /*veto=*/true, wr_fin, wt_fin);
+
+    // Every source flagged in some channel -> every source has ONE channel weight scaled,
+    // and NO weight is zeroed (kVetoWeightScale = 0.1 keeps everyone voting).
+    CHECK(wt_fin[0] == doctest::Approx(10.0 * median::kVetoWeightScale));
+    CHECK(wr_fin[1] == doctest::Approx(5.0 * median::kVetoWeightScale));
+    CHECK(wr_fin[2] == doctest::Approx(5.0 * median::kVetoWeightScale));
+    CHECK(wr_fin[0] == doctest::Approx(0.5));          // own-channel weights untouched
+    CHECK(wt_fin[1] == doctest::Approx(0.5));
+    CHECK(wt_fin[2] == doctest::Approx(0.5));
+    for (int i = 0; i < 3; ++i) {
+        CHECK(wr_fin[i] > 0.0);
+        CHECK(wt_fin[i] > 0.0);
+    }
+    // Output finite and SANE: the rotation re-solve (source 0's rotation weight now the
+    // only unscaled... source 0 IS the rot fault, but its weight was already the smallest;
+    // post-veto weights {0.5, 0.5, 0.5} are uniform -> the 2-vs-1 median rejects the
+    // fault) lands on the clean cluster; the translation re-solve keeps source 0's clean
+    // translation (still the dominant mass 1.0 vs 1.0 at mutually-distant outliers).
+    CHECK(r.value.R.allFinite());
+    CHECK(r.value.t.allFinite());
+    CHECK(std::isfinite(r.spread_rot));
+    CHECK(std::isfinite(r.spread_trans));
+    CHECK(geo_dist(r.value.R, so3::exp(Vec3(0, 0, 0.30))) < 0.2);    // fault rejected
+    CHECK((r.value.t - Vec3(1.0, 0.0, 0.0)).norm() < 1.0);           // on the clean t side
+}
+
+TEST_CASE("split median: uniformly scaling a whole channel's weights leaves the solve "
+          "invariant (the all-flagged re-solve would be the base solve)") {
+    // Weiszfeld scale-invariance, pinned directly: scaling EVERY weight in a channel by
+    // kVetoWeightScale (what a hypothetical all-flagged veto re-solve would consume)
+    // changes nothing — so even the unreachable all-flagged edge could only waste the
+    // (capped) re-solve, never corrupt the output.
+    SE3 xs[4];
+    xs[0] = make_se3(Vec3(0.0, 0.1, 0.3), Vec3(1.0, 0.2, -0.3));
+    xs[1] = make_se3(Vec3(0.1, 0.0, 0.2), Vec3(1.1, 0.1, -0.2));
+    xs[2] = make_se3(Vec3(-0.1, 0.1, 0.4), Vec3(0.9, 0.3, -0.4));
+    xs[3] = make_se3(Vec3(0.0, -0.1, 0.3), Vec3(1.0, 0.2, -0.3));
+    const Scalar wr[4] = {1.0, 0.7, 1.3, 0.9};
+    const Scalar wt[4] = {0.9, 1.1, 0.6, 1.4};
+    Scalar wr_s[4], wt_s[4];
+    for (int i = 0; i < 4; ++i) {
+        wr_s[i] = wr[i] * median::kVetoWeightScale;
+        wt_s[i] = wt[i] * median::kVetoWeightScale;
+    }
+
+    const median::SplitResult a = median::solve_split(xs, wr, wt, 4, params(), false);
+    const median::SplitResult b = median::solve_split(xs, wr_s, wt_s, 4, params(), false);
+    CHECK(close(a.value.R, b.value.R, 1e-12));
+    CHECK(close(a.value.t, b.value.t, 1e-12));
+    CHECK(a.spread_rot == doctest::Approx(b.spread_rot).epsilon(1e-12));
+    CHECK(a.spread_trans == doctest::Approx(b.spread_trans).epsilon(1e-12));
 }
 
 // ---------------------------------------------------------------------------

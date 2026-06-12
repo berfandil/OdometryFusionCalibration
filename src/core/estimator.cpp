@@ -62,6 +62,12 @@ constexpr int    kMaxSourcesCap = 32;   // matches Result::calib/health array si
 // MINOR: the two caps used to be duplicated literals that could silently diverge).
 static_assert(kMaxSourcesCap <= Eskf::kMaxMedianInputs,
               "kMaxSourcesCap must not exceed Eskf::kMaxMedianInputs");
+// Slice-19 review MINOR: median::kMaxSplitInputs is the split solver's fixed scratch
+// capacity — past it solve_split silently disables the veto and fills the final-weight
+// outputs only to kMaxSplitInputs, so a cap bump on the estimator side without the solver
+// side would hand median_influence_split garbage tail weights. Tie it at compile time.
+static_assert(kMaxSourcesCap <= median::kMaxSplitInputs,
+              "kMaxSourcesCap must not exceed median::kMaxSplitInputs");
 // Absolute-reference corrections cap (Slice 11, D22). Fixed-capacity registry (strict
 // core: no post-init heap, bounded loops). 8 is generous for the GPS/INS/map-match
 // plugin count a single rig carries; past it add_correction returns CapacityExceeded.
@@ -206,6 +212,12 @@ std::uint64_t config_hash(const Config& cfg) {
     // policy -> both calibration-shaping, hashed. A flip rejects a cross-flag restore.
     w.put_bool(cfg.split_median);
     w.put_bool(cfg.split_veto);
+    // Slice-19 review MAJOR-2: q_scale_split sizes the split path's per-channel adaptive Q
+    // — the consensus covariance the persisted calibration converged under — so it is
+    // hashed alongside the split flags it belongs to. (The coupled q_scale predates the
+    // hash and remains a documented runtime exclusion; the asymmetry is deliberate — re-
+    // hashing q_scale now would invalidate every existing blob for no D23 gain.)
+    w.put_f64(cfg.q_scale_split);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -1223,8 +1235,9 @@ Status Estimator::step(Timestamp now) {
             s.aligned[n]  = A;
             s.weights[n]  = w;
             // Slice 19: the rotation channel's weight = the clamped fusion weight times
-            // the per-source rotation prior (read only when split_median is on).
-            s.weights_rot[n] = w * s.rot_weight_prior[i];
+            // the per-source rotation prior. Written only when the split path will read
+            // it (review NIT: the coupled path never reads weights_rot — don't dead-store).
+            if (cfg.split_median) s.weights_rot[n] = w * s.rot_weight_prior[i];
             s.med_slot[n] = i;
             h.weight      = w;
             ++n;
@@ -1286,6 +1299,11 @@ Status Estimator::step(Timestamp now) {
     for (int k = 0; k < n; ++k) {
         const int i = s.med_slot[k];
         SourceHealth& h = s.result.health[i];
+        // Slice-19 NIT (known wart, deliberate): on the SPLIT path this residual — and the
+        // reliability EMA it feeds — is still the MIXED split_distance (rot^2 + lambda*
+        // trans^2) against a consensus the mixed metric never solved for. Per-channel
+        // residual/reliability is policy layer (b), the explicit Slice-19 follow-up; when
+        // layer (b) lands, replace this with per-channel distances under split_median.
         const Scalar d = se3::split_distance(med.value, s.aligned[k], cfg.metric_lambda);
         h.residual = d;
 
@@ -1563,10 +1581,12 @@ Status Estimator::step(Timestamp now) {
     if (cfg.adaptive_q) {
         // Split path (Slice 19, §1.3): the two PER-CHANNEL spreads drive a per-channel Q
         // (q_trans from spread_trans in m^2, q_rot from spread_rot in rad^2 — no lambda
-        // unit-mixing), shared q_scale. Coupled path: untouched.
+        // unit-mixing), scaled by q_scale_split — the split path's OWN calibrated scale
+        // (review MAJOR-2: the coupled 0.7 is grossly overconfident on the honest
+        // per-channel spreads; see Config::q_scale_split). Coupled path: untouched.
         q_pose = cfg.split_median
                      ? Eskf::adaptive_q_split(smed.spread_trans, smed.spread_rot,
-                                              cfg.q_scale, cfg.q_floor)
+                                              cfg.q_scale_split, cfg.q_floor)
                      : Eskf::adaptive_q(med.spread, cfg.q_scale, cfg.q_floor);
     } else {
         q_pose = Eskf::adaptive_q(Scalar(0), cfg.q_scale, cfg.q_floor);
@@ -2189,6 +2209,8 @@ Status validate(const Config& cfg) {
         return Status::OutOfRange;                       // inflation >= 1
     if (cfg.q_scale <= 0.0)
         return Status::OutOfRange;                       // q_scale > 0
+    if (cfg.q_scale_split <= 0.0)
+        return Status::OutOfRange;                       // q_scale_split > 0 (Slice 19)
     for (int i = 0; i < 6; ++i) {
         if (cfg.q_floor[i] < 0.0) return Status::OutOfRange;   // each q_floor[i] >= 0
     }

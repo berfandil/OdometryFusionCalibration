@@ -411,7 +411,10 @@ SplitResult solve_split(const SE3* deltas, const Scalar* w_rot, const Scalar* w_
         bool any_rot_outlier = false, any_trans_outlier = false;
         bool rot_flag[kMaxSplitInputs], trans_flag[kMaxSplitInputs];
         for (int i = 0; i < n; ++i) {
-            // Leave-one-out spread of the OTHER inputs in each channel (0 if degenerate).
+            // Leave-one-out spread of the OTHER inputs in each channel (0 if degenerate),
+            // FLOORED at the absolute per-channel constant (review MAJOR-1): coincident
+            // other inputs (loo -> 0) must not turn the flag into a d_i > ~0 hair trigger
+            // that fires on honest noise — see kVetoSpreadFloor* in median.hpp.
             const Scalar wr  = we_rot[i];
             const Scalar den_r = Sw_r - wr;
             const Scalar num_r = Sd2_r - wr * d_rot[i] * d_rot[i];
@@ -422,13 +425,26 @@ SplitResult solve_split(const SE3* deltas, const Scalar* w_rot, const Scalar* w_
             const Scalar num_t = Sd2_t - wt * d_trans[i] * d_trans[i];
             const Scalar loo_t = (den_t > Scalar(0) && num_t > Scalar(0))
                                      ? std::sqrt(num_t / den_t) : Scalar(0);
-            rot_flag[i]   = d_rot[i]   > kVetoNormDist * loo_r;
-            trans_flag[i] = d_trans[i] > kVetoNormDist * loo_t;
+            const Scalar loo_r_eff = (loo_r > kVetoSpreadFloorRot) ? loo_r
+                                                                   : kVetoSpreadFloorRot;
+            const Scalar loo_t_eff = (loo_t > kVetoSpreadFloorTrans) ? loo_t
+                                                                     : kVetoSpreadFloorTrans;
+            rot_flag[i]   = d_rot[i]   > kVetoNormDist * loo_r_eff;
+            trans_flag[i] = d_trans[i] > kVetoNormDist * loo_t_eff;
             any_rot_outlier   = any_rot_outlier || rot_flag[i];
             any_trans_outlier = any_trans_outlier || trans_flag[i];
         }
         // A rotation-channel outlier suppresses that source's TRANSLATION weight (and vice
         // versa); the affected channel is re-solved once with the scaled weights.
+        //
+        // ALL-SOURCES-FLAGGED edge (review MINOR): the veto SCALES by kVetoWeightScale —
+        // it never zeroes, so every source keeps voting whatever the flag pattern; and
+        // Weiszfeld is scale-invariant, so if every source in one channel were flagged the
+        // re-solve would equal the base solve (wasted-but-capped WCET, identical result).
+        // That pattern is in fact UNREACHABLE under the LOO normalization: d_i > 3*loo_i
+        // for all i implies sum_i w_i^2 d_i^2 > (sum w) * (sum w d^2), which contradicts
+        // w_i <= sum w — at most n-1 sources can be flagged per channel. Both facts (never
+        // zero, scale-invariant re-solve) are pinned by tests, not just this argument.
         if (any_rot_outlier) {
             for (int i = 0; i < n; ++i) {
                 if (rot_flag[i]) we_trans[i] *= kVetoWeightScale;

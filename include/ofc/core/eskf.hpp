@@ -341,9 +341,11 @@ public:
     // Per-channel adaptive process noise for the SPLIT median path (Slice 19, §1.3):
     //   q_pose[0:3] (trans) = (q_scale * spread_trans^2) * I3 + diag(q_floor[0:3])
     //   q_pose[3:6] (rot)   = (q_scale * spread_rot^2)   * I3 + diag(q_floor[3:6])
-    // One SHARED q_scale knob (the split-ON cov-cal sweep showed no per-channel scale is
-    // needed to meet the band); the two spreads are the split solver's per-channel RMS
-    // distances (m / rad — no lambda unit-mixing). [trans; rot] order as adaptive_q().
+    // One SHARED scale knob (the split-ON cov-cal sweep showed no per-channel scale is
+    // needed to meet the band) — the estimator passes Config::q_scale_split here, NOT the
+    // coupled q_scale (review MAJOR-2: the split path has its own calibration); the two
+    // spreads are the split solver's per-channel RMS distances (m / rad — no lambda
+    // unit-mixing). [trans; rot] order as adaptive_q().
     static Mat6 adaptive_q_split(Scalar spread_trans, Scalar spread_rot, Scalar q_scale,
                                  const Scalar* q_floor);
 

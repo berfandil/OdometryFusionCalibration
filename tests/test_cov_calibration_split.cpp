@@ -3,9 +3,12 @@
 // The coupled (default) path's q_scale calibration is test_cov_calibration.cpp — UNCHANGED.
 // This file calibrates + guards the SPLIT path (split_median = true, veto default ON): the
 // per-channel spreads drive a per-channel adaptive Q (q_trans from spread_trans, q_rot from
-// spread_rot — Eskf::adaptive_q_split, one shared q_scale), so the q_scale calibration must
+// spread_rot — Eskf::adaptive_q_split, one shared scale), so the scale calibration must
 // be REDONE for the split path with the same sweep methodology (sweep {0.5, 0.7, 1.0, 1.5}
 // x trajectory set x M seeds; never-overconfident first, then closest to DOF from below).
+// The calibrated value ships as the DEFAULT of Config::q_scale_split (review MAJOR-2: the
+// split path reads its OWN scale knob, so enabling split_median can never silently run the
+// coupled 0.7) — the guard below pins that the DEFAULT lands in band.
 //
 // SWEEP RESULT (this rig, M=30, 1x noise, recorded 2026-06-12 — the offline grid; trans3 /
 // rot3 are the marginal 3-DOF block NEES on the binding nees_traj row):
@@ -31,11 +34,12 @@
 // SWEEP-SET DEVIATION (reported): the slice-spec'd brace {0.5, 0.7, 1.0, 1.5} contains NO
 // in-band value (every entry overconfident, the §1.3 STOP condition as literally written).
 // The sweep was EXTENDED upward with the same methodology and the SAME band (never
-// weakened): q_scale = 3.0 lands every trajectory in band with both 3-DOF blocks BALANCED
+// weakened): a scale of 3.0 lands every trajectory in band with both 3-DOF blocks BALANCED
 // on the binding trajectory (2.21/2.70) — so per §1.3's own criterion a single shared
-// q_scale suffices and NO per-channel scale knob is added. The CORE DEFAULT q_scale stays
-// 0.7 (the coupled calibration, untouched); a deployment enabling split_median must set
-// q_scale ~ 3.0 (CONFIG guidance — doc follow-up).
+// scale suffices and NO per-channel scale knob is added. The CORE DEFAULT q_scale stays
+// 0.7 (the coupled calibration, untouched); the split path reads Config::q_scale_split
+// instead, whose DEFAULT is the calibrated 3.0 (review MAJOR-2 — no deployment tuning
+// step, no silent-overconfidence trap).
 #include <doctest/doctest.h>
 
 #include "ofc/core/config.hpp"
@@ -117,7 +121,10 @@ Config split_cal_config(const std::vector<SourceParams>& planted,
     c.adaptive_q     = true;
     c.split_median   = true;          // THE PATH UNDER CALIBRATION (veto default ON; the
     c.split_veto     = veto;          // sweep aid can probe veto-off for diagnosis)
-    c.q_scale        = q_scale;
+    // The sweep parametrizes q_scale_split — the knob the split path actually reads
+    // (review MAJOR-2). q_scale stays at its coupled default (0.7): the guard passing
+    // proves the split path does NOT read it.
+    c.q_scale_split  = q_scale;
     for (int i = 0; i < 6; ++i) c.q_floor[i] = 1e-6;
     c.sensors        = sensors_out.data();
     c.sensor_count   = static_cast<int>(sensors_out.size());
@@ -214,17 +221,22 @@ TEST_CASE("covcal-split SWEEP (offline re-calibration aid)" * doctest::skip()) {
 }
 
 // ===========================================================================
-// THE PERMANENT SPLIT-ON GUARD (SLICE19 §2 item 5): at the calibrated SPLIT-path q_scale
+// THE PERMANENT SPLIT-ON GUARD (SLICE19 §2 item 5): at the calibrated SPLIT-path scale
 // (3.0 — NOT the coupled default 0.7; see the sweep table above) every trajectory's
 // ensemble-mean pose NEES is NEVER OVERCONFIDENT (< 5.6 hard band cap, < DOF 6) and
 // NEAR-CONSISTENT (above the gross-pessimism floor). The band is NOT to be weakened (the
 // slice's STOP rule); the coupled guard in test_cov_calibration.cpp is untouched.
 // ===========================================================================
-// The calibrated split-path q_scale (the CONFIG guidance value for split_median rigs).
+// The calibrated split-path scale — pinned below to BE Config::q_scale_split's default
+// (review MAJOR-2): the band is guarded at the value a split rig gets out of the box.
 static const Scalar kSplitQScale = 3.0;
 
 TEST_CASE("covcal-split: split-ON ensemble-mean pose NEES is never overconfident (<5.6) and "
-          "near-consistent at the calibrated split q_scale (3.0)") {
+          "near-consistent at the calibrated split q_scale_split (3.0 — the DEFAULT)") {
+    // The calibrated value IS the default — a rig flipping split_median on runs in band
+    // with no further tuning (the MAJOR-2 footgun removed). Recalibrating the sweep means
+    // updating Config::q_scale_split's default AND this pin together.
+    CHECK(Config{}.q_scale_split == kSplitQScale);
     struct Entry { const char* name; Trajectory tr; };
     std::vector<Entry> trajs;
     trajs.push_back({"nees_traj", split_nees_traj()});
@@ -260,8 +272,9 @@ TEST_CASE("covcal-split: split-ON ensemble-mean pose NEES is never overconfident
     CHECK(worst > 4.0);                // the calibrated point stays near-consistent
 
     // PROOF THE COUPLED DEFAULT IS WRONG FOR THE SPLIT PATH (the headline finding of the
-    // sweep — guards against anyone "simplifying" the split config back to q_scale 0.7):
-    // at 0.7 the split path is GROSSLY overconfident on the binding trajectory.
+    // sweep — guards against anyone "simplifying" q_scale_split back to the coupled 0.7
+    // or collapsing the two knobs into one): at 0.7 the split path is GROSSLY
+    // overconfident on the binding trajectory.
     const Scalar nees_coupled_default = split_ensemble_nees(split_nees_traj(), 0.7, M);
     MESSAGE("covcal-split @ the coupled default 0.7: nees_traj=" << nees_coupled_default);
     CHECK(nees_coupled_default > 12.0);   // ~21.7 measured — far past DOF=6

@@ -89,6 +89,16 @@ Result solve(const SE3* deltas, const Scalar* weights, int n, const Params& p);
 //   sqrt(sum_w/w_i) (< 3 for any rig under ~10 equal-weight sources) — i.e. a single gross
 //   outlier could NEVER trip the 3.0 threshold. Leave-one-out is the minimal normalization
 //   that makes the guard live at small n while keeping the fixed constants.
+//   ABSOLUTE FLOOR (Slice-19 review MAJOR-1): the LOO spread is floored at a per-channel
+//   absolute constant (kVetoSpreadFloorRot / kVetoSpreadFloorTrans) BEFORE the ratio.
+//   Without it, (near-)coincident OTHER inputs drive loo -> 0 and the flag degenerates to
+//   d_i > ~0 — ANY honest noise then flags the source EVERY step. That is the project's
+//   own target-rig shape (KAIST: all sources share wheel translation, so the translation
+//   channel is near-coincident by construction — the FOG heading source's ROTATION weight
+//   would be permanently vetoed by mm-level translation deviations). With the floor, a
+//   source must deviate by more than kVetoNormDist x the floor in absolute terms even when
+//   the other inputs agree perfectly — only GROSS faults trip it, which is the veto's
+//   contract (graceful per-channel weighting handles everything below).
 // The veto needs >= 3 inputs (rejection is undefined below that, as in the coupled solver)
 // and at most kMaxSplitInputs (the fixed scratch capacity, == the estimator's source cap).
 //
@@ -102,6 +112,21 @@ constexpr int kMaxSplitInputs = 32;
 // split_veto bool is). See the veto contract above.
 constexpr Scalar kVetoNormDist    = 3.0;   // flag: d_i > 3 x leave-one-out channel spread
 constexpr Scalar kVetoWeightScale = 0.1;   // flagged source's OTHER-channel weight scale
+// Absolute per-channel floors on the leave-one-out spread (review MAJOR-1) — in the
+// channel's NATIVE distance units on a WINDOWED delta: rad (geodesic) / m (Euclidean).
+// Sized for the project's window regime (0.05-0.2 s windows at vehicle dynamics): honest
+// per-window sensor noise sits BELOW the floor (wheel/visual odometry per-window scatter
+// ~mm-cm and ~mrad; the sim noise floors are 0.005 m / 0.005 rad), while a hard fault is
+// orders of magnitude ABOVE the kVetoNormDist x floor trip point (0.06 m / 0.03 rad per
+// window ~ 0.6 m/s / 0.3 rad/s at a 0.1 s window). Consequence (deliberate): when the
+// other inputs are coincident, a fault must exceed the ABSOLUTE trip point to be vetoed —
+// moderate degradation is left to the graceful per-channel weighting, exactly the policy
+// split that motivated the veto. Window-length CAVEAT: the floors are window-agnostic
+// constants; rigs with much longer windows (>~1 s) accumulate more honest per-window
+// noise and would need these revisited (report, do not tune per rig — they are fixed
+// policy like kVetoNormDist).
+constexpr Scalar kVetoSpreadFloorRot   = 0.01;   // rad, per windowed delta
+constexpr Scalar kVetoSpreadFloorTrans = 0.02;   // m,   per windowed delta
 
 // Output of the split solve. `value` = { R = rotation-channel median, t = translation-
 // channel median }; the per-channel spreads/iters/convergence mirror Result's fields.

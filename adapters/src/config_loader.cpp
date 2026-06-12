@@ -131,8 +131,11 @@ const char* kKnobDoc =
     "  joint_lever_scale=<bool> (turn-regime joint lever+scale 4-unknown LS, Slice 17b; default off)\n"
     "  multi_bias_enabled=<bool> (median-coupled multi-source bias states, Slice 18; default off)\n"
     "  multi_bias_cov0=<f>      (multi-bias per-DOF prior variance seed, > 0; default 0.04)\n"
-    "  split_median=<bool>      (per-channel split median, Slice 19; default off = coupled)\n"
+    "  split_median=<bool>      (per-channel split median, Slice 19; default off = coupled;\n"
+    "      when on, adaptive Q is scaled by q_scale_split — NOT q_scale)\n"
     "  split_veto=<bool>        (split-path cross-channel outlier veto; default on)\n"
+    "  q_scale_split=<f>        (split-path adaptive-Q scale, > 0; default 3.0 = the\n"
+    "      calibrated split value — only read when split_median is on)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
@@ -311,6 +314,13 @@ Status ConfigLoader::parse(const std::string& text) {
                 // only read when split_median is on).
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 cfg_.split_veto = bv;
+            } else if (key == "q_scale_split") {
+                // Slice 19 review/MAJOR-2: the split path's own adaptive-Q scale (> 0;
+                // validate()). Default 3.0 IS the calibrated split value — the coupled
+                // q_scale (0.7) is grossly overconfident on the per-channel spreads and
+                // is deliberately NOT read when split_median is on.
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.q_scale_split = dv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);

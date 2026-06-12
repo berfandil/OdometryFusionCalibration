@@ -485,13 +485,14 @@ TEST_CASE("persistence config-hash guard: flipping subbin_centroid rejects a cro
 }
 
 // ===========================================================================
-// Slice 19: split_median / split_veto / rot_weight_prior are calibration-shaping ->
-// they join the config-hash stream. A blob written under the defaults must be REJECTED
-// by a rig that flips the solver flag, the veto policy, or a sensor's rotation prior
-// (the persisted committed calibration was converged against a DIFFERENT consensus).
+// Slice 19: split_median / split_veto / q_scale_split / rot_weight_prior are
+// calibration-shaping -> they join the config-hash stream. A blob written under the
+// defaults must be REJECTED by a rig that flips the solver flag, the veto policy, the
+// split Q scale, or a sensor's rotation prior (the persisted committed calibration was
+// converged against a DIFFERENT consensus).
 // ===========================================================================
 TEST_CASE("persistence config-hash guard: flipping split_median / split_veto / "
-          "rot_weight_prior rejects a cross-flag restore") {
+          "q_scale_split / rot_weight_prior rejects a cross-flag restore") {
     std::vector<unsigned char> blob;
     converge_and_serialize_scale(blob);    // written with the defaults (split off, veto on)
 
@@ -524,6 +525,18 @@ TEST_CASE("persistence config-hash guard: flipping split_median / split_veto / "
         std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
         sensors[1].rot_weight_prior = 10.0;
         Config cfg = make_scale_cfg(sensors);
+        Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
+        for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
+        CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);
+    }
+    // (c2) q_scale_split changed (review MAJOR-2 follow-on: it sizes the split path's
+    // adaptive Q — the consensus covariance the persisted calibration converged under,
+    // hashed alongside the split flags) -> different hash -> reject.
+    {
+        std::vector<std::unique_ptr<SyntheticSource>> srcs; make_scale_sources(tr, srcs);
+        std::vector<SensorConfig> sensors; make_scale_sensors(sensors);
+        Config cfg = make_scale_cfg(sensors);
+        cfg.q_scale_split = 1.5;                 // non-default (default 3.0)
         Estimator est; REQUIRE(est.init(cfg) == Status::Ok);
         for (auto& sp : srcs) REQUIRE(est.add_source(sp.get()) == Status::Ok);
         CHECK(est.deserialize(blob.data(), static_cast<int>(blob.size())) == Status::InvalidConfig);

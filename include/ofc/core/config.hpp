@@ -80,7 +80,16 @@ struct SensorConfig {
     // Sigma-confidence placeholder, while this is a deliberate datasheet declaration — e.g.
     // a FOG-grade heading source carries rot_weight_prior ~ 10 so fusion's rotation channel
     // tracks it without distorting translation). >= 0 (validate; 0 = "never trust this
-    // source's rotation"). INERT (byte-identical) when split_median is off. Hashed.
+    // source's rotation"). ALL-ZERO SEMANTICS (Slice-19 review MINOR, pinned): if EVERY
+    // source participating in a step carries an effective rotation weight of 0, the
+    // rotation channel falls back to the UNWEIGHTED (uniform) median — the per-channel
+    // mirror of the coupled solver's all-<=0 w_of contract. The per-source distrust
+    // declarations cannot all be honored at once (fusion must still publish a rotation),
+    // so declare RELATIVE trust (0 on the distrusted sources, > 0 on at least one) rather
+    // than zeroing every source; validate() does NOT reject the all-zero config because
+    // the same condition arises per STEP from participation subsets (e.g. cold-start),
+    // where the uniform fallback is the only safe behavior. INERT (byte-identical) when
+    // split_median is off. Hashed.
     Scalar   rot_weight_prior = 1.0;
     bool     native_confidence = true;
     Scalar   modeled_noise_per_m   = 0.01;
@@ -155,8 +164,8 @@ struct Config {
     // routes to median::solve_split — TWO independent Weiszfeld medians (rotation on SO(3)
     // geodesic, translation on R^3) with per-channel weights (w_rot additionally carries
     // SensorConfig::rot_weight_prior), per-channel spreads driving a per-channel adaptive Q
-    // (q_trans from spread_trans, q_rot from spread_rot — shared q_scale, no lambda
-    // unit-mixing), and a block-diagonal Slice-18 median influence. Lets fusion express
+    // (q_trans from spread_trans, q_rot from spread_rot — one shared scale, q_scale_split
+    // NOT q_scale; no lambda unit-mixing), and a block-diagonal Slice-18 median influence. Lets fusion express
     // per-channel source quality: the fused heading can track the best heading source
     // without distorting translation (the KAIST urban12 FOG case). Default OFF = the
     // coupled solver runs BYTE-IDENTICALLY (the split solver is mathematically different
@@ -173,6 +182,24 @@ struct Config {
     // translation-good source must keep full translation participation. Constants are
     // fixed (median.hpp) — only this bool is a knob. Hashed.
     bool       split_veto     = true;
+    // q_scale for the SPLIT path (Slice-19 review MAJOR-2; read INSTEAD of q_scale when
+    // split_median is on, inert otherwise). The split path's honest per-channel spreads
+    // need a DIFFERENT calibration than the coupled path's mixed spread: the coupled
+    // adaptive Q put the mixed (rot^2 + lambda*trans^2) spread on all six axes, so each
+    // channel's Q rode the other channel's scatter as padding; the per-channel sizing
+    // removes that padding and q_scale*spread_chan^2 understates the median's true
+    // per-window error by ~3-4x in both channels. Re-running the coupled sweep methodology
+    // split-ON (tests/test_cov_calibration_split.cpp — 3-source mounted rig, M=30 seeds,
+    // nees_traj/turning/straight) gives worst-case ensemble-mean pose NEES:
+    //   q_scale_split  0.5    0.7    1.0    1.5    2.0   2.5   3.0           4.0
+    //   worst NEES     30.10  21.65  15.24  10.20  7.67  6.14  5.12 <-chosen 3.85(floor!)
+    // 3.0 is the unique never-overconfident (< 5.6) + above-floor (> 1.2) point — the
+    // default IS the calibrated value, so flipping split_median on never silently runs the
+    // coupled 0.7 (NEES ~21.7, grossly overconfident — the config trap this knob removes).
+    // The coupled q_scale (0.7) and its calibration are untouched. > 0 (validate). Hashed
+    // (it shapes the consensus covariance the persisted calibration converged under, like
+    // the split flags; the coupled q_scale predates the hash and stays excluded).
+    Scalar     q_scale_split  = 3.0;
 
     // Weights
     Scalar      reliability_ema_alpha = 0.02;
