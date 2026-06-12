@@ -61,7 +61,23 @@ Real-data (orchestrator, post-merge — KAIST urban07/12/17, recommended urban c
 
 ## 3. Status
 
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed (`reviews/slice-19-findings.md`) + findings fixed
-- [ ] Real-data validation table filled in
-- [ ] Docs updated (DESIGN §4 / DECISIONS D3-amendment + D29 / CONFIG / ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed) — `6ebfcc5`
+- [x] Reviewed (`reviews/slice-19-findings.md`: APPROVE WITH FINDINGS, 2 MAJOR + 5 MINOR + 2 NIT) + all fixed — `6c23894`; unit 305 cases / 18,911 asserts
+- [x] Real-data validation — table below
+- [x] Docs updated (DECISIONS D29 / CONFIG / ISSUES) — orchestrator
+
+### §1 amendments from implementation + review (authoritative)
+
+- **Veto normalization is LEAVE-ONE-OUT spread with absolute floors** (`max(loo, kVetoSpreadFloorRot=0.01 rad | kVetoSpreadFloorTrans=0.02 m)`): the spec'd full-set RMS bounds `d_i/spread ≤ √n` — the 3.0 threshold could mathematically never fire; and unfloored LOO is a hair-trigger on near-coincident channels (would have vetoed the FOG's rotation on the shared-wheel KAIST rig). Both deviations review-verified.
+- **`Config::q_scale_split` (default 3.0)**: the split path needs its own calibrated q_scale — the coupled 0.7 is grossly overconfident under split (NEES 21.7, pinned) because the coupled mixed-unit spread padded both channels' Q. The spec'd sweep brace {0.5..1.5} contained no in-band value; the sweep was extended (same methodology, band intact) to 3.0 — **deviation RATIFIED by the orchestrator under the user's design delegation** (the §1.3 STOP rule's protected invariants — band unweakened, nothing out-of-band shipped — were honored). Post-veto-floor re-check: worst NEES 4.998, in band.
+- All-zero rotation weights → uniform fallback (the coupled solver's zero-weight contract); veto scaling never zeroes (0.1×).
+
+### Real-data validation (KAIST, recommended urban config + `split_median` + FOG `rot_weight_prior=10`, 2026-06-12)
+
+| run | local rot p50 | rot mean | trans p50 | notes |
+|---|---|---|---|---|
+| urban07 | 0.0276 → **0.0161 rad** | 0.0346 → **0.0191** | 1.35 → **0.98 m** | better everywhere (max 8.4→5.2 m) |
+| urban12 | 0.0133 → **0.0041 rad (0.23°)** | 0.0308 → **0.0183 (1.05°)** | 0.477 → **0.194 m** | full-drive rms rot 5.4° ≈ the FOG floor (4.6°); the 5–30°/61°-spike band GONE; tail ~same (1.88 m); ONE worst window regressed 120→211 m (recorded; everything else better) |
+| urban17 | 0.0055 (=) | 0.0087 (=) | 0.533 (=) | neutral — no regression |
+
+**The fused heading now tracks the best heading source.** Acceptance (<10° full-drive) met. Follow-ups logged: layer (b) per-channel scatter reliability (the Slice-9 residual is still the mixed split_distance on the split path), layer (c) GPS-course drift monitor (auto-discovery of the FOG), the one urban12 window regression, veto floors vs ≫1 s windows.
