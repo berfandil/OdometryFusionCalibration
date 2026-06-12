@@ -60,7 +60,23 @@ Real-data (orchestrator):
 
 ## 4. Status
 
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed (`reviews/slice-18-findings.md`) + findings fixed
-- [ ] Real-data validation table filled in
-- [ ] Docs updated (CONFIG/DECISIONS/DESIGN/ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed) — FD pin `def0cee` (falsified the spike-5a scalar Jacobian, derived the exact Ω_i), implementation `2dc6678`
+- [x] Reviewed (`reviews/slice-18-findings.md`: APPROVE WITH FINDINGS, 4 MAJOR + 8 MINOR + 3 NIT) + all fixed + hardened — `67b0242` (B1 vote guards) + `57fc874` (B2 per-DOF bias control + findings); unit 274 cases / 17238 asserts
+- [x] Real-data validation — tables below; **the urban12 heading goal is NOT MET — documented as an observability boundary, not a bug**
+- [x] Docs updated (CONFIG/DECISIONS D28/ISSUES) — orchestrator
+
+### Hardening added during real-data validation (authoritative §2 amendments)
+
+- **B1 — out-of-range vote SKIP guards** on Phase-1 so3 / Phase-2 xyz / rot3d channels (the 17b scale2 precedent + skip counters): on the first real-data runs, wandering bias DOFs rotated the de-biased deltas until calibration votes edge-clamped into the [-1,1] boundary bin and COMMITTED at ±0.984375 (the edge-bin center) — urban12 tail 1.99 → 2716 m with absurd committed extrinsics. The guards close that channel for good (urban12 signature test, mutation-pinned). **Unconditional win, active regardless of the bias flag.**
+- **B2 — per-DOF bias control**: `bias_process_noise` is per-DOF (Vec6; scalar = uniform; **0 pins that bias DOF at zero entirely**), `kMultiBiasCov0` promoted to `Config::multi_bias_cov0`.
+
+### Real-data validation (KAIST, hardened build, recommended urban config)
+
+| run | flag OFF | naive (all-source 6-DOF, sim-scale cov0=0.04) | hardened, yaw-only, physical scale (cov0=1e-6, pn=1e-10) |
+|---|---|---|---|
+| urban07 | rot rms 0.084, p50 2.37, calib mm | rot rms 0.48, FALSE 0.11 m levers committed | **rot rms 0.089, p50 2.35, calib mm — no regression** |
+| urban12 | tail 1.99 m, applied 1375 | tail 2716 m, calib at hist edges, death spiral | **≡ flag-off to 5 decimals** (tail 1.99343, NEES 371.52) — bias INERT |
+
+### The observability boundary (why the urban12 heading prize is out of reach here)
+
+Instrumented bias trajectory (harness `bias_wz` column, `9756d46`): at sim-scale priors a single applied GPS fix kicks the yaw bias to **+9870°/h** (true: −75°/h) — the prior σ of 0.2 rad/s told the filter such biases are plausible → junk sink → divergence. At the honest physical prior (σ ≈ 206°/h) the filter learns **±3°/h in 41 minutes, `bias_observable` = 0.000** — per-fix information ≈ 0. Structurally: a position-only GPS fix observes yaw-rate bias only through the rotation rows of the gain — **exactly what Slice-15b C4 suppresses** (and C4 is what keeps urban12 alive). The channel that WOULD observe per-source bias cheaply — source-vs-source yaw-rate differences, visible every step without GPS — is discarded by the median consensus by design, and treating sources as filter measurements is the architecture D4 explicitly rejected (double-counting). Conclusion: median-coupled bias states work as modeled (sim: 4.4×/14× coast improvement) but real urban position-only GPS at honest priors cannot feed them; the fused-heading-tracks-FOG prize needs a different lever (e.g. revisiting per-DOF consensus weighting — a D3-level change), recorded for a future decision.
