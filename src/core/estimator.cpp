@@ -44,6 +44,7 @@
 #include "ofc/core/buffer.hpp"
 #include "ofc/core/calibration.hpp"
 #include "ofc/core/eskf.hpp"
+#include "ofc/core/heading_monitor.hpp"
 #include "ofc/core/lie.hpp"
 #include "ofc/core/median.hpp"
 #include "ofc/core/persistence.hpp"
@@ -57,6 +58,8 @@ namespace ofc {
 
 namespace {
 constexpr Scalar kNanosPerSec = Scalar(1e9);
+constexpr Scalar kHmPi  = Scalar(3.14159265358979323846);  // heading-monitor yaw unwrap
+constexpr Scalar kHm2Pi = Scalar(6.28318530717958647692);
 constexpr int    kMaxSourcesCap = 32;   // matches Result::calib/health array sizes
 // The median-influence capacity must cover every possible median participant set (review
 // MINOR: the two caps used to be duplicated literals that could silently diverge).
@@ -218,6 +221,12 @@ std::uint64_t config_hash(const Config& cfg) {
     // hash and remains a documented runtime exclusion; the asymmetry is deliberate — re-
     // hashing q_scale now would invalidate every existing blob for no D23 gain.)
     w.put_f64(cfg.q_scale_split);
+    // Slice 19c: the heading-monitor flag changes the split rotation channel's effective
+    // weights (the auto-discovered boost composes beside rot_weight_prior) and the boost cap
+    // scales that boost -> both calibration-shaping (they shape the consensus the persisted
+    // calibration converged under, like rot_weight_prior). A flip rejects a cross-flag restore.
+    w.put_bool(cfg.heading_monitor);
+    w.put_f64(cfg.heading_monitor_boost_max);
     // calib_lag_s shapes the deeper-frontier smoother lag L (× tick_rate_hz), a calibration-
     // shaping knob like phase2_strategy — hashed for consistency (tick_rate_hz itself stays the
     // documented runtime exclusion).
@@ -489,6 +498,30 @@ struct Estimator::Impl {
     // the cap so the per-step median selection is heap-free + bounded (strict core). The
     // split path reuses it SEQUENTIALLY (one channel's pass at a time).
     Scalar rel_scratch[kMaxSourcesCap];
+
+    // ---- GPS-course heading-drift monitor (Slice 19c, split policy layer c) ----------------
+    // Active only when cfg.heading_monitor (which validate() requires split_median). Fed ONE
+    // sample per APPLIED position-observing correction with each source's CUMULATIVE base-frame
+    // yaw + forward distance; ranks the per-source heading drift vs GPS course and emits a
+    // per-source rotation-channel boost read in the NEXT step's split weight assembly (slow
+    // update — causal, like the reliability feedback). Heap-resident inside Impl (the monitor's
+    // own state is fixed-capacity; allocated once with Impl). NOT persisted (re-warms).
+    HeadingMonitor heading_mon;
+    bool           heading_active = false;          // cfg.heading_monitor (cached)
+    // Per-registered-slot CUMULATIVE base-frame yaw (rad, unwrapped) + forward distance (m),
+    // accrued each fused step from this step's aligned median delta so the monitor reads a
+    // consistent per-source heading/odometry history at fix times. Reset in init().
+    Scalar         hm_yaw[kMaxSourcesCap]  = {};
+    Scalar         hm_fwd[kMaxSourcesCap]  = {};
+    bool           hm_have_prevR[kMaxSourcesCap] = {};
+    Mat3           hm_prevR[kMaxSourcesCap];        // previous aligned R per slot (yaw unwrap)
+    // Per-step scratch the fuse loop fills with this step's per-source yaw/fwd, handed to the
+    // monitor when a fix is applied (no heap in step()).
+    Scalar         hm_yaw_snap[kMaxSourcesCap] = {};
+    Scalar         hm_fwd_snap[kMaxSourcesCap] = {};
+    // Latest per-source boost the monitor published (read into the split weight assembly; 1.0
+    // until the monitor scores). Updated AFTER the fuse each step (causal).
+    Scalar         hm_boost[kMaxSourcesCap];
 
     // Lifecycle state (Slice 3, D23). Persisted across steps; the phase is
     // RECOMPUTED every step from the current fuse signals, so an upgrade
@@ -957,6 +990,15 @@ Status Estimator::init(const Config& cfg) {
         impl_->resid_n_split[i]     = 0;
         impl_->reliability_rot[i]   = Scalar(1);
         impl_->reliability_trans[i] = Scalar(1);
+        // Heading-monitor per-source history + boost (Slice 19c): clean accumulators + a
+        // neutral boost so the first steps weight exactly as Slice 19b (monitor abstains).
+        impl_->hm_yaw[i]            = Scalar(0);
+        impl_->hm_fwd[i]           = Scalar(0);
+        impl_->hm_have_prevR[i]    = false;
+        impl_->hm_prevR[i]         = Mat3::Identity();
+        impl_->hm_yaw_snap[i]      = Scalar(0);
+        impl_->hm_fwd_snap[i]      = Scalar(0);
+        impl_->hm_boost[i]         = Scalar(1);
         // Per-sensor smoother gate (Slice 10): bound in add_source(); default off.
         impl_->smooth_source[i]     = false;
         impl_->calib_slot[i]        = -1;
@@ -966,6 +1008,13 @@ Status Estimator::init(const Config& cfg) {
     // Deeper-frontier calibration ring + smoother (Slice 10): empty until the first step.
     impl_->calib_ring_count = 0;
     impl_->smoother.reset();
+
+    // Heading-monitor (Slice 19c): cache the flag + clear monitor state. The source count is
+    // bound lazily in add_source (sources register after init); validate() guarantees
+    // split_median is on whenever this is. Off = the entire monitor path is skipped (no fix
+    // feed, boosts stay 1.0 -> byte-identical to Slice 19b).
+    impl_->heading_active = cfg.heading_monitor;
+    impl_->heading_mon.configure(0);
 
     // Time-sync: configure once at init (preallocates its buffers/histograms). Disabled
     // configs skip it entirely (behave exactly as before — offsets stay at the priors).
@@ -1103,6 +1152,10 @@ Status Estimator::add_source(const ISource* src) {
         impl_->calib2.set_prior(src->id(), Xp, sccal);
     }
     ++impl_->source_count;
+    // Heading-monitor (Slice 19c): track the live registered count so it ranks exactly the
+    // registered sources by slot. Reconfiguring clears the monitor's (still empty) state —
+    // sources are always added before the first step(), so no in-flight history is lost.
+    if (impl_->heading_active) impl_->heading_mon.configure(impl_->source_count);
     return Status::Ok;
 }
 
@@ -1243,6 +1296,30 @@ Status Estimator::step(Timestamp now) {
         const SE3& X = s.prior_extrinsic[i];
         const SE3 A  = se3::compose(se3::compose(X, B_corr), se3::inverse(X));
 
+        // Heading-monitor per-source history (Slice 19c). Accumulate this source's CUMULATIVE
+        // base-frame yaw (composing the aligned increment A.R; unwrapped) + source-frame
+        // forward distance (B_corr.t.x — the odometer reading the v_odo cross-check needs).
+        // Done for EVERY covered source so the per-source heading history stays continuous
+        // across steps; snapshotted at fix time. Inert (no work) when the monitor is off.
+        if (s.heading_active) {
+            const Mat3 Rcur = s.hm_have_prevR[i] ? Mat3(s.hm_prevR[i] * A.R) : A.R;
+            const Scalar yaw_abs = std::atan2(Rcur(1, 0), Rcur(0, 0));
+            if (!s.hm_have_prevR[i]) {
+                s.hm_yaw[i] = yaw_abs;
+            } else {
+                // Unwrap against the previous cumulative yaw (deltas telescope continuously).
+                Scalar dyaw = yaw_abs - std::atan2(s.hm_prevR[i](1, 0), s.hm_prevR[i](0, 0));
+                while (dyaw >  kHmPi) dyaw -= kHm2Pi;
+                while (dyaw < -kHmPi) dyaw += kHm2Pi;
+                s.hm_yaw[i] += dyaw;
+            }
+            s.hm_prevR[i]      = Rcur;
+            s.hm_have_prevR[i] = true;
+            s.hm_fwd[i] += B_corr.t.x();
+            s.hm_yaw_snap[i] = s.hm_yaw[i];
+            s.hm_fwd_snap[i] = s.hm_fwd[i];
+        }
+
         // Weight = prior x reliability x Sigma-confidence, clamped to [floor, cap]
         // (DESIGN §4, D17). CAUSAL ORDERING: reliability[i] is the value accumulated from
         // PRIOR steps (init 1.0) — this step's residual updates it only AFTER the median is
@@ -1277,7 +1354,12 @@ Status Estimator::step(Timestamp now) {
                 const Scalar wr = std::max(cfg.weight_floor, std::min(cfg.weight_cap,
                                            w_base * s.reliability_rot[i]));
                 s.weights[n]     = wt;
-                s.weights_rot[n] = wr * s.rot_weight_prior[i];
+                // Slice 19c: the heading-monitor boost slots beside the config prior — same
+                // position OUTSIDE the clamp (Slice-19 contract): w_rot = clamp(w_base *
+                // rel_rot) * rot_weight_prior * monitor_boost. hm_boost is the PRIOR step's
+                // published boost (causal, like reliability), exactly 1.0 while the monitor is
+                // off / abstaining, so the monitor-off path stays byte-identical to 19b.
+                s.weights_rot[n] = wr * s.rot_weight_prior[i] * s.hm_boost[i];
                 h.weight         = wt;   // legacy diagnostic = the translation channel
             } else {
                 s.weights[n] = w;
@@ -1885,6 +1967,27 @@ Status Estimator::step(Timestamp now) {
     s.result.frontier        = s.eskf.state();
     s.result.frontier.stamp  = t1;
 
+    // ---- GPS-course heading-drift monitor feed + boost publish (Slice 19c) ------------------
+    // After the correction is applied, the post-update frontier position IS the GPS fix in the
+    // odom frame (a follow/position fix pulls the state onto z). Submit one monitor sample per
+    // APPLIED position fix with each source's cumulative yaw/forward history snapshotted this
+    // step, then republish the per-source boost the NEXT step's split weight assembly reads
+    // (causal — like the reliability feedback). Inert (no work) when the monitor is off.
+    if (s.heading_active) {
+        if (cdiag.corr_applied > 0) {
+            s.heading_mon.submit_fix(static_cast<Scalar>(t1) * Scalar(1e-9),
+                                     s.result.frontier.pose.t,
+                                     s.hm_yaw_snap, s.hm_fwd_snap);
+        }
+        for (int i = 0; i < s.source_count; ++i) {
+            s.hm_boost[i] = s.heading_mon.boost(i, cfg.heading_monitor_boost_max);
+            SourceHealth& hh   = s.result.health[i];
+            hh.heading_scored  = s.heading_mon.scored(i);
+            hh.heading_score   = hh.heading_scored ? s.heading_mon.score(i) : Scalar(0);
+            hh.heading_boost   = s.hm_boost[i];
+        }
+    }
+
     // Per-source bias snapshot (Slice 11b, Option A). Filled HERE — after predict_aug (the
     // de-bias) and the absolute-ref update_aug (the injection) — so it reflects THIS step's
     // bias estimate. Only the single bias source carries it; every other source reads zero
@@ -2323,6 +2426,14 @@ Status validate(const Config& cfg) {
         return Status::OutOfRange;                       // q_scale > 0
     if (cfg.q_scale_split <= 0.0)
         return Status::OutOfRange;                       // q_scale_split > 0 (Slice 19)
+    // GPS-course heading-drift monitor (Slice 19c). The boost feeds the rotation channel
+    // ONLY — there is no rotation channel on the coupled solver — so the monitor REQUIRES
+    // split_median; heading_monitor with the coupled median is a config error (no silent
+    // no-op). The boost cap must be >= 1 (a cap < 1 would invert the boost direction).
+    if (cfg.heading_monitor && !cfg.split_median)
+        return Status::InvalidConfig;                    // monitor needs the split rotation channel
+    if (cfg.heading_monitor_boost_max < 1.0)
+        return Status::OutOfRange;                       // boost cap >= 1
     for (int i = 0; i < 6; ++i) {
         if (cfg.q_floor[i] < 0.0) return Status::OutOfRange;   // each q_floor[i] >= 0
     }

@@ -136,6 +136,9 @@ const char* kKnobDoc =
     "  split_veto=<bool>        (split-path cross-channel outlier veto; default on)\n"
     "  q_scale_split=<f>        (split-path adaptive-Q scale, > 0; default 3.0 = the\n"
     "      calibrated split value — only read when split_median is on)\n"
+    "  heading_monitor=<bool>   (GPS-course heading-drift monitor, Slice 19c; default off;\n"
+    "      auto-discovers the heading-grade source — REQUIRES split_median)\n"
+    "  heading_monitor_boost_max=<f>  (winner's rotation-channel boost cap, >= 1; default 10)\n"
     "  subbin_centroid=<bool>   (centroid sub-bin readout, all 5 calib histograms)\n"
     "  adaptive_q=<bool>   q_scale=<f>   q_floor=<f | 6 f's [trans;rot]>\n"
     "  mahalanobis_chi2=<f>   correction_robust_kappa=<f>   correction_rot_suppress_kappa=<f>  (0=off)\n"
@@ -321,6 +324,18 @@ Status ConfigLoader::parse(const std::string& text) {
                 // is deliberately NOT read when split_median is on.
                 if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
                 cfg_.q_scale_split = dv;
+            } else if (key == "heading_monitor") {
+                // Slice 19c: GPS-course heading-drift monitor (auto-discovers the heading-
+                // grade source, boosting its rotation channel). Default off = byte-identical.
+                // REQUIRES split_median — validate() rejects monitor-without-split.
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                cfg_.heading_monitor = bv;
+            } else if (key == "heading_monitor_boost_max") {
+                // Slice 19c: the winner's rotation-channel boost cap (>= 1; validate()).
+                // Default 10 = the urban recipe's rot_weight_prior. Inert unless
+                // heading_monitor is on.
+                if (!parse_double(val, dv)) return fail("expected number", line_no, raw);
+                cfg_.heading_monitor_boost_max = dv;
             } else if (key == "subbin_centroid") {
                 // Slice 16: one switch, applied to ALL FIVE calibration histograms.
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);

@@ -34,6 +34,7 @@ add_library(ofc_core STATIC
     src/core/estimator.cpp
     src/core/histogram.cpp
     src/core/timesync.cpp
+    src/core/heading_monitor.cpp
     src/core/calibration.cpp
     src/core/smoother.cpp
 )

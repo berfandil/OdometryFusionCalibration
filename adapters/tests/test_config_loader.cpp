@@ -569,3 +569,62 @@ TEST_CASE("ConfigLoader: split_median / split_veto / q_scale_split / rot_weight_
               == Status::OutOfRange);
     }
 }
+
+TEST_CASE("ConfigLoader: heading_monitor / heading_monitor_boost_max parse (Slice 19c); "
+          "defaults; monitor-without-split + bad values reject") {
+    // Both keys set, with split_median on (the monitor's precondition).
+    {
+        const std::string text =
+            "[global]\nmax_sources=2\nreference_sensor_id=0\n"
+            "split_median = true\n"
+            "heading_monitor = true\n"
+            "heading_monitor_boost_max = 8.0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n"
+            "[sensor.1]\nid=1\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK(loader.config().heading_monitor);
+        CHECK(loader.config().heading_monitor_boost_max == doctest::Approx(8.0));
+    }
+    // Keys absent -> defaults (monitor off = byte-identical; boost cap 10).
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK_FALSE(loader.config().heading_monitor);
+        CHECK(loader.config().heading_monitor_boost_max == doctest::Approx(10.0));
+    }
+    // heading_monitor=true WITHOUT split_median fails the core validate() (InvalidConfig) — the
+    // boost feeds the rotation channel only.
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "heading_monitor = true\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) == Status::InvalidConfig);
+    }
+    // Bad values reject loudly; a boost cap < 1 parses but fails validate() (OutOfRange).
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nheading_monitor = banana\n") == Status::InvalidConfig);
+        CHECK(loader.error().find("heading_monitor") != std::string::npos);
+    }
+    {
+        ConfigLoader loader;
+        CHECK(loader.parse("[global]\nheading_monitor_boost_max = junk\n")
+              == Status::InvalidConfig);
+        CHECK(loader.error().find("expected number") != std::string::npos);
+    }
+    {
+        const std::string text =
+            "[global]\nmax_sources=1\nreference_sensor_id=0\n"
+            "split_median = true\nheading_monitor = true\n"
+            "heading_monitor_boost_max = 0.5\n"
+            "[sensor.0]\nid=0\nis_reference=true\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) == Status::OutOfRange);
+    }
+}

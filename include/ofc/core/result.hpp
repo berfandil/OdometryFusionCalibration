@@ -128,6 +128,22 @@ struct SourceHealth {
     Scalar   reliability_trans = 1.0;   // split path: translation-channel reliability (19b)
     Scalar   bias_rot          = 0.0;   // split path: rotation-channel EMA-mean (rad)
     Scalar   bias_trans        = 0.0;   // split path: translation-channel EMA-mean (m)
+    // GPS-course heading-drift monitor diagnostics (Slice 19c — split policy layer c). Only
+    // populated when Config::heading_monitor is on (and split_median, its precondition); the
+    // defaults below are what every other path reads.
+    //   * heading_score — the per-source drift score |slope| + event-rate (rad/s; a pure
+    //                     RANKING quantity — a LOWER score is a better heading source). 0.0
+    //                     until the source is scored.
+    //   * heading_boost — the per-source ROTATION-channel weight multiplier the monitor feeds
+    //                     into the split solve: boost = clip(boost_max * min_j score_j /
+    //                     score_i, 1, boost_max), composed OUTSIDE the clamp alongside
+    //                     rot_weight_prior. Exactly 1.0 while the monitor abstains (< 2 sources
+    //                     scored) or for an unscored source — so monitor-off reads 1.0.
+    //   * heading_scored— whether a drift baseline has formed for this source (false until the
+    //                     first GPS-contiguous segment yields two blocks >= min_base apart).
+    Scalar   heading_score   = 0.0;     // drift score (rad/s); 0 until scored
+    Scalar   heading_boost   = 1.0;     // rotation-channel boost multiplier; 1.0 = neutral
+    bool     heading_scored  = false;   // a drift baseline has formed
     bool     in_window   = false;
     bool     straight    = false;
     bool     turning     = false;

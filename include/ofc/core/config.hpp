@@ -202,6 +202,29 @@ struct Config {
     // the split flags; the coupled q_scale predates the hash and stays excluded).
     Scalar     q_scale_split  = 3.0;
 
+    // GPS-course heading-drift monitor (Slice 19c, split policy layer (c)). When enabled, the
+    // monitor ranks each source's heading quality against GPS course-over-ground ONLINE and
+    // boosts the best source's ROTATION-channel weight in the split solve — auto-discovering
+    // the heading-grade source (the FOG) instead of the hand-tuned rot_weight_prior=10 urban
+    // recipe. The boost slots beside the config prior (same position OUTSIDE the channel
+    // clamp, Slice-19 contract): w_rot_i = clamp(w_base * rel_rot_i) * rot_weight_prior_i *
+    // heading_boost_i. The boost is 1.0 for every source until >= 2 are scored (abstain-don't-
+    // guess), so flag-on with no scored data is byte-identical to flag-off. REQUIRES
+    // split_median (the boost feeds the rotation channel only — there is no rotation channel on
+    // the coupled path); heading_monitor=true with split_median=false is an InvalidConfig at
+    // validate() (no silent no-op). Default OFF = byte-identical on BOTH paths (the monitor
+    // never runs, never reads a fix). Hashed (a flip rejects stale restores). Monitor state is
+    // NOT persisted (re-warms over the first GPS-contiguous at-speed segment, same stance as
+    // 19b per-channel reliability). Diagnostics in SourceHealth.{heading_score, heading_boost,
+    // heading_scored}.
+    bool       heading_monitor = false;
+    // Maximum rotation-channel boost the monitor may apply (the winner's cap; >= 1, validate).
+    // On KAIST this reproduces the hand recipe with no config (fog -> ~10, others -> 1).
+    // Default 10 = the urban recipe's rot_weight_prior. Hashed (it scales the consensus the
+    // persisted calibration converges under, like rot_weight_prior). Inert unless
+    // heading_monitor is on; a cap < 1 is rejected (it would invert the boost direction).
+    Scalar     heading_monitor_boost_max = 10.0;
+
     // Weights
     Scalar      reliability_ema_alpha = 0.02;
     // Variance-EMA reliability clamp (Slice 9, D17). The reliability multiplier is
