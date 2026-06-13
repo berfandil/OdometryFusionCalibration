@@ -66,7 +66,27 @@ Real-data (orchestrator, post-merge — KAIST urban07/12/17, urban recipe WITHOU
 
 ## 3. Status
 
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed + findings fixed
-- [ ] Real-data validation
-- [ ] Docs updated (DECISIONS D29 / CONFIG / ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed) — `770f6b2` (`HeadingMonitor` core unit + estimator wiring + loader keys; diagnostics home = `SourceHealth.{heading_score,heading_boost,heading_scored}`)
+- [x] Reviewed (`reviews/slice-19c-findings.md`: REQUEST CHANGES — 2 CRITICAL + 1 high-risk + MINORs) + all fixed — `e7bba55`
+- [x] Real-data validation — table below
+- [x] Docs updated (DECISIONS D29 / CONFIG / ISSUES) — orchestrator
+
+### Implementation deviations from §1 (authoritative)
+
+- **Block reduction = MEDIAN** (spec §1.3): the first implementer shipped a running-MEAN block reduction (no per-block sort); review flagged it CRITICAL (the event-channel design proves short blocks carry outliers — multipath/slip). Fixed to a strict-core per-block median (fixed `Scalar[kBlockSamples=256]` + stack `nth_element`, no heap; surplus samples dropped reservoir-style). Mean-vs-median discriminated by test (`s0=2.18e-4` under mean → `0` under median).
+- **Zero-drift boost floor** `kScoreFloor = 2.42e-5 rad/s (= 5 deg/h)`: the boost ratio floors both numerator and denominator at the GPS-course noise floor (spec §1.5, lower edge ~5 deg/h) so a near-zero-drift source no longer special-cases to the cap and the ranking stays continuous (matches the prototype's `weight_rule(floor_deg_h=5)`).
+- **Abstain-ON byte-identical**: added a pin proving monitor-ON in the abstain state (<120 s baseline → boosts exactly 1.0) reproduces monitor-OFF fusion bit-for-bit (closes the OFF-contract loop: flag-OFF AND abstain-ON are both neutral).
+
+### Real-data validation (KAIST, urban recipe, `split_median=true` + `heading_monitor=true`, **`rot_weight_prior` REMOVED**, 2026-06-13)
+
+The point of layer (c): replace the hand-set `rot_weight_prior=10` with auto-discovery. Final-step monitor diagnostics + local metric vs the Slice-19b baseline (which DID set `rot_weight_prior=10`):
+
+| run | FOG (src1) boost | other boosts | FOG score | local rot p50 (mon vs 19b baseline) | note |
+|---|---|---|---|---|---|
+| urban07 | **10** | src0/2 = 1 | 5.8e-5 rad/s (~12°/h) | 0.0185 vs 0.0162 rad | discovered; slightly worse (abstain latency ~346 s on a short drive) |
+| urban12 | **10** | src0/2 = 1 | 7.1e-6 rad/s (~1.5°/h) | 0.0085 vs 0.0041 rad (0.49° vs 0.23°) | discovered; ~2× worse local rot — GPS-hostile canyon start delays first scorable segment ~1300 s (abstain over half the early drive); tail 1.88 m + worst window 211 m UNCHANGED (urban12 fix holds) |
+| urban17 | **10** | src0/2 = 1 | 2.7e-5 rad/s (~5.6°/h) | 0.0055 vs 0.0055 rad | discovered; neutral — identical to baseline |
+
+**Verdict: the monitor correctly auto-discovers the heading-grade source on all three drives** (boost 10 on the FOG, 1 on the drifters; scores rank-correct, matching `tools/proto_heading_monitor.py` and the GT ranking), reproducing the manual recipe with ZERO config by end-of-drive. The absolute heading target (<10°) is met everywhere. The cost is **discovery latency**: during the early-drive abstain window the fused heading is not yet FOG-preferred, so where the heading-grade source is known a priori the from-`t=0` manual `rot_weight_prior` is strictly better (urban12 0.23°→0.49° p50, urban07 mild). urban17 neutral. **So layer (c) is the tool for when the heading-grade source is UNKNOWN (no datasheet) or degrades over time; the config prior (layer a) stays the choice when it is known.** Default OFF. Note `rel_rot` independently caps the FOG at 5 (19b) — the two layers compound (FOG rotation weight ≈ 50× at convergence).
+
+**Follow-up candidate**: warm-start the boost from `rot_weight_prior` (prior as the abstain-window default, monitor refines once scored) → would erase the latency cost while keeping auto-discovery. Logged, not built.

@@ -339,6 +339,20 @@ void ReplayHarness::write_summary(std::ostream& os) const {
                << c.extrinsic.t.z() << "] (conf " << c.translation_confidence
                << (c.translation_committed ? ",committed" : "") << ")\n";
         }
+        // Slice-19c heading-monitor diagnostics (per source, last fused step): the
+        // auto-discovered rotation-channel boost + drift score + scored flag, plus the
+        // 19b per-channel reliabilities. Boost ~ boost_max on the heading-grade source,
+        // ~1 on the drifters when the monitor has discovered the ranking.
+        os << "# heading monitor (per source, at last fused step):\n";
+        for (int i = 0; i < last->result.source_count; ++i) {
+            const SourceHealth& h = last->result.health[i];
+            os << "#   src" << static_cast<int>(h.id)
+               << " heading_boost=" << h.heading_boost
+               << " heading_score=" << h.heading_score
+               << " scored=" << (h.heading_scored ? "yes" : "no")
+               << " rel_rot=" << h.reliability_rot
+               << " rel_trans=" << h.reliability_trans << '\n';
+        }
     }
 }
 
