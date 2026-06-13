@@ -25,6 +25,9 @@ Scalar wrap_pi(Scalar a) {
 // indices by value, returns the value at the first index where the cumulative weight reaches
 // half the total. `idx` is caller-owned scratch of length >= m. Precondition: m >= 1, every
 // weight >= 0 with a positive total. Returns vals[idx[0]] for m == 1.
+// Tie behavior: termination at the FIRST index whose cumulative weight reaches `half` picks the
+// LOWER median when the half-weight mark falls exactly on a boundary (the first-half element
+// wins) -- matches the prototype's np.searchsorted(cw, 0.5*cw[-1]) and is correct for slope.
 Scalar weighted_median(const Scalar* vals, const Scalar* wts, int m, int* idx) {
     for (int k = 0; k < m; ++k) idx[k] = k;
     std::sort(idx, idx + m, [&](int a, int b) { return vals[a] < vals[b]; });
@@ -45,6 +48,22 @@ Scalar median_of(const Scalar* vals, int m, int* idx) {
     std::sort(idx, idx + m, [&](int a, int b) { return vals[a] < vals[b]; });
     const int mid = m / 2;            // upper-median for even m (matches numpy on the odd
     return vals[idx[mid]];            // n>=3 consensus path the monitor actually uses)
+}
+
+// Block MEDIAN over `m` values held in caller-owned scratch `buf` (length >= m; CLOBBERED in
+// place). Strict core: an in-place partial selection (std::nth_element -- no heap, no allocation;
+// it partitions the fixed stack array) gives O(m) WCET with no per-block sort/alloc. Matches the
+// prototype's np.median: the average of the two middle order statistics for even m, the middle
+// one for odd m. Precondition: m >= 1.
+Scalar block_median(Scalar* buf, int m) {
+    const int mid = m / 2;
+    std::nth_element(buf, buf + mid, buf + m);
+    const Scalar hi = buf[mid];
+    if (m % 2 == 1) return hi;
+    // Even m: pair the upper-middle with the max of the lower half (the lower-middle statistic).
+    Scalar lo = buf[0];
+    for (int k = 1; k < mid; ++k) if (buf[k] > lo) lo = buf[k];
+    return Scalar(0.5) * (lo + hi);
 }
 
 bool finite(Scalar x) { return std::isfinite(x); }
@@ -76,16 +95,26 @@ void HeadingMonitor::configure(int n) {
 
 void HeadingMonitor::finalize_block(Track& tr) {
     if (tr.cur_n == 0) return;
+    // Reduce the open block to its MEDIAN (t, cum) (spec 1.3 / prototype). cur_n counts every
+    // submitted sample but the buffer holds at most kBlockSamples of them (surplus dropped on
+    // submit); reduce over what we retained. block_median clobbers its scratch, so median the
+    // time buffer first (copying into scratch_med_), then the cumulative buffer in place.
+    const int m = (tr.cur_n < kBlockSamples) ? tr.cur_n : kBlockSamples;
     Block blk;
-    blk.t = tr.cur_tsum / static_cast<Scalar>(tr.cur_n);
-    blk.c = tr.cur_csum / static_cast<Scalar>(tr.cur_n);
+    for (int k = 0; k < m; ++k) scratch_med_[k] = tr.cur_ts[k];
+    blk.t = block_median(scratch_med_, m);
+    blk.c = block_median(tr.cur_cs, m);   // cur_cs is reset below, safe to clobber in place
     // Pair this block with every earlier block of the segment whose baseline >= min_base.
     for (int q = 0; q < tr.block_count; ++q) {
         const int ix = (tr.block_head + q) % kSlopeReservoir;
         const Scalar base = blk.t - tr.blocks[ix].t;
         if (base >= kMinBase) {
             const Scalar s = (blk.c - tr.blocks[ix].c) / base;
-            // Push (s, base) into the bounded slope reservoir (evict oldest when full).
+            // Push (s, base) into the bounded slope reservoir (evict oldest when full). FIFO
+            // eviction of the OLDEST short-baseline slope is safe: the baseline-weighted median
+            // (score()) down-weights small-baseline samples, so an aged-out 120-125 s slope (e.g.
+            // the dense pool a post-denial restart produces) carries little weight anyway, while
+            // the most recent long-baseline slopes -- the current drift regime -- dominate.
             if (tr.slope_count < kSlopeReservoir) {
                 const int w = (tr.slope_head + tr.slope_count) % kSlopeReservoir;
                 tr.slope_v[w] = s;
@@ -98,7 +127,10 @@ void HeadingMonitor::finalize_block(Track& tr) {
             }
         }
     }
-    // Append the new block to the segment's block ring (evict oldest when full).
+    // Append the new block to the segment's block ring (evict oldest when full). block_count is
+    // the water level: it increments until it saturates at kSlopeReservoir, after which the ring
+    // wraps and the OLDEST block is evicted FIFO (block_head advances). The pairing loop above
+    // always iterates exactly the live block_count entries, so saturation never double-counts.
     if (tr.block_count < kSlopeReservoir) {
         const int w = (tr.block_head + tr.block_count) % kSlopeReservoir;
         tr.blocks[w] = blk;
@@ -107,10 +139,8 @@ void HeadingMonitor::finalize_block(Track& tr) {
         tr.blocks[tr.block_head] = blk;
         tr.block_head = (tr.block_head + 1) % kSlopeReservoir;
     }
-    tr.cur_t0   = Scalar(0);
-    tr.cur_tsum = Scalar(0);
-    tr.cur_csum = Scalar(0);
-    tr.cur_n    = 0;
+    tr.cur_t0 = Scalar(0);
+    tr.cur_n  = 0;
 }
 
 void HeadingMonitor::segment_break() {
@@ -139,8 +169,12 @@ void HeadingMonitor::push_pair(Scalar t_pair, Scalar dt_pair, const Scalar* r) {
         // Block bookkeeping: a new sample closes the open block once it spans block_s.
         if (tr.cur_n > 0 && (t_pair - tr.cur_t0) >= kBlockS) finalize_block(tr);
         if (tr.cur_n == 0) tr.cur_t0 = t_pair;
-        tr.cur_tsum += t_pair;
-        tr.cur_csum += tr.cum;
+        // Buffer the (t, cum) sample for the per-block MEDIAN; keep the first kBlockSamples and
+        // drop any surplus (reservoir stance -- the median of the retained head stays robust).
+        if (tr.cur_n < kBlockSamples) {
+            tr.cur_ts[tr.cur_n] = t_pair;
+            tr.cur_cs[tr.cur_n] = tr.cum;
+        }
         ++tr.cur_n;
     }
     ++pairs_;
@@ -172,6 +206,10 @@ void HeadingMonitor::submit_fix(Scalar t_s, const Vec3& pos,
     const Scalar v_gps = std::hypot(dE, dN) / std::max(dt, Scalar(1e-9));
     if (ok) ok = (v_gps >= kVMin) && (v_gps <= kVMax);
     // Per-source forward + yaw increments over the fix interval -> consensus v_odo / yaw rate.
+    // These are unsigned magnitudes feeding two SEPARATE gates: the cross-val gate (below)
+    // compares GPS speed v_gps vs the odometry SPEED v_odo (|magnitude| difference, kills
+    // multipath jumps); the forward-only gate is separate -- it tests the SIGN of the median
+    // forward increment dx_med (a reverse flips the GPS course 180 deg).
     Scalar v_odo = Scalar(0), yaw_rate = Scalar(0), dx_med = Scalar(0);
     if (ok) {
         for (int i = 0; i < n_; ++i) {
@@ -257,13 +295,18 @@ Scalar HeadingMonitor::boost(int i, Scalar boost_max) const {
     for (int j = 0; j < n_; ++j) {
         if (!scored(j)) continue;
         ++sc;
-        const Scalar s = score(j);
+        // Floor each score at kScoreFloor (the GPS-course noise floor): sources at or below it
+        // are mutually indistinguishable, so they all rank equal and the ratio stays continuous
+        // (no zero-drift discontinuity). Floor BEFORE taking the min so `best` is also floored.
+        const Scalar s = std::max(score(j), kScoreFloor);
         if (!have_best || s < best) { best = s; have_best = true; }
     }
     if (sc < 2 || !scored(i)) return Scalar(1);                        // abstain / unscored
-    const Scalar s_i = score(i);
-    if (!(s_i > Scalar(0))) return cap;                               // zero-drift -> full cap
-    const Scalar b = cap * (best / s_i);
+    // Floor the denominator too: an exactly-zero (or sub-floor) drift no longer jumps to the
+    // full cap -- it floors to kScoreFloor like every other below-resolvability source, so the
+    // boost is continuous (boost = clip(cap * best / max(score_i, floor), 1, cap)).
+    const Scalar s_i = std::max(score(i), kScoreFloor);
+    const Scalar b   = cap * (best / s_i);
     return std::min(cap, std::max(Scalar(1), b));
 }
 

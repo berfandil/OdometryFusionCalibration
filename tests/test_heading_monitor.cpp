@@ -273,6 +273,11 @@ TEST_CASE("19c item 1: headline — drifter demoted, clean boosted, fused headin
     CHECK(on.boost[0] == doctest::Approx(10.0));
     CHECK(on.boost[1] == doctest::Approx(10.0));
     CHECK(on.boost[2] == doctest::Approx(1.0));
+    // What actually moves fusion is the RATIO of the clean boost to the drifter's (not the cap
+    // value itself): pin the ranking robustly so this survives a boost_max retune. A clean source
+    // outweighs the drifter in the rotation channel by ~the full cap.
+    CHECK(on.boost[0] / on.boost[2] > 5.0);
+    CHECK(on.boost[1] / on.boost[2] > 5.0);
 
     // Monitor OFF: every boost is exactly neutral (no scoring is even surfaced).
     CHECK(off.boost[0] == Scalar(1));
@@ -374,6 +379,11 @@ TEST_CASE("19c item 3: telescoping — a bridged turn still catches the turn-cor
     REQUIRE(r.mon.scored(0));
     // The turn-correlated drifter (caught only because the pairs bridged the gated turns) scores
     // far worse than the clean sources.
+    // NOTE: this injects slip on BOTH the turn-in and the turn-out (two-sided), which is the
+    // CONSERVATIVE case -- two opposing slips partially cancel in the bridged residual yet the
+    // drifter is still caught. A one-sided slip (inject on turn-in only, none on turn-out) would
+    // be a STRONGER check: the residual would not cancel at all, so the drifter would be even
+    // easier to flag. Two-sided suffices to pin the telescoping behavior.
     CHECK(r.mon.score(2) > 5.0 * r.mon.score(0));
     CHECK(r.mon.boost(2, 10.0) == doctest::Approx(1.0));
     CHECK(r.mon.boost(0, 10.0) > 1.5);
@@ -608,4 +618,114 @@ TEST_CASE("19c item 9: boost is rotation-weight-only — translation/cov path un
     CHECK(on.rr2 == off.rr2);
     CHECK(on.rt2 == off.rt2);
     CHECK(on.tz  == off.tz);
+}
+
+// ===========================================================================
+// REVIEW FIX (CRITICAL 1) -- BLOCK MEDIAN ROBUSTNESS. The 60-s block reduction is the MEDIAN of
+// the block's (t, cum) samples (spec 1.3 / prototype), not the mean. A single bad pair inside an
+// otherwise-clean block (a multipath spike / wheel-slip step that fits in 60 s) must NOT skew the
+// block-reduced cumulative residual -- the median outvotes it; a mean would be pulled toward it.
+// ===========================================================================
+TEST_CASE("19c review: block reduction is MEDIAN -- an in-block outlier cluster does not skew it") {
+    // Isolate the BLOCK reduction from the slope-pool median. Drive exactly enough fixes for THREE
+    // 60-s blocks (b0,b1,b2): only the (b0,b2) pair clears the 120-s min baseline, so the slope
+    // pool holds a SINGLE slope and the score equals |that one slope|. There is no pool of clean
+    // slopes to outvote a corrupted one, so the ONLY robustness left is the per-block reduction.
+    // We corrupt block b2 for a MINORITY (20 of ~60) of its samples: the block MEDIAN ignores the
+    // cluster (score stays 0), while a block MEAN would shift b2's reduced cum by 4.5 deg*20/60 =
+    // 1.5 deg and the lone slope would jump to ~2.2e-4 rad/s. This test PASSES under the median
+    // and FAILS under a mean reduction (verified by temporarily swapping the reduction).
+    const Scalar bump = Scalar(4.5) * kPi / Scalar(180.0);   // 4.5 deg, just inside the 5 deg clamp
+
+    MonRig clean;
+    clean.straight(185);                 // ~185 s -> exactly 3 blocks -> one (b0,b2) slope
+    REQUIRE(clean.mon.scored(0));
+    const Scalar s0_clean = clean.mon.score(0);   // a perfectly clean stream scores exactly 0
+
+    MonRig spiked;
+    spiked.straight(150);                // fill b0,b1 and most of b2
+    spiked.yaw[0] += bump;               // source 0: hold a +4.5 deg offset over a 20-pair cluster
+    spiked.straight(20);                 //   (a minority of block b2's ~60 samples)
+    spiked.yaw[0] -= bump;               // remove the offset (cum returns to the clean staircase)
+    spiked.straight(15);                 // close b2 at the same total length
+    REQUIRE(spiked.mon.scored(0));
+    const Scalar s0_spiked = spiked.mon.score(0);
+
+    // MEDIAN robustness: the minority cluster is outvoted inside block b2, so the lone slope is
+    // intact and source 0's score is unchanged from the clean run (both ~0 to estimator epsilon).
+    CHECK(s0_spiked == doctest::Approx(s0_clean));
+
+    // Discriminator vs the MEAN: a mean reduction would shift b2's reduced cum by ~1.5 deg, making
+    // the lone (b0,b2) slope ~0.026 rad / 120 s ~ 2.2e-4 rad/s. Pin the result FAR below that -- a
+    // mean reduction cannot pass this bound, a median reduction passes it trivially.
+    CHECK(std::abs(s0_spiked - s0_clean) < Scalar(1e-5));   // mean would give ~2.2e-4 here
+}
+
+// ===========================================================================
+// REVIEW FIX (CRITICAL 2) -- ZERO-DRIFT BOOST CONTINUITY. A source with EXACTLY zero (or sub-
+// floor) drift must NOT jump to the full cap while a tiny-drift source gets less -- that breaks
+// the ranking ratio. The score is floored at kScoreFloor (the GPS-course noise floor), so all
+// below-resolvability sources rank equal and the boost is continuous.
+// ===========================================================================
+TEST_CASE("19c review: zero-drift boost is continuous (floored, not special-cased to the cap)") {
+    using namespace heading_monitor_const;
+    // All three sources perfectly clean (zero planted drift): every score is at/below the floor,
+    // so every source floors to the SAME value -> equal ranking -> all boosted to the cap. The
+    // old code returned `cap` for an exactly-zero score and a proportional value for a tiny one,
+    // an unbounded discontinuity; the floor makes them coincide.
+    MonRig r;
+    r.straight(kScoreFixes);
+    REQUIRE(r.mon.scored_count() == 3);
+    // Sub-floor scores -> all three boosts equal (continuous, no zero-drift jump).
+    const Scalar b0 = r.mon.boost(0, 10.0);
+    const Scalar b1 = r.mon.boost(1, 10.0);
+    const Scalar b2 = r.mon.boost(2, 10.0);
+    CHECK(b0 == doctest::Approx(b1));
+    CHECK(b1 == doctest::Approx(b2));
+    CHECK(b0 == doctest::Approx(10.0));     // all at/below the floor -> all at the cap, none higher
+
+    // Continuity check: two sub-floor scores never differ by more than the cap in their boost
+    // (the floor clamps both numerator and denominator), so no source can be infinitely demoted
+    // by another's near-zero score. The clean-clean ratio is exactly 1 (not cap/epsilon).
+    CHECK(b0 / b1 == doctest::Approx(1.0));
+}
+
+// ===========================================================================
+// REVIEW FIX (HIGH-RISK 3) -- ABSTAIN-ON BYTE-IDENTICAL. The OFF contract has TWO halves: the
+// OFF flag is neutral (item 7), AND monitor-ON-but-ABSTAINING (< 120 s / < 2 scored, boosts
+// exactly 1.0) reproduces the monitor-OFF fusion BYTE-IDENTICALLY. A short run (60 s) cannot
+// form a slope baseline, so monitor-ON abstains; its frontier pose/cov/weights must bit-match
+// the monitor-OFF run, and every boost must be exactly 1.0.
+// ===========================================================================
+TEST_CASE("19c review: abstain-ON is byte-identical to OFF (boosts exactly 1.0)") {
+    // 60 s is below the 120 s slope baseline -> the ON monitor scores nothing -> it abstains
+    // (every boost 1.0), so ON and OFF must produce bit-identical fusion. (Mirrors the item-7
+    // pin's literal-capture style, but pins ON==OFF directly rather than against HEAD literals.)
+    const EstRun on  = run_split_gps_rig(true,  60.0, 0.005);
+    const EstRun off = run_split_gps_rig(false, 60.0, 0.005);
+
+    // Abstain state: nothing scored, every boost EXACTLY 1.0 (not Approx -- full precision).
+    for (int i = 0; i < 3; ++i) {
+        CHECK_FALSE(on.scored[i]);
+        CHECK(on.boost[i] == Scalar(1));
+    }
+
+    // Frontier pose: bit-identical to the OFF run.
+    CHECK(on.tx  == off.tx);
+    CHECK(on.ty  == off.ty);
+    CHECK(on.tz  == off.tz);
+    CHECK(on.r01 == off.r01);
+    CHECK(on.r12 == off.r12);
+    // Frontier covariance: bit-identical.
+    CHECK(on.c0  == off.c0);
+    CHECK(on.c7  == off.c7);
+    // Published weights (rotation boost composes into these) + per-channel reliabilities: bit-
+    // identical (boost = 1.0 leaves w_rot = clamp(w_base*rel)*prior*1.0 unchanged).
+    CHECK(on.w0  == off.w0);
+    CHECK(on.w1  == off.w1);
+    CHECK(on.w2  == off.w2);
+    CHECK(on.rr2 == off.rr2);
+    CHECK(on.rt2 == off.rt2);
+    // Correction bookkeeping: the same number of fixes applied (the monitor never gates fusion).
+    CHECK(on.corr_applied_total == off.corr_applied_total);
 }

@@ -55,6 +55,13 @@ constexpr int    kMaxSources = 32;                 // matches Result arrays / Co
 // aged out rather than pinned forever. 256 covers a multi-hour drive's contiguous segment at
 // the 60-s block cadence with margin (the prototype's longest KAIST segment pooled < 200).
 constexpr int    kSlopeReservoir = 256;
+// Per-block sample cap for the block MEDIAN reduction (1.3). A 60-s block at the nominal 1-Hz
+// GPS-fix cadence holds ~60 anchor-pair samples; at the gate's minimum fix spacing (kDtMin =
+// 0.05 s) a pathological burst could submit up to ~1200. We bound the per-block buffer at this
+// depth (strict core: a fixed Scalar[K], no heap) and, if a block somehow exceeds it, DROP the
+// surplus samples with no error (reservoir stance, like the slope pool) -- the median of the
+// retained head is still robust. 256 covers >4 Hz of valid pairs across a full 60-s block.
+constexpr int    kBlockSamples = 256;
 
 constexpr Scalar kDtMin    = Scalar(0.05);         // fix spacing > 0.05 s
 constexpr Scalar kDtMax    = Scalar(3.0);          // fix spacing <= 3 s
@@ -67,6 +74,17 @@ constexpr Scalar kPairGap  = Scalar(60.0);         // anchor-pair + segment-clos
 constexpr Scalar kEvent    = Scalar(0.08726646259971647);  // 5 deg, rate/event clamp split
 constexpr Scalar kBlockS   = Scalar(60.0);         // block length (s)
 constexpr Scalar kMinBase  = Scalar(120.0);        // min slope baseline (s)
+// Score floor for the boost ratio (rad/s). The boost is a RANKING -- boost_i = clip(boost_max *
+// min_j score_j / score_i, 1, boost_max) -- so it must stay continuous as a score approaches
+// zero: an exactly-zero-drift source would otherwise win the full cap while a 1e-9 rad/s source
+// gets proportionally less, an unbounded discontinuity that chatters on noiseless simulators /
+// future multi-FOG rigs. Clamping BOTH the numerator (best) and denominator (score_i) to this
+// floor makes the ratio well-behaved (any source at or below the floor is mutually
+// indistinguishable -> floors to the same value -> equal boost). Value = the LOWER edge of the
+// GPS-course noise floor the spec 1.5 documents (~5-15 deg/h): 5 deg/h = 2.4241e-5 rad/s. This
+// is the most conservative choice (it floors only sources genuinely below GPS resolvability) and
+// matches the prototype's weight_rule(floor_deg_h=5.0).
+constexpr Scalar kScoreFloor = Scalar(2.42406840554768e-05);  // 5 deg/h in rad/s
 }  // namespace heading_monitor_const
 
 // Online per-source GPS-course heading-drift monitor. One instance owned by the estimator
@@ -127,14 +145,17 @@ private:
     struct Track {
         // Cumulative rate-channel residual (the staircase whose SLOPE is the drift rate).
         Scalar cum = 0;
-        // Open block accumulator: running sums for the median-free block reduction. The
-        // prototype takes the per-block MEDIAN of (t, cum); for the strict core we use the
-        // block MEAN (sums / count) — the block is a short (block_s) near-linear run of the
-        // staircase, so mean and median coincide to estimator tolerance, and the mean needs no
-        // per-block heap/sort. cur_t0 marks the open block's first sample time.
+        // Open block accumulator: a fixed-capacity buffer of the block's (t, cum) samples. The
+        // block reduction takes the per-block MEDIAN of (t, cum) (matching the prototype and
+        // spec 1.3) via a bounded in-place selection -- NOT the mean. A short (block_s) run of
+        // the staircase is NOT guaranteed outlier-free (a multipath spike / wheel-slip step can
+        // land inside one block); the median is robust to a single bad pair where the mean would
+        // be skewed. cur_t0 marks the open block's first sample time. cur_n counts SUBMITTED
+        // samples (so the block-span test is independent of the buffer cap); the buffer holds the
+        // first min(cur_n, kBlockSamples) of them (surplus dropped, reservoir stance).
         Scalar cur_t0   = 0;
-        Scalar cur_tsum = 0;
-        Scalar cur_csum = 0;
+        Scalar cur_ts[heading_monitor_const::kBlockSamples];  // block sample times
+        Scalar cur_cs[heading_monitor_const::kBlockSamples];  // block sample cumulatives
         int    cur_n    = 0;
         // Finalized blocks of the current segment (bounded; pairwise-slope source).
         Block  blocks[heading_monitor_const::kSlopeReservoir];
@@ -178,6 +199,10 @@ private:
     // heap; sized at the cap). Reused sequentially.
     mutable Scalar scratch_a_[kMaxSources];
     mutable Scalar scratch_b_[kMaxSources];
+    // Scratch for the per-block time-median (block_median clobbers its input; the cum buffer is
+    // medianed in place but the time buffer must survive, so it is copied here first). Sized at
+    // the per-block sample cap; used only from finalize_block (non-const), so not mutable.
+    Scalar scratch_med_[heading_monitor_const::kBlockSamples];
 };
 
 }  // namespace ofc
