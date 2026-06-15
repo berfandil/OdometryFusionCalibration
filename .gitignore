@@ -33,3 +33,7 @@ compile_commands.json
 /kaist_run/
 /euroc_run/
 /nuscenes_run/
+/radar_scan_run/
+
+# Python tooling bytecode cache
+__pycache__/
