@@ -478,6 +478,14 @@ constexpr Scalar kVoteRidgeRel = Scalar(1e-3);
 // near-null reads ~1.0e-3–1.3e-3 on the involved axes — 1e-2 sits between the regimes
 // with ≳6× margin on both sides.
 constexpr Scalar kJointMarginMin = Scalar(1e-2);
+// Slice 20: for a translation_only source, translation_confidence is the MIN over the
+// OBSERVED lever axes only — an axis whose histogram never reached this fraction of the
+// most-voted axis's mass (e.g. z under yaw-only planar driving: empty, held at prior) is
+// EXCLUDED from the min, so a structurally-unobservable axis can't pin the joint lever
+// confidence at 0 and block a clean lateral/along-track commit. NON-flagged sources keep
+// the strict min-over-all-3 (byte-identical). 0.1 = an axis with <10% of the max axis's
+// vote mass is "not observed" (robust to occasional obs-gate flicker on the null axis).
+constexpr Scalar kAxisObservedFrac = Scalar(0.1);
 // rot3d two-axis observability floor (Slice 17): the Wahba solve is votable only when the
 // MIDDLE eigenvalue of the axis Gram BBw clears this fraction of the largest (two distinct
 // rotation axes excited; Kabsch needs only two correspondences — gate λ_mid, NOT λ_min).
@@ -1312,6 +1320,24 @@ Scalar Phase2Calibrator::translation_confidence(SourceId id) const {
     const Scalar cx = xyz_[3 * s + 0].confidence();
     const Scalar cy = xyz_[3 * s + 1].confidence();
     const Scalar cz = xyz_[3 * s + 2].confidence();
+    if (trans_only_[s]) {
+        // Slice 20: min over OBSERVED axes only (an unobservable planar-null axis is empty
+        // and must not pin the min at 0 — see kAxisObservedFrac). The lever then commits on
+        // its observable axes with the null axis held at the prior.
+        const Scalar m0 = xyz_[3 * s + 0].total();
+        const Scalar m1 = xyz_[3 * s + 1].total();
+        const Scalar m2 = xyz_[3 * s + 2].total();
+        const Scalar mmax = std::max(m0, std::max(m1, m2));
+        if (!(mmax > Scalar(0))) return Scalar(0);     // no votes anywhere
+        const Scalar floor = kAxisObservedFrac * mmax;
+        const Scalar c[3] = {cx, cy, cz};
+        const Scalar m[3] = {m0, m1, m2};
+        Scalar out = Scalar(-1);
+        for (int k = 0; k < 3; ++k) {
+            if (m[k] >= floor) out = (out < Scalar(0)) ? c[k] : std::min(out, c[k]);
+        }
+        return (out < Scalar(0)) ? Scalar(0) : out;
+    }
     return std::min(cx, std::min(cy, cz));
 }
 

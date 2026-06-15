@@ -329,11 +329,14 @@ TEST_CASE("trans-only along-track: concentration gate already withholds the nois
         REQUIRE(cal.set_prior(1, X, true, true) == Status::Ok);
         feed_trans_only(cal, 1, X, t_X, 400, /*multiaxis=*/false);
         // x,y recover; z is the planar null (withheld by the conditioning info gate, so it
-        // falls back to the prior = truth here). The OBSERVABLE axes' joint confidence is
-        // high -> the lever commits cleanly when the data is clean.
+        // falls back to the prior = truth here). Slice-20 min-over-OBSERVED translation
+        // confidence EXCLUDES the empty z, so the OBSERVABLE axes' clean concentration is
+        // reported -> the planar lever COMMITS (the strict min-over-3 would have been pinned
+        // at 0 by the empty z and never committed -- the fix's whole point).
         CHECK(std::abs(cal.lever_arm(1).x() - t_X.x()) < Scalar(2e-3));
         CHECK(std::abs(cal.lever_arm(1).y() - t_X.y()) < Scalar(2e-3));
         INFO("clean trans_conf = " << cal.translation_confidence(1));
+        CHECK(cal.translation_confidence(1) >= cfg.commit_concentration);
     }
 
     // NOISY along-track: heavy SENSOR-frame drift on the along-track (sensor x) axis (the
@@ -353,15 +356,15 @@ TEST_CASE("trans-only along-track: concentration gate already withholds the nois
         const Scalar tconf = cal.translation_confidence(1);
         INFO("noisy along-track x err = " << ex << " m ; lateral y err = " << ey
              << " m ; trans_conf = " << tconf);
-        // THE FINDING (drives the guard decision, reported back): the noisy along-track
-        // scatter destroys the per-channel concentration, so the MIN-over-channels
-        // translation_confidence collapses to ~0 — FAR below the commit_concentration gate
-        // (0.6). The estimator's lever commit gate keys on EXACTLY this confidence, so the
-        // wrong along-track value is WITHHELD by the existing concentration gate. No new
-        // residual gate is needed (SLICE20 along-track guard path (b): concentration
-        // already withholds; path (c) residual gate SKIPPED — simpler is better).
+        // THE FINDING (Slice-20 min-over-OBSERVED, the HONEST version): the noisy along-track
+        // x IS an observed axis (well-conditioned, gets votes) but its scatter destroys its
+        // per-channel concentration cx. min-over-OBSERVED = min(cx, cy) is therefore dragged
+        // down by the noisy cx (NOT by the empty z — z is now correctly excluded), so the
+        // JOINT translation_confidence collapses below the commit gate and the lever is
+        // WITHHELD. (Confirms: a noisy-but-OBSERVED along-track axis still blocks the joint
+        // commit -> committing only the clean lateral axis would need PER-AXIS commit, a
+        // separate change; the min-over-observed fix only unpins the empty unobservable axis.)
         CHECK(tconf < cfg.commit_concentration);
-        CHECK(tconf < Scalar(0.1));   // concentration collapses under the drift
     }
 }
 
