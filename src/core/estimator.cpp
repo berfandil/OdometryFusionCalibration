@@ -268,6 +268,11 @@ std::uint64_t config_hash(const Config& cfg) {
             w.put_bool(sc.scale_calib);
             w.put_bool(sc.bias_states);
             w.put_bool(sc.is_reference);
+            // Slice 20: the translation_only flag changes WHICH estimator drives the rotation
+            // extrinsic (pinned-to-prior vs recovered yaw/pitch ∘ roll / rot3d) and whether
+            // the lever row's R_X is the clean prior -> calibration-shaping, hashed. A flip
+            // rejects a cross-flag restore (pre-20 blobs cold-start by design).
+            w.put_bool(sc.translation_only);
         }
     }
     // On the (astronomically unlikely) scratch overflow, fold the overflow flag into the hash
@@ -442,6 +447,13 @@ struct Estimator::Impl {
     // by calib2.rot3d() (SUPERSEDING the yaw/pitch ∘ roll composition — rot3d only ever
     // commits under multi-axis excitation where the full 3-DOF solve strictly dominates).
     bool     rot3d_committed[kMaxSourcesCap] = {};   // full rotation (axis hand-eye)
+    // Translation-only source (Slice 20): a velocity-only / heading-blind source whose
+    // rotation extrinsic is TRUSTED at the prior. Per registered slot, mirrors
+    // SensorConfig::translation_only. When set, apply_calib_feedback() never commits the
+    // rotation DOFs (ext/roll/rot3d stay false — the rotation extrinsic never moves off the
+    // prior, the footgun this flag removes) while the lever + scale DOFs commit as usual.
+    // Default false (byte-identical).
+    bool     trans_only[kMaxSourcesCap] = {};
 
     // Scratch for the per-step fuse (no heap in step()).
     SE3    aligned[kMaxSourcesCap];
@@ -684,6 +696,13 @@ struct Estimator::Impl {
         if (cfg.cold_start == ColdStart::MedianFromStart) return true;
         const SourceId id = sources[i]->id();
         if (id == cfg.reference_sensor_id) return true;
+        // A translation_only source (Slice 20) NEVER commits a rotation (its rotation
+        // extrinsic is TRUSTED at the prior, not recovered) — so ext/rot3d_committed are
+        // both pinned false. Without this carve-out ReferenceOnly cold-start would keep it
+        // out of the median forever. Its rotation IS trustworthy by declaration (the prior),
+        // so it joins once its LEVER has committed (the translation DOF it actually
+        // recovers). Pinned false default-off, so this is inert for non-translation_only.
+        if (trans_only[i]) return lever_committed[i];
         // ReferenceOnly: join once the rotation extrinsic is committed (either path).
         return ext_committed[i] || rot3d_committed[i];
     }
@@ -735,15 +754,24 @@ struct Estimator::Impl {
             // that must be RE-TUNED per vote_weight; it is a literal vote COUNT only when
             // vote_weight == One (which the feedback tests force — set_hists()). See config.hpp.
 
+            // TRANSLATION-ONLY source (Slice 20): its rotation extrinsic is TRUSTED at the
+            // prior, never recovered — so the ROTATION DOFs (yaw/pitch, roll, rot3d) must
+            // NEVER commit (they would commit a confidently-WRONG rotation from the source's
+            // absent/noise heading — the footgun). The calibrators already skip those votes
+            // for this source (so the gates would read conf 0 anyway), but we force the flags
+            // false here too, belt-and-suspenders, so the rotation extrinsic provably stays =
+            // prior. The LEVER + SCALE DOFs below commit exactly as for any other source.
+            const bool tonly = trans_only[i];
+
             // --- yaw/pitch (so(3) direction) -----------------------------------------
             const bool was_ext = ext_committed[i];
-            ext_committed[i] = commit_gate_reanchor(
+            ext_committed[i] = !tonly && commit_gate_reanchor(
                 was_ext, calib1.extrinsic_confidence(id), calib1.vote_count(id),
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
 
             // --- roll ----------------------------------------------------------------
             const bool was_roll = roll_committed[i];
-            roll_committed[i] = commit_gate_reanchor(
+            roll_committed[i] = !tonly && commit_gate_reanchor(
                 was_roll, calib2.extrinsic_confidence(id), calib2.roll_vote_count(id),
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
 
@@ -765,12 +793,12 @@ struct Estimator::Impl {
             // off — the byte-identical default. On planar (yaw-only) motion the BBw rank
             // gate keeps the channels empty, so this can never commit there.
             const bool was_rot3d = rot3d_committed[i];
-            if (cfg.rot3d_enabled) {
+            if (cfg.rot3d_enabled && !tonly) {
                 rot3d_committed[i] = commit_gate_reanchor(
                     was_rot3d, calib2.rot3d_confidence(id), calib2.rot3d_vote_count(id),
                     cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
             } else {
-                rot3d_committed[i] = false;
+                rot3d_committed[i] = false;   // Slice 20: pinned false for translation_only
             }
 
             // --- scale2: turn-regime joint scale (Slice 17b, opt-in) ------------------
@@ -973,6 +1001,7 @@ Status Estimator::init(const Config& cfg) {
         impl_->scale_committed[i]   = false;
         impl_->rot3d_committed[i]   = false;
         impl_->scale2_committed[i]  = false;
+        impl_->trans_only[i]        = false;   // Slice 20: set per-slot in add_source
         impl_->med_slot[i]          = -1;
         impl_->slot_mb[i]           = -1;   // Slice 18: no bias index bound to this slot yet
         // Variance-EMA reliability reset (Slice 9, D17): clean EMA state + neutral
@@ -1109,6 +1138,10 @@ Status Estimator::add_source(const ISource* src) {
     // calibrators iff its SensorConfig::per_sensor_kf is set (else its raw delayed B_corr
     // is used on the deeper path; off entirely if no source enables it).
     impl_->smooth_source[slot] = (sc != nullptr) ? sc->per_sensor_kf : false;
+    // Per-source translation-only gate (Slice 20): this slot's rotation extrinsic is trusted
+    // at the prior (the calibrators pin R_X = prior + skip yaw/pitch/roll/rot3d voting for
+    // it; the feedback loop never commits its rotation DOFs). Default false = byte-identical.
+    impl_->trans_only[slot] = (sc != nullptr) ? sc->translation_only : false;
     // Per-source bias states. Option A (Slice 11b, multi_bias_enabled OFF): record the single
     // bias source's slot + process-noise rate — validate() guarantees at most one, so the
     // first match is THE bias source; the augmented filter is enabled lazily in step() only
@@ -1141,15 +1174,19 @@ Status Estimator::add_source(const ISource* src) {
                                             ? sc->bias_process_noise[0] : Scalar(0);
         }
     }
-    // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib.
+    // Bind the Phase-1 calibrator's per-source prior (histogram basepoint) + scale_calib +
+    // translation_only (Slice 20: a velocity-only source skips its direction/roll/rot3d
+    // votes and pins R_X = prior in the lever row; keeps scale + lever).
     {
         const SE3  Xp = (sc != nullptr) ? sc->prior_extrinsic : SE3{};
         const bool sccal = (sc != nullptr) ? sc->scale_calib : true;
-        impl_->calib1.set_prior(src->id(), Xp, sccal);
+        const bool tonly = (sc != nullptr) ? sc->translation_only : false;
+        impl_->calib1.set_prior(src->id(), Xp, sccal, tonly);
         // Phase-2 prior (pinned-ref gauge + translation fallback). yaw/pitch is fed each
         // step from the live Phase-1 estimate; roll/t start from the prior. scale_calib
-        // gates the joint-scale (scale2) channel identically to Phase-1 (Slice 17b).
-        impl_->calib2.set_prior(src->id(), Xp, sccal);
+        // gates the joint-scale (scale2) channel identically to Phase-1 (Slice 17b);
+        // translation_only pins R_X = prior in the lever row (Slice 20).
+        impl_->calib2.set_prior(src->id(), Xp, sccal, tonly);
     }
     ++impl_->source_count;
     // Heading-monitor (Slice 19c): track the live registered count so it ranks exactly the
@@ -2471,6 +2508,18 @@ Status validate(const Config& cfg) {
             // Slice 19: the rotation-channel weight prior must be >= 0 (0 = "never trust
             // this source's rotation" is legitimate; negative would flip the median pull).
             if (cfg.sensors[i].rot_weight_prior < 0.0) return Status::OutOfRange;
+            // Slice 20: a translation_only source's rotation extrinsic is TRUSTED (pinned to
+            // the prior), not recovered — so the prior's rotation must be a valid SO(3)
+            // (RᵀR ≈ I, det > 0). A garbage prior rotation would silently corrupt every lever
+            // row (R_X = prior is load-bearing — a +20° wrong R_X gives metre-scale lever
+            // error per the prototype). Reject at init, not silently mis-calibrate. (Same
+            // orthonormality test the restore path uses; see deserialize.)
+            if (cfg.sensors[i].translation_only) {
+                const Mat3& Rp = cfg.sensors[i].prior_extrinsic.R;
+                const Scalar off = (Rp.transpose() * Rp - Mat3::Identity()).norm();
+                if (!(off < Scalar(1e-6)) || !(Rp.determinant() > Scalar(0)))
+                    return Status::InvalidConfig;
+            }
             if (cfg.sensors[i].bias_states) ++bias_sources;
             // Per-DOF since B2: each rate must be >= 0.
             for (int d = 0; d < 6; ++d) {

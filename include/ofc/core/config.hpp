@@ -108,6 +108,23 @@ struct SensorConfig {
     // uniform (slow constant-bias assumption).
     BiasProcessNoise bias_process_noise = BiasProcessNoise(Scalar(1e-4));
     bool     is_reference    = false;   // gauge anchor
+    // TRANSLATION-ONLY source (Slice 20, D30). A sensor that measures its own VELOCITY but
+    // not its rotation (Doppler radar, optical-flow): its per-step rotation increment is
+    // uninformative (R_B ~ I, heading-blind). When true, the calibrator takes this source's
+    // rotation extrinsic AS GIVEN (the prior) instead of trying to RECOVER it — it PINS R_X
+    // to prior_extrinsic.R and runs the existing hand-eye LEVER LS with that clean R_X
+    // (recovering the observable lever axes + scale), and skips Phase-1 yaw/pitch voting,
+    // rot3d accumulation/vote, and the per-window roll recovery FOR THIS SOURCE. The rotation
+    // extrinsic NEVER commits off the prior (extrinsic_committed stays false — honestly:
+    // trusted, not recovered). This removes the garbage-rotation-commit FOOTGUN: today a
+    // heading-blind source fits yaw/pitch from absent/noise rotation and commits a confidently
+    // WRONG rotation (the nuScenes front radar committed rx=-0.984 rad at conf 0.95). SCALE
+    // calibration is KEPT (the straight-regime magnitude ratio is valid for a velocity source).
+    // validate(): a translation_only source must still have a valid (orthonormal-rotation)
+    // prior_extrinsic — its rotation is trusted, not recovered. Default false = byte-identical
+    // (all new code behind `if (translation_only)`). Joins the persistence config-hash (a flip
+    // rejects stale restores; pre-20 blobs cold-start). Hashed.
+    bool     translation_only = false;
 };
 
 struct Config {

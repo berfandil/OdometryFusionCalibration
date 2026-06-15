@@ -90,10 +90,16 @@ public:
 
     // Register the per-source PRIOR extrinsic (sensor->base) — the histogram basepoint
     // and the rotation the recovered correction is applied on top of. Also captures
-    // whether the source calibrates scale (scale_calib). Call once per source after
-    // configure(), before observe(). A source never registered uses identity / scale_calib
-    // = true defaults. Returns OutOfRange if id is out of range, CapacityExceeded at cap.
-    Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true);
+    // whether the source calibrates scale (scale_calib) and whether it is TRANSLATION-ONLY
+    // (Slice 20; a velocity-only / heading-blind source). A translation_only source's
+    // direction (so(3) yaw/pitch) votes are SKIPPED — its rotation extrinsic is trusted at
+    // the prior, not recovered — while its SCALE votes are kept (the straight-regime
+    // magnitude ratio is still valid). Call once per source after configure(), before
+    // observe(). A source never registered uses identity / scale_calib = true /
+    // translation_only = false defaults. Returns OutOfRange if id is out of range,
+    // CapacityExceeded at cap.
+    Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true,
+                     bool translation_only = false);
 
     // --- Re-anchor API (Slice 8 feedback loop) -------------------------------
     // RE-ANCHOR the so(3) basepoint to a NEW committed extrinsic (sensor->base). The
@@ -216,6 +222,19 @@ private:
     // Always strictly positive (add() ignores non-positive weights).
     Scalar vote_weight_factor(Scalar omega_norm, Scalar confidence) const;
 
+    // The direction (yaw/pitch so(3)) vote for one source — the reverse-fold, the
+    // π-singularity guard, the candidate rotation log + range-guarded 3-channel deposit
+    // (Slice 20 factored this out of observe() so a translation_only source can skip ONLY
+    // the direction half while still voting scale; the body is byte-identical to the
+    // pre-20 inline). `bt`/`bn` = the source's reported translation + its (>0) norm;
+    // `consensus_sign` the fused forward/reverse sign; `w` the per-source vote weight.
+    // RETURNS false when a DIRECTION GUARD (degenerate fold / the π-singularity) DROPS the
+    // whole sample — the caller then skips the scale vote too, mirroring the pre-20 inline
+    // `continue` (a guard-dropped sample voted NOTHING, not even scale). Returns true when
+    // the sample fell through to the scale vote (so(3) deposited or counted as a range-skip).
+    bool phase1_direction_vote(int slot, const Vec3& bt, Scalar bn,
+                               Scalar consensus_sign, Scalar w);
+
     // Active configuration (configure() is the sole initializer; readers short-circuit on
     // !configured_).
     bool     configured_       = false;
@@ -236,6 +255,10 @@ private:
     Histogram1D scale_[kMaxSources];
     SE3         prior_[kMaxSources];
     bool        scale_calib_[kMaxSources] = {};
+    // Translation-only source (Slice 20): its direction (yaw/pitch so(3)) votes are skipped
+    // — the rotation extrinsic is trusted at the prior, not recovered — while scale votes
+    // are kept. Default false (byte-identical).
+    bool        trans_only_[kMaxSources] = {};
     // Range-guard-withheld so(3) vote count (cumulative diagnostics; Slice 18 review/B1).
     Scalar      so3_skipped_[kMaxSources] = {};
     SourceId    ids_[kMaxSources] = {};
@@ -378,9 +401,15 @@ public:
     // for an unvoted source. `scale_calib` (Slice 17b) mirrors Phase-1's: a source with
     // scale_calib == false never votes/reads the joint-scale (scale2) channel (its scale
     // is pinned at the prior); it defaults true, so every pre-17b caller is unchanged.
+    // `translation_only` (Slice 20): a velocity-only / heading-blind source PINS its
+    // rotation extrinsic to the prior — observe() forces R_X = prior_extrinsic.R for its
+    // lever row (R_yp = the prior rotation, roll = 0), SKIPS the per-window roll vote and
+    // the rot3d accumulation/vote, and the lever + scale LS run otherwise unchanged with
+    // that clean R_X. Default false (byte-identical; all new code behind the flag).
     // Call once per source after configure(). Returns OutOfRange if id is out of range,
     // CapacityExceeded at cap.
-    Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true);
+    Status set_prior(SourceId id, const SE3& prior_extrinsic, bool scale_calib = true,
+                     bool translation_only = false);
 
     // --- Re-anchor API (Slice 8 feedback loop) -------------------------------
     // RE-ANCHOR the lever-arm prior + the PairwisePinnedRef gauge to a NEW committed
@@ -647,6 +676,11 @@ private:
     Vec3        atb_[kMaxSources];
     Scalar      rows_[kMaxSources] = {};
     bool        ryp_set_[kMaxSources] = {};
+    // Translation-only source (Slice 20): when set, observe() pins R_X = prior_[slot].R for
+    // the lever row (R_yp = prior rotation, roll = 0) and skips the roll vote + rot3d
+    // accumulation/vote for this slot. The lever + scale LS run unchanged with the clean
+    // R_X. Default false (byte-identical; all new code behind the flag).
+    bool        trans_only_[kMaxSources] = {};
     SourceId    ids_[kMaxSources] = {};
     int         source_count_ = 0;
 

@@ -151,7 +151,10 @@ const char* kKnobDoc =
     "  per_sensor_kf=<bool>   scale_calib=<bool>   is_reference=<bool>\n"
     "  bias_states=<bool>     bias_process_noise=<f | 6 f's [v;omega]>   (per-source body-twist\n"
     "      bias, Slice 11b/18; 6-number per-DOF form needs multi_bias_enabled — a DOF rate of\n"
-    "      exactly 0 PINS that bias DOF at zero)\n";
+    "      exactly 0 PINS that bias DOF at zero)\n"
+    "  translation_only=<bool>   (Slice 20; velocity-only source e.g. Doppler radar —\n"
+    "      pins the rotation extrinsic to the prior, calibrates only lever + scale;\n"
+    "      requires an orthonormal prior_extrinsic rotation; default false)\n";
 
 } // namespace
 
@@ -402,6 +405,13 @@ Status ConfigLoader::parse(const std::string& text) {
             } else if (key == "is_reference") {
                 if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
                 sc.is_reference = bv;
+            } else if (key == "translation_only") {
+                // Slice 20: this source measures its own velocity but not its rotation
+                // (Doppler radar / optical-flow). Pins its rotation extrinsic to the prior
+                // (validate() requires an orthonormal prior rotation) and calibrates only the
+                // lever + scale. Default false (byte-identical).
+                if (!parse_bool(val, bv)) return fail("expected bool", line_no, raw);
+                sc.translation_only = bv;
             } else if (key == "bias_states") {
                 // Slice 11b/18: this source carries a body-twist bias state (Option A when
                 // [global] multi_bias_enabled is off — single source only; Option B when on).

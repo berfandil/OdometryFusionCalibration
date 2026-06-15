@@ -136,13 +136,14 @@ int Phase1Calibrator::ensure_slot(SourceId id) {
 }
 
 Status Phase1Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
-                                   bool scale_calib) {
+                                   bool scale_calib, bool translation_only) {
     if (!configured_)                          return Status::NotInitialized;
     if (static_cast<int>(id) >= kMaxSources)   return Status::OutOfRange;
     const int slot = ensure_slot(id);
     if (slot < 0)                              return Status::CapacityExceeded;
     prior_[slot]       = prior_extrinsic;
     scale_calib_[slot] = scale_calib;
+    trans_only_[slot]  = translation_only;     // Slice 20: skip direction votes if set
     return Status::Ok;
 }
 
@@ -253,64 +254,26 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         const Scalar bn = bt.norm();
         if (bn < kUnitEps) continue;                  // no translation -> no direction
 
-        // Observed forward direction in the BASE frame through the prior extrinsic.
-        // When the mount matches the prior this sits near +e_x for FORWARD base motion
-        // and near -e_x for REVERSE base motion.
-        const Vec3 dir_B = bt / bn;
-        Vec3 g_obs = prior_[slot].R * dir_B;
-        // REVERSE-FOLD (D5, DESIGN §6): fold a reverse-segment sample into the SAME
-        // hemisphere as the forward segments using the CONSENSUS sign (sign of the fused
-        // translation on the base-forward axis), not the source's own g_obs.x. For a
-        // sideways/far-off mount g_obs.x is noise, so a fixed g_obs.x<0 test would split the
-        // forward and reverse samples across antipodal peaks; the consensus sign folds them
-        // correctly for any mount orientation. With the fold OFF (reverse_fold_ == false) we
-        // do NOT negate — a reverse sample stays backward (≥90° off +e_x) and is then dropped
-        // by the π-guard below (never voted; not edge-clamped boundary mass as before).
-        if (reverse_fold_ && consensus_sign < Scalar(0)) g_obs = -g_obs;
-        const Scalar gn = g_obs.norm();
-        if (gn < kUnitEps) continue;
-        const Vec3 g_unit = g_obs / gn;
-
-        // π-SINGULARITY GUARD. Phase-1 is the SMALL-deviation-from-prior regime: a valid
-        // mount's folded forward direction sits near +e_x. If the folded direction is ≥90°
-        // off +e_x (cos(e_x, g_unit) < 0) the candidate rotation approaches 180°, whose
-        // so3::log is singular (s = θ/(2·sinθ) → ÷0 at θ=π → NaN/huge, lie.cpp:49). Such a
-        // sample is outside Phase-1's regime, so SKIP it rather than vote a π-rotation log —
-        // this guarantees no NaN/clamped-π mass ever enters the histogram.
-        if (g_unit.dot(kFwd) < Scalar(0)) continue;
-
         // Per-source vote weight (D5): scale every channel by the configured factor (the
         // turn magnitude and/or this source's Σ-confidence). `confidences` is optional —
         // a null array gives unit confidence (Confidence/Combo collapse to Rotation).
         const Scalar conf = (confidences != nullptr) ? confidences[i] : Scalar(1);
         const Scalar w    = vote_weight_factor(omega_norm, conf);
 
-        // Candidate rotation δR taking e_x -> g_unit; vote its so(3) log (3 channels).
-        // The guard above keeps θ < 90°, well clear of the so3::log singularity at π.
-        const Mat3 dR  = rotation_between(kFwd, g_unit);
-        const Vec3 phi = so3::log(dR);
-        // RANGE GUARD (Slice 18 review/B1 — the scale2 precedent generalized to the so(3)
-        // direction channels). A vote whose value falls OUTSIDE the configured histogram
-        // range is outside the calibrated regime (e.g. a de-biasing filter's wandering
-        // bias DOFs injecting a growing fake rotation into every source delta — the
-        // urban12 corruption channel). Depositing it would CLAMP into the boundary bin,
-        // where deterministic out-of-regime mass looks concentrated, COMMITS at the
-        // edge-bin center (~±0.984 at 64 bins over [-1,1]) and feeds absurd extrinsics
-        // back into fusion. SKIP the whole 3-channel vote instead (the components are one
-        // coupled rotation; a partial deposit would skew the joint readout) and count it —
-        // the histogram only ever holds genuine in-regime mass, so boundary-bin garbage
-        // can never commit. Strictly-interior test, mirroring the scale2 guard; the
-        // fold() clamp inside Histogram1D stays (it serves circular/edge cases elsewhere).
-        const bool in_range =
-            phi.x() > so3_cfg_.range_min && phi.x() < so3_cfg_.range_max &&
-            phi.y() > so3_cfg_.range_min && phi.y() < so3_cfg_.range_max &&
-            phi.z() > so3_cfg_.range_min && phi.z() < so3_cfg_.range_max;
-        if (in_range) {
-            so3_[3 * slot + 0].add(phi.x(), w);
-            so3_[3 * slot + 1].add(phi.y(), w);
-            so3_[3 * slot + 2].add(phi.z(), w);
-        } else {
-            so3_skipped_[slot] += Scalar(1);
+        // TRANSLATION-ONLY source (Slice 20): its per-step rotation is uninformative
+        // (R_B ~ I), so the direction (yaw/pitch so(3)) method would fit + commit a garbage
+        // rotation extrinsic — the footgun this flag removes. SKIP the whole direction block
+        // (it pins its rotation extrinsic to the prior instead) but STILL vote SCALE below
+        // (the straight-regime magnitude ratio is valid for a velocity source).
+        //
+        // For a NON-translation_only source the direction guards (degenerate-fold, the
+        // π-singularity) DROP the WHOLE sample — including its scale vote — exactly as the
+        // pre-20 inline `continue`s did (byte-identical): phase1_direction_vote returns
+        // false on a guard-dropped sample, and we `continue` past the scale vote. A
+        // translation_only source SKIPS the direction block entirely and always reaches the
+        // scale vote (its direction is irrelevant; only |t_B| feeds scale).
+        if (!trans_only_[slot]) {
+            if (!phase1_direction_vote(slot, bt, bn, consensus_sign, w)) continue;
         }
 
         // Scale vote = magnitude ratio vs the reference's reported magnitude (same weight).
@@ -320,6 +283,72 @@ Status Phase1Calibrator::observe(int n, const SourceId* ids, const SE3* reported
     }
 
     return Status::Ok;
+}
+
+// Direction (yaw/pitch so(3)) vote for one source — factored out (Slice 20) so a
+// translation_only source can skip ONLY the direction half while still voting scale.
+// `bt`/`bn` are the source's reported translation + its norm (bn > 0 guaranteed by the
+// caller); `w` the per-source vote weight. Byte-identical to the inlined pre-20 body.
+bool Phase1Calibrator::phase1_direction_vote(int slot, const Vec3& bt, Scalar bn,
+                                             Scalar consensus_sign, Scalar w) {
+    // Observed forward direction in the BASE frame through the prior extrinsic.
+    // When the mount matches the prior this sits near +e_x for FORWARD base motion
+    // and near -e_x for REVERSE base motion.
+    const Vec3 dir_B = bt / bn;
+    Vec3 g_obs = prior_[slot].R * dir_B;
+    // REVERSE-FOLD (D5, DESIGN §6): fold a reverse-segment sample into the SAME
+    // hemisphere as the forward segments using the CONSENSUS sign (sign of the fused
+    // translation on the base-forward axis), not the source's own g_obs.x. For a
+    // sideways/far-off mount g_obs.x is noise, so a fixed g_obs.x<0 test would split the
+    // forward and reverse samples across antipodal peaks; the consensus sign folds them
+    // correctly for any mount orientation. With the fold OFF (reverse_fold_ == false) we
+    // do NOT negate — a reverse sample stays backward (≥90° off +e_x) and is then dropped
+    // by the π-guard below (never voted; not edge-clamped boundary mass as before).
+    if (reverse_fold_ && consensus_sign < Scalar(0)) g_obs = -g_obs;
+    const Scalar gn = g_obs.norm();
+    if (gn < kUnitEps) return false;
+    const Vec3 g_unit = g_obs / gn;
+
+    // π-SINGULARITY GUARD. Phase-1 is the SMALL-deviation-from-prior regime: a valid
+    // mount's folded forward direction sits near +e_x. If the folded direction is ≥90°
+    // off +e_x (cos(e_x, g_unit) < 0) the candidate rotation approaches 180°, whose
+    // so3::log is singular (s = θ/(2·sinθ) → ÷0 at θ=π → NaN/huge, lie.cpp:49). Such a
+    // sample is outside Phase-1's regime, so SKIP it rather than vote a π-rotation log —
+    // this guarantees no NaN/clamped-π mass ever enters the histogram.
+    if (g_unit.dot(kFwd) < Scalar(0)) return false;
+
+    // Candidate rotation δR taking e_x -> g_unit; vote its so(3) log (3 channels).
+    // The guard above keeps θ < 90°, well clear of the so3::log singularity at π.
+    const Mat3 dR  = rotation_between(kFwd, g_unit);
+    const Vec3 phi = so3::log(dR);
+    // RANGE GUARD (Slice 18 review/B1 — the scale2 precedent generalized to the so(3)
+    // direction channels). A vote whose value falls OUTSIDE the configured histogram
+    // range is outside the calibrated regime (e.g. a de-biasing filter's wandering
+    // bias DOFs injecting a growing fake rotation into every source delta — the
+    // urban12 corruption channel). Depositing it would CLAMP into the boundary bin,
+    // where deterministic out-of-regime mass looks concentrated, COMMITS at the
+    // edge-bin center (~±0.984 at 64 bins over [-1,1]) and feeds absurd extrinsics
+    // back into fusion. SKIP the whole 3-channel vote instead (the components are one
+    // coupled rotation; a partial deposit would skew the joint readout) and count it —
+    // the histogram only ever holds genuine in-regime mass, so boundary-bin garbage
+    // can never commit. Strictly-interior test, mirroring the scale2 guard; the
+    // fold() clamp inside Histogram1D stays (it serves circular/edge cases elsewhere).
+    const bool in_range =
+        phi.x() > so3_cfg_.range_min && phi.x() < so3_cfg_.range_max &&
+        phi.y() > so3_cfg_.range_min && phi.y() < so3_cfg_.range_max &&
+        phi.z() > so3_cfg_.range_min && phi.z() < so3_cfg_.range_max;
+    if (in_range) {
+        so3_[3 * slot + 0].add(phi.x(), w);
+        so3_[3 * slot + 1].add(phi.y(), w);
+        so3_[3 * slot + 2].add(phi.z(), w);
+    } else {
+        so3_skipped_[slot] += Scalar(1);
+    }
+    // The sample passed the direction guards (an in-range so(3) vote was deposited OR a
+    // counted range-skip — both cases the pre-20 inline path fell through to the scale
+    // vote, so the caller proceeds to vote scale). The two `return false` guards above
+    // mirror the pre-20 `continue`s that DROPPED the whole sample (no scale vote either).
+    return true;
 }
 
 // --- Readouts --------------------------------------------------------------
@@ -775,11 +804,12 @@ int Phase2Calibrator::ensure_slot(SourceId id) {
     xyz_skipped_[slot]    = Scalar(0);
     rot3d_skipped_[slot]  = Scalar(0);
     scale2_calib_[slot]   = true;
+    trans_only_[slot]     = false;
     return slot;
 }
 
 Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
-                                   bool scale_calib) {
+                                   bool scale_calib, bool translation_only) {
     if (!configured_)                        return Status::NotInitialized;
     if (static_cast<int>(id) >= kMaxSources) return Status::OutOfRange;
     const int slot = ensure_slot(id);
@@ -792,6 +822,9 @@ Status Phase2Calibrator::set_prior(SourceId id, const SE3& prior_extrinsic,
     // Joint-scale gate (Slice 17b), mirroring Phase-1: a scale_calib==false source never
     // votes/reads the scale2 channel (its scale is pinned at the prior).
     scale2_calib_[slot] = scale_calib;
+    // Translation-only source (Slice 20): observe() pins R_X = prior rotation for its lever
+    // row and skips the roll vote + rot3d accumulation/vote.
+    trans_only_[slot]   = translation_only;
     return Status::Ok;
 }
 
@@ -946,6 +979,15 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         const Mat3& R_B = reported[i].R;
         const Vec3& t_B = reported[i].t;
 
+        // TRANSLATION-ONLY source (Slice 20): a velocity-only / heading-blind source
+        // (R_B ~ I) whose rotation extrinsic is TRUSTED at the prior, not recovered. PIN
+        // the lever row's rotation to the FULL prior rotation: R_yp = prior_[slot].R, roll
+        // = 0 (no roll vote), and skip the rot3d accumulation/vote entirely — so the row
+        // uses the clean R_X = prior rotation (the whole point: the heading-blind direction
+        // / Wahba fits would otherwise commit a garbage rotation that pollutes every lever
+        // row by ~|t|·θ). The lever + scale LS below run UNCHANGED with that clean R_X.
+        const bool trans_only = trans_only_[slot];
+
         // Roll basepoint R_yp: the Phase-1 yaw/pitch rotation if provided. FALLBACK
         // (bootstrap, before Phase 1 has fed an R_yp — see set_yaw_pitch): the prior's
         // yaw/pitch ONLY, with its prior roll STRIPPED, so the recovered roll is measured
@@ -955,7 +997,11 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // this drops exactly the roll DOF). In the WIRED estimator R_yp is set every step
         // (the wired path always sets R_yp), so this fallback only matters on the
         // bootstrap / Slice-8 path — but it is now roll-safe there too.
-        const Mat3 R_yp = ryp_set_[slot] ? ryp_[slot] : yaw_pitch_of(prior_[slot].R);
+        // TRANSLATION-ONLY: R_yp is forced to the FULL prior rotation (incl. its roll), so
+        // R_X = R_yp·Rx(0) = the prior rotation exactly — its rotation is given, not fit.
+        const Mat3 R_yp = trans_only ? prior_[slot].R
+                                     : (ryp_set_[slot] ? ryp_[slot]
+                                                       : yaw_pitch_of(prior_[slot].R));
 
         // Per-source vote weight (D5): the turn magnitude and/or this source's
         // Σ-confidence. `confidences` optional (null -> unit confidence).
@@ -963,8 +1009,11 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         const Scalar w    = vote_weight_factor(omega_norm, conf);
 
         // --- Roll: 1-D rotation hand-eye residual minimizer, voted into S¹ -------
-        const Scalar roll = best_roll(R_yp, R_A, R_B);
-        roll_[slot].add(roll, w);
+        // SKIPPED for a translation_only source (its roll is pinned at the prior, not
+        // recovered — voting a best_roll fit of its absent rotation would be the same
+        // garbage commit the flag removes); roll stays 0 in the row below.
+        const Scalar roll = trans_only ? Scalar(0) : best_roll(R_yp, R_A, R_B);
+        if (!trans_only) roll_[slot].add(roll, w);
 
         // --- rot3d: axis-correspondence Wahba accumulation + vote (Slice 17) -----
         // a = log(R_A), b = log(R_B); the hand-eye rotation identity R_A R_X = R_X R_B is
@@ -988,7 +1037,12 @@ Status Phase2Calibrator::observe(int n, const SourceId* ids, const SE3* reported
         // byte-identical to the pre-fix path.
         bool rot3d_row = false;   // R̂ valid for THIS window's translation row
         Mat3 Rhat;
-        if (rot3d_enabled_) {
+        // TRANSLATION-ONLY (Slice 20): skip the rot3d Wahba accumulation/vote — a
+        // heading-blind source's b = log(R_B) ~ 0 would never open the two-axis gate
+        // anyway, but skipping it explicitly keeps the row's R_X pinned at the prior
+        // rotation (rot3d_row stays false -> R_X = R_yp·Rx(0) = prior) and the rot3d
+        // channels empty (its rotation extrinsic never commits off the prior).
+        if (rot3d_enabled_ && !trans_only) {
             const Vec3 b_axis = so3::log(R_B);
             // ‖a‖ ≥ kRotRowMin is already guaranteed by the per-window guard above; require
             // the same floor on ‖b‖ (a degenerate/noise-only sensor rotation row).
@@ -1233,7 +1287,12 @@ SE3 Phase2Calibrator::extrinsic(SourceId id) const {
     const int s = slot_for(id);
     if (s < 0) return SE3{};
     SE3 X = prior_[s];
-    const Mat3 R_yp = ryp_set_[s] ? ryp_[s] : prior_[s].R;
+    // TRANSLATION-ONLY (Slice 20): the rotation extrinsic is the PRIOR, pinned (roll never
+    // votes for it, so roll(id)=0; force R_yp to the full prior rotation regardless of any
+    // fed ryp_ so the readout is correct even when used outside the wired estimator). Only
+    // the lever (translation) is recovered.
+    const Mat3 R_yp = trans_only_[s] ? prior_[s].R
+                                     : (ryp_set_[s] ? ryp_[s] : prior_[s].R);
     X.R = R_yp * roll_about_forward(roll(id));    // yaw/pitch ∘ recovered roll
     X.t = lever_arm(id);
     return X;

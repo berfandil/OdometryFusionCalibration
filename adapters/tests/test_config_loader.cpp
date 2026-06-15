@@ -204,6 +204,43 @@ TEST_CASE("ConfigLoader: joint_lever_scale parses (Slice 17b); default off; bad 
     }
 }
 
+TEST_CASE("ConfigLoader: translation_only (per-sensor) parses (Slice 20); default off; "
+          "bad value rejects") {
+    // Enabled on a sensor with a valid (identity) prior rotation -> validates Ok.
+    {
+        const std::string text =
+            "[global]\nmax_sources=2\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n"
+            "[sensor.1]\nid=1\nprior_extrinsic = 0.3 0 0  0.5 0 0\n"
+            "translation_only = true\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        REQUIRE(loader.config().sensor_count == 2);
+        CHECK(loader.config().sensors[1].translation_only);
+        CHECK_FALSE(loader.config().sensors[0].translation_only);
+    }
+    // Key absent -> default OFF (byte-identical).
+    {
+        const std::string text =
+            "[global]\nmax_sources=2\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n"
+            "[sensor.1]\nid=1\n";
+        ConfigLoader loader;
+        REQUIRE(loader.parse(text) == Status::Ok);
+        CHECK_FALSE(loader.config().sensors[1].translation_only);
+    }
+    // Non-bool value -> loud error naming the line.
+    {
+        const std::string text =
+            "[global]\nmax_sources=2\nreference_sensor_id=0\n"
+            "[sensor.0]\nid=0\nis_reference=true\n"
+            "[sensor.1]\nid=1\ntranslation_only = banana\n";
+        ConfigLoader loader;
+        CHECK(loader.parse(text) == Status::InvalidConfig);
+        CHECK(loader.error().find("translation_only") != std::string::npos);
+    }
+}
+
 TEST_CASE("ConfigLoader: subbin_centroid round-trips into all five calibration histograms") {
     // Slice 16: one [global] key switches the centroid sub-bin readout on for
     // every calibration histogram (so3/roll/xyz/scale/offset).
