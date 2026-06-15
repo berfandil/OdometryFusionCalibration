@@ -55,6 +55,10 @@ So 3D is a mechanical lift (point dimension + Kabsch dimension); the descriptor/
 
 ## 4. Status
 - [x] Algorithm documented (this file) + 3D notes — user-contributed, orchestrator-captured.
-- [ ] Implemented (`tools/radar_scan_odometry.py`, 2D, 3D-ready).
-- [ ] Validated on nuScenes radar (recovered odometry vs GT; rotation now present).
-- [ ] (stretch) Fed through the calibrator as a non-`translation_only` radar — does the rotation extrinsic + lever become observable?
+- [x] Implemented (`tools/radar_scan_odometry.py`, `61b79f3`; 2D, 3D-ready; both refinements — tolerance-merge matching + RANSAC). Core math proven EXACT (synthetic Kabsch/RANSAC round-trips a planted 3 deg to 1e-9). Two real bugs found+fixed: the CAN base delta integrated ZERO samples per 75 ms radar window (CAN is ~500 ms) -> use the instantaneous nearest-in-time CAN twist held over dt; + a plausibility gate rejecting RANSAC-blunder yaw/translation beyond the CAN prior + margin.
+- [x] Validated on nuScenes radar (scene-0061/0103, all 5 radars):
+  - **Translation tracks** (median 0.5-1.0 m/frame ≈ the ~0.9 m GT step; step-length corr ~0.4).
+  - **Rotation NOT usable** on sparse 2D ARS408: the true 75 ms inter-scan yaw (~0.2 deg) sits BELOW the ~0.8 deg Kabsch rotation-noise floor on ~9 noisy inlier points -> cumulative recovered heading scatters (-53 to +23 deg vs GT net +98 deg), per-frame yaw correlation ~0. Match stats: dense radars 44-84 static / 20-49 corr / 9-33 inliers / 8-45% identity-fallback; sparse corner radars worse (33-86% fallback).
+- [x] (stretch) Fed through the calibrator as a non-`translation_only` radar: the rotation channel is STRUCTURALLY unblocked — radar `extr_rot` confidence becomes NONZERO (0.11-0.46) vs the Doppler `translation_only` baseline's structural conf 0. BUT the noisy per-step rotation drives the recovered extrinsic to ~1 rad nonsense, collapses the radar scale, and wrecks fused drift (max 801 m, NEES 78). The heading-blind wall is removed structurally; the limiter is now front-end rotation SNR.
+
+**Verdict**: the algorithm is correct and gives usable radar TRANSLATION + a structural rotation unblock, but per-step ROTATION is below the noise floor on sparse 2D 13 Hz radar. **Next levers** (rotation, in order): (1) **longer matching baseline** — match scan k to k−N so the accumulated yaw (N x ~0.2 deg) rises above the ~0.8 deg Kabsch floor while the FOV still overlaps (the most promising, cheap fix; trades overlap for signal); (2) temporal smoothing of the recovered R; (3) a 4D/imaging radar (§2: more points + elevation -> 3D + a far better-conditioned Kabsch). Translation is already usable as a drop-in radar source today. Committing a real radar LEVER remains gated on this front-end rotation quality (Slice 20b).
