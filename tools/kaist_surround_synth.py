@@ -203,7 +203,8 @@ def read_gt(path):
 
 def main():
     args = sys.argv[1:]
-    flags = {"noise_free": False, "seed": 12345, "nominal": 0.05, "emit_manifest": False}
+    flags = {"noise_free": False, "seed": 12345, "nominal": 0.05, "emit_manifest": False,
+             "noise_scale": 1.0}
     pos = []
     i = 0
     while i < len(args):
@@ -218,6 +219,9 @@ def main():
         elif a == "--nominal":
             i += 1
             flags["nominal"] = float(args[i])
+        elif a == "--noise-scale":
+            i += 1
+            flags["noise_scale"] = float(args[i])
         else:
             pos.append(a)
         i += 1
@@ -246,10 +250,17 @@ def main():
         Rprev, tprev = Rc, tc
 
     nominal = flags["nominal"]
+    ns = flags["noise_scale"]
     for (name, yaw, pitch, roll, lever, scale, s_pct, s_floor, s_rot_deg) in SENSORS:
         ER, Et = extrinsic_E(yaw, pitch, roll, lever)
         ERt, Einv_t = se3_inv(ER, Et)
-        s_rot = math.radians(s_rot_deg)
+        # --noise-scale uniformly multiplies all per-step sigmas (and so the variance columns
+        # by ns^2). The TABLE values are a representative-but-pessimistic per-step level; the
+        # physical heading random walk is sigma_step * sqrt(N_steps), so a long 100 Hz drive
+        # needs small per-step sigma to stay GPS-correctable. ns < 1 dials toward realistic VO.
+        s_pct *= ns
+        s_floor *= ns
+        s_rot = math.radians(s_rot_deg) * ns
         # Modeled per-step variance columns (constant; representative nominal step).
         var_t = (s_pct * nominal + s_floor) ** 2
         var_r = s_rot ** 2
