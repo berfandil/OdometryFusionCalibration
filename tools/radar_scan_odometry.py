@@ -33,13 +33,23 @@
 #
 # Pure ASCII; numpy ok; SEEDED RNG (random.Random) for the RANSAC sampling -> reproducible.
 #
+# LONGER MATCHING BASELINE (--baseline N, default 1): match scan k to scan k-N instead of k-1, so the
+# true accumulated yaw over the matched window is ~N x larger while the Kabsch rotation-noise floor
+# stays ~constant -> rotation SNR rises ~N x. Trade-off: larger N -> radar moved more -> less FOV
+# overlap -> fewer correspondences. Sweep N to find the sweet-spot before overlap collapse. The
+# per-frame static filter is UNCHANGED; only the matched PAIR (and its dt / CAN prior / GT delta /
+# plausibility cap) changes. HEADLINE metrics: per-step yaw correlation (recovered vs GT over the same
+# interval) + a NON-OVERLAPPING cumulative-heading track (sum over k=N,2N,3N,... windows).
+#
 # Usage:
 #   python tools/radar_scan_odometry.py <dataroot> <out_dir> <scene> [scene ...]
-#       [--radar NAME] [--tau-v M_S] [--tau-d M] [--rho R] [--tau-inlier M]
+#       [--radar NAME] [--baseline N] [--tau-v M_S] [--tau-d M] [--rho R] [--tau-inlier M]
 #       [--ransac-iters N] [--min-corr N] [--seed N] [--quiet]
 #   e.g. python tools/radar_scan_odometry.py C:/workspace/data/nuScenes radar_scan_run scene-0061
+#        python tools/radar_scan_odometry.py C:/workspace/data/nuScenes run scene-0061 --baseline 8
 #
 #   --radar NAME (repeatable) restricts to a subset of the 5 radars; default = all 5.
+#   --baseline N matches scan k with scan k-N (default 1 = consecutive). Sweep to test radar rotation.
 #   Emits <out_dir>/<scene>_scan_<radar>.csv (increment form, the project schema, WITH rotation),
 #   a drop-in alternative to the Doppler front-end, plus a per-radar vs-GT validation report.
 import math
@@ -279,8 +289,17 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
                         speed_scale, yaw_scale, rng, args):
     # The full per-radar pipeline. stream = [(ts_us, filename, ego_pose), ...] time-ordered. calib =
     # calibrated_sensor (ego_from_radar). Returns (rows, stats, perframe) where rows are increment-CSV
-    # tuples (t_us, R3, t3, var6) and perframe holds the per-pair (R_est, t_est, R_gt, t_gt) for the
-    # vs-GT validation.
+    # tuples (t_us, R3, t3, var6) and perframe holds the per-pair record (R_est, t_est, R_gt, t_gt,
+    # recovered, ts_curr_us, ts_part_us, k_idx) for the vs-GT validation.
+    #
+    # LONGER MATCHING BASELINE (--baseline N): the scan at ordered index k is matched with the scan
+    # at index k-N (default N=1 = consecutive, the original behaviour). Both frames are STILL static-
+    # filtered the same way per-frame (the per-frame filter is UNCHANGED); only the matched PAIR
+    # changes. The recovered B_radar then spans [t_{k-N}, t_k] (~N x the inter-scan time), so the true
+    # accumulated yaw is ~N x larger while the Kabsch rotation-noise floor stays ~constant -> the
+    # rotation SNR should rise. dt, the CAN prior, the plausibility cap and the GT delta ALL span the
+    # longer [t_{k-N}, t_k] interval. Trade-off: larger N -> the radar moved more -> less FOV overlap
+    # -> fewer correspondences -> matching degrades, so there is a sweet-spot N.
     import bisect
     vm_sorted = sorted(vm, key=lambda r: r["utime"])
     vm_ts = [r["utime"] for r in vm_sorted]
@@ -289,32 +308,35 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
     X_t = list(calib["translation"])
     X_Rt = n2c.mat_t(X_R)
 
+    N = max(1, int(args.baseline))
+
     rows = []
     perframe = []
     stats = {"n_pairs": 0, "n_fallback": 0, "sum_det": 0, "sum_static": 0,
              "sum_corr": 0, "sum_inl": 0, "n_recov": 0, "n_gated": 0}
 
-    prev = None  # (ts_us, kept_pts, descs)
-    for (ts_us, filename, _ego) in stream:
+    # ring buffer of the last N+1 scans' RAW detections keyed by ordered index k. The partner for the
+    # scan at index k is the one at index k-N (so we only need to remember the last N+1 frames).
+    hist = []  # list of (ts_us, dets), most-recent last; trimmed to length N+1
+    for k, (ts_us, filename, _ego) in enumerate(stream):
         dets = n2c.read_radar_pcd(os.path.join(blobroot, filename))
-        if prev is None:
-            # first scan: filter against a zero-motion prior just to seed prev's kept set; but we
-            # cannot know its dt -> use the next pair's dt. Simpler: defer filtering of the FIRST
-            # frame until we have the pair, by storing raw dets. We refilter prev within the pair.
-            prev = (ts_us, dets, None)
+        hist.append((ts_us, dets))
+        if len(hist) > N + 1:
+            hist.pop(0)
+        if k < N:
+            # not enough history yet to reach back N scans (the first N scans are skipped, harmless)
             continue
 
-        t_prev_us, prev_dets, _ = prev
+        t_prev_us, prev_dets = hist[0]   # the scan at index k-N
         dt = (ts_us - t_prev_us) * 1e-6
         if dt <= 0:
-            prev = (ts_us, dets, None)
             continue
 
-        # --- reference CAN base delta over [t_prev, t_curr] -> expected radar motion ---
+        # --- reference CAN base delta over [t_{k-N}, t_k] -> expected radar motion ---
         A_R, A_t = base_delta_from_can(vm_sorted, vm_ts, t_prev_us, ts_us, speed_scale, yaw_scale)
         B_R, B_t = expected_radar_motion(A_R, A_t, X_R, X_t)
 
-        # --- A. static filter BOTH frames with the same expected-motion prior ---
+        # --- A. static filter BOTH frames with the same expected-motion prior (per-frame, UNCHANGED) ---
         prev_kept = static_filter(prev_dets, B_R, B_t, dt, args.tau_v)
         curr_kept = static_filter(dets, B_R, B_t, dt, args.tau_v)
         stats["sum_det"] += len(dets)
@@ -336,11 +358,11 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
         stats["sum_inl"] += n_inl
 
         # PHYSICAL-PLAUSIBILITY GATE: sparse radar descriptors occasionally produce a confident but
-        # GROSSLY wrong Kabsch fit (tens of degrees of yaw in a 75 ms step) that survives RANSAC when
-        # the geometry is near-degenerate. The median frame is fine but these blunders destroy the
-        # integrated heading. Reject any recovered increment whose yaw or translation exceeds the
-        # CAN-predicted radar motion by a generous margin -> treat as fallback. This uses the SAME
-        # reference prior the static filter already trusts (not GT).
+        # GROSSLY wrong Kabsch fit (tens of degrees of yaw) that survives RANSAC when the geometry is
+        # near-degenerate. The median frame is fine but these blunders destroy the integrated heading.
+        # Reject any recovered increment whose yaw or translation exceeds the CAN-predicted radar
+        # motion over the (longer) [t_{k-N}, t_k] interval by a generous margin -> treat as fallback.
+        # This uses the SAME reference prior the static filter already trusts (not GT).
         recovered = R2 is not None
         if recovered:
             yaw_inc = abs(math.atan2(R2[1, 0], R2[0, 0]))   # |yaw| of the recovered map (sign-free)
@@ -362,10 +384,10 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
             stats["n_fallback"] += 1
             R_inc, t_inc = R3, t3
         else:
-            # Kabsch gave r_prev ~= R2 r_curr + t2, i.e. the map CURR->PREV. The increment-form
-            # contract is the body motion FROM prev TO curr (so integrating increments walks the
-            # trajectory forward). That forward body delta is the INVERSE of the curr->prev map:
-            #   R_inc = R2^T ,  t_inc = -R2^T t2  (planar; z=0).
+            # Kabsch gave r_prev ~= R2 r_curr + t2, i.e. the map CURR->PREV (over [t_{k-N}, t_k]). The
+            # increment-form contract is the body motion FROM the partner TO curr (so integrating
+            # increments walks the trajectory forward). That forward body delta is the INVERSE of the
+            # curr->prev map:  R_inc = R2^T ,  t_inc = -R2^T t2  (planar; z=0).
             R2T = R2.T
             ti = -R2T @ t2
             R_inc = [[R2T[0, 0], R2T[0, 1], 0.0],
@@ -380,8 +402,8 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
 
         rows.append((ts_us, R_inc, t_inc, var6))
 
-        # --- validation: GT radar frame-to-frame motion over [t_prev, t_curr] ---
-        # B_radar_gt = X_radar^-1 o A_gt o X_radar  (forward body delta prev->curr in the radar frame)
+        # --- validation: GT radar frame-to-frame motion over [t_{k-N}, t_k] ---
+        # B_radar_gt = X_radar^-1 o A_gt o X_radar  (forward body delta partner->curr in radar frame)
         gi0 = min(max(bisect.bisect_right(gt_ts, t_prev_us) - 1, 0), len(gt_R) - 1)
         gi1 = min(max(bisect.bisect_right(gt_ts, ts_us) - 1, 0), len(gt_R) - 1)
         R0g, p0g = gt_R[gi0], gt_p[gi0]
@@ -390,8 +412,7 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
         Agt_R = n2c.mat_mul(R0gt, R1g)
         Agt_t = n2c.mat_vec(R0gt, [p1g[i] - p0g[i] for i in range(3)])
         Bgt_R, Bgt_t = expected_radar_motion(Agt_R, Agt_t, X_R, X_t)
-        perframe.append((R_inc, t_inc, Bgt_R, Bgt_t, recovered))
-        prev = (ts_us, dets, None)
+        perframe.append((R_inc, t_inc, Bgt_R, Bgt_t, recovered, ts_us, t_prev_us, k))
 
     return rows, stats, perframe
 
@@ -417,26 +438,65 @@ def pct(vals, q):
     return s[k]
 
 
-def report_radar(channel, perframe, stats):
+def pearson(xs, ys):
+    # Pearson correlation of two equal-length sequences; nan if degenerate (no variance / <2 points).
+    n = len(xs)
+    if n < 2:
+        return float("nan")
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = math.sqrt(sxx * syy)
+    if den < 1e-12:
+        return float("nan")
+    return sxy / den
+
+
+def report_radar(channel, perframe, stats, baseline):
     # Per-radar: translation error (m) + rotation error (deg), recovered vs GT, median + p90, over
     # frames where a real motion was recovered (fallback frames excluded from the error stats but
-    # counted in the fallback rate). Plus the cumulative-heading-tracking headline.
+    # counted in the fallback rate). Plus the HEADLINE rotation metrics: the per-step yaw correlation
+    # (recovered vs GT yaw of B_radar over the SAME [t_{k-N}, t_k] interval -- was ~0 at N=1; does it
+    # rise toward 1 as N grows?) and a NON-OVERLAPPING cumulative-heading track.
+    N = max(1, int(baseline))
     trans_errs, rot_errs = [], []
+    # per-step yaw arrays for correlation (recovered-motion frames only -- fallback yaw is a forced 0
+    # and would spuriously inflate/deflate the correlation; correlate where we actually claimed a R).
+    est_yaws, gt_yaws = [], []
+    # cumulative heading over ALL frames (fallback contributes 0 recovered yaw, like the Doppler R=I)
     cum_est_yaw = 0.0
     cum_gt_yaw = 0.0
-    for (R_inc, t_inc, Rg, tg, recovered) in perframe:
-        # cumulative heading uses ALL frames (fallback contributes 0 recovered yaw, like Doppler R=I)
+    # NON-OVERLAPPING cumulative heading: sum the recovered (and GT) yaw over the pairs whose curr
+    # ordered-index k is a multiple of N (k=N,2N,3N,...). Those windows tile [t_0,t_N,t_2N,...]
+    # end-to-end with NO overlap, so summing them is a true heading track vs the GT heading at the
+    # same break times. Fallback frames keep their 0 recovered yaw (honest: no heading recovered).
+    nov_est_yaw = 0.0
+    nov_gt_yaw = 0.0
+    n_nov = 0
+    for rec in perframe:
+        (R_inc, t_inc, Rg, tg, recovered, ts_us, t_prev_us, k) = rec
         cum_est_yaw += yaw_of(R_inc)
         cum_gt_yaw += yaw_of(Rg)
+        if k % N == 0:
+            nov_est_yaw += yaw_of(R_inc)
+            nov_gt_yaw += yaw_of(Rg)
+            n_nov += 1
         if not recovered:
             continue
         te = math.hypot(t_inc[0] - tg[0], t_inc[1] - tg[1])
         re = rot_err_deg(R_inc, Rg)
         trans_errs.append(te)
         rot_errs.append(re)
+        est_yaws.append(math.degrees(yaw_of(R_inc)))
+        gt_yaws.append(math.degrees(yaw_of(Rg)))
     n = stats["n_pairs"]
+    nov_est_deg = math.degrees(nov_est_yaw)
+    nov_gt_deg = math.degrees(nov_gt_yaw)
     out = {
         "channel": channel,
+        "baseline": N,
         "n_pairs": n,
         "n_recov": stats["n_recov"],
         "fallback_pct": 100.0 * stats["n_fallback"] / n if n else 0.0,
@@ -449,8 +509,14 @@ def report_radar(channel, perframe, stats):
         "trans_p90": pct(trans_errs, 0.9),
         "rot_med": pct(rot_errs, 0.5),
         "rot_p90": pct(rot_errs, 0.9),
+        "yaw_corr": pearson(est_yaws, gt_yaws),   # HEADLINE: per-step recovered-vs-GT yaw correlation
         "cum_est_yaw_deg": math.degrees(cum_est_yaw),
         "cum_gt_yaw_deg": math.degrees(cum_gt_yaw),
+        # non-overlapping cumulative-heading track + final error vs GT net yaw over those windows
+        "nov_est_yaw_deg": nov_est_deg,
+        "nov_gt_yaw_deg": nov_gt_deg,
+        "nov_heading_err_deg": nov_est_deg - nov_gt_deg,
+        "n_nov": n_nov,
     }
     return out
 
@@ -470,6 +536,7 @@ def parse_args(argv):
     a.min_corr = 3        # min correspondences/inliers to recover a real motion
     a.yaw_margin_deg = 5.0   # plausibility gate: max |recovered yaw| above the CAN-predicted yaw
     a.trans_margin_m = 1.0   # plausibility gate: max |recovered trans| above the CAN-predicted step
+    a.baseline = 1        # match scan k with scan k-N (N=1 = consecutive, the original behaviour)
     a.seed = 12345
     a.radars = None       # None -> all 5
     a.quiet = False
@@ -493,6 +560,8 @@ def parse_args(argv):
             i += 1; a.yaw_margin_deg = float(argv[i])
         elif x == "--trans-margin-m":
             i += 1; a.trans_margin_m = float(argv[i])
+        elif x == "--baseline":
+            i += 1; a.baseline = int(argv[i])
         elif x == "--seed":
             i += 1; a.seed = int(argv[i])
         elif x == "--radar":
@@ -555,22 +624,27 @@ def convert_scene(dataroot, out_dir, scene_name, tables, args):
             stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
             speed_scale, yaw_scale, rng, args)
         short = channel.lower()
-        outp = base + "_scan_" + short.replace("radar_", "radar_") + ".csv"
-        emit_scan_csv(outp, "%s scan-odometry: descriptor scan-match (R+t)" % channel,
-                      rows, t0_us)
-        rep = report_radar(channel, perframe, stats)
+        # tag the CSV with the baseline so sweep runs (different N) do not overwrite each other
+        nbase = max(1, int(args.baseline))
+        nsuf = "" if nbase == 1 else ("_n%d" % nbase)
+        outp = base + "_scan_" + short.replace("radar_", "radar_") + nsuf + ".csv"
+        emit_scan_csv(outp, "%s scan-odometry: descriptor scan-match (R+t), baseline N=%d"
+                      % (channel, nbase), rows, t0_us)
+        rep = report_radar(channel, perframe, stats, args.baseline)
         reports.append(rep)
     return reports, scene_name
 
 
 def print_report(scene_name, reports, args):
-    print("=" * 100)
-    print("RADAR SCAN-MATCHING ODOMETRY -- %s   (tau_v=%.2f tau_d=%.2f rho=%.2f tau_inl=%.2f iters=%d)"
-          % (scene_name, args.tau_v, args.tau_d, args.rho, args.tau_inlier, args.ransac_iters))
-    print("=" * 100)
+    nbase = max(1, int(args.baseline))
+    print("=" * 110)
+    print("RADAR SCAN-MATCHING ODOMETRY -- %s   N=%d  (tau_v=%.2f tau_d=%.2f rho=%.2f tau_inl=%.2f "
+          "iters=%d)" % (scene_name, nbase, args.tau_v, args.tau_d, args.rho, args.tau_inlier,
+                         args.ransac_iters))
+    print("=" * 110)
     # match-quality block
-    print("-" * 100)
-    print("MATCH QUALITY (per frame averages)")
+    print("-" * 110)
+    print("MATCH QUALITY (per frame averages)  -- overlap collapse shows here as corr/inlier -> 0, fallbk -> 100%")
     print("%-20s | %5s | %7s | %7s | %7s | %7s | %8s | %7s"
           % ("radar", "#pair", "det", "static", "corr", "inlier", "fallbk%", "gated%"))
     print("-" * 90)
@@ -579,34 +653,32 @@ def print_report(scene_name, reports, args):
               % (r["channel"], r["n_pairs"], r["avg_det"], r["avg_static"],
                  r["avg_corr"], r["avg_inl"], r["fallback_pct"], r["gated_pct"]))
     # accuracy block
-    print("-" * 100)
-    print("RECOVERED vs GT  (over frames with a real recovered motion)")
+    print("-" * 110)
+    print("RECOVERED vs GT  (over frames with a real recovered motion; errors are over the [t_{k-N}, t_k] interval)")
     print("%-20s | %12s | %12s | %12s | %12s"
           % ("radar", "trans med m", "trans p90 m", "rot med deg", "rot p90 deg"))
     print("-" * 78)
     for r in reports:
         print("%-20s | %12.3f | %12.3f | %12.3f | %12.3f"
               % (r["channel"], r["trans_med"], r["trans_p90"], r["rot_med"], r["rot_p90"]))
-    # heading-tracking headline
-    print("-" * 100)
-    print("CUMULATIVE HEADING TRACKING  (does the scan-match recover a REAL heading? Doppler = 0)")
-    print("%-20s | %16s | %16s | %12s"
-          % ("radar", "cum recov yaw", "cum GT yaw", "ratio"))
-    print("-" * 70)
+    # HEADLINE rotation block: per-step yaw correlation + non-overlapping cumulative heading track
+    print("-" * 110)
+    print("ROTATION HEADLINE  (per-step yaw CORRELATION recovered-vs-GT; was ~0 at N=1 -> rises toward 1?)")
+    print("%-20s | %9s | %16s | %16s | %16s"
+          % ("radar", "yaw corr", "nonovl recov hdg", "nonovl GT hdg", "nonovl hdg err"))
+    print("-" * 88)
     for r in reports:
-        gt_y = r["cum_gt_yaw_deg"]
-        est_y = r["cum_est_yaw_deg"]
-        ratio = (est_y / gt_y) if abs(gt_y) > 1e-6 else float("nan")
-        print("%-20s | %13.2f deg | %13.2f deg | %12.2f"
-              % (r["channel"], est_y, gt_y, ratio))
-    print("=" * 100)
+        print("%-20s | %9.3f | %12.2f deg | %12.2f deg | %12.2f deg"
+              % (r["channel"], r["yaw_corr"], r["nov_est_yaw_deg"], r["nov_gt_yaw_deg"],
+                 r["nov_heading_err_deg"]))
+    print("=" * 110)
 
 
 def main():
     args = parse_args(sys.argv[1:])
     if len(args.pos) < 3:
         print("usage: radar_scan_odometry.py <dataroot> <out_dir> <scene> [scene ...] "
-              "[--radar NAME] [--tau-v M_S] [--tau-d M] [--rho R] [--tau-inlier M] "
+              "[--radar NAME] [--baseline N] [--tau-v M_S] [--tau-d M] [--rho R] [--tau-inlier M] "
               "[--ransac-iters N] [--min-corr N] [--yaw-margin-deg D] [--trans-margin-m M] "
               "[--seed N] [--quiet]")
         sys.exit(2)
