@@ -39,5 +39,5 @@
 
 ## 4. Status
 - [x] Sweep run (urban07 full, urban17 to cov 3200, urban12 to cov 200) + analyzed.
-- [ ] Docs updated (CONFIG `cov_floor_m2` recommendation; ISSUES per-fix-R / GPS-vs-GT-confound item) — orchestrator.
+- [x] Docs updated (CONFIG `cov_floor_m2` note; ISSUES per-fix-R / GPS-vs-GT-confound item) + **recipe banked: urban `cov_floor_m2 = 300`** (HANDOFF URBAN TRAJECTORY RECIPE, `28339aa`+bank).
 - [ ] (follow-up) per-fix/multipath-aware `R` model + GPS-vs-GT frame-offset characterization; un-gated-NIS R calibration methodology.
