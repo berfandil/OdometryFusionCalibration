@@ -62,7 +62,18 @@ Real-data (orchestrator, post-merge):
 
 ## 5. Status
 - [x] Investigated (calibration.cpp lever path) + prototyped (`tools/proto_radar_lever.py`, `8df5de8`) — lateral lever recovers, along-track is a sensor SNR wall, `R_X`-from-prior is load-bearing.
-- [ ] Implemented (TDD, gate green, committed)
-- [ ] Reviewed + findings fixed
-- [ ] Real-data validation (nuScenes radar)
-- [ ] Docs updated (DECISIONS D30 / CONFIG / ISSUES) — orchestrator
+- [x] Implemented (TDD, gate green, committed `629d379`): `translation_only` flag pins rotation to prior (skip Phase-1 direction vote / rot3d / roll), lever LS runs with `R_X = prior`, scale kept. Along-track guard = the existing concentration gate withholds (no residual gate added). 8 unit cases.
+- [x] Reviewed (`reviews/slice-20-review.md`: APPROVE, clean) — byte-identical default-off verified incl. the scale-vote-drop equivalence the implementer self-caught.
+- [x] Real-data validation (nuScenes mini concat, 5 radars `translation_only=true`, lever perturbed +0.20 m) — see below.
+- [x] Docs updated (DECISIONS D30 / CONFIG / ISSUES) — orchestrator
+
+### Real-data result (nuScenes radar, 2026-06-15) — footgun FIXED, committed lever NOT delivered (honest)
+
+- **Footgun fix CONFIRMED on real radar**: every radar's `extr_rot = [0, 0, prior_yaw]`, conf 0 — exactly the prior, no spurious roll/pitch, nothing committed off prior. The pre-flag garbage (`rx -0.984` at conf 0.95) is GONE. Rotation is trusted-at-prior as designed. This is the primary, verified win + a real safety fix (a wrong rotation extrinsic was being fed back to fusion).
+- **The radar LEVER does NOT commit on real data** (conf 0 on all 5), and the readout OVERSHOOTS the lateral axis (src3 y: perturbed 1.0 -> readout 0.516 vs true 0.8; src6 y: -0.418 -> -0.710 vs -0.618) — noisy, NOT the ~cm clean recovery the prototype showed. Two causes: (1) `translation_confidence = min(cx,cy,cz)` and z is unobservable on planar -> the min is pinned at 0 -> the lever can never commit on planar driving (a structural min-over-unobservable-axis issue, not specific to this flag); (2) the PRODUCTION per-window / consensus-base estimator is materially noisier than the prototype's idealized GT-base BATCH LS -> the radar along-track Doppler noise dominates the per-window lever vote, so even the lateral axis does not concentrate to the commit gate.
+- **Lesson (the project's recurring one)**: the `proto_radar_lever.py` clean lateral recovery used GT-base + a single batch LS over all windows; the real estimator uses the consensus base + per-window histogram votes + the concentration commit gate. Do NOT claim a real-data win from an idealized prototype — the full production path revealed the gap. The flag + footgun fix are solid; committed lever recovery on real radar is NOT achieved.
+
+### Follow-ups (for committed radar lever recovery)
+1. **`min`-over-OBSERVED-axes lever confidence** for `translation_only` sources (exclude the planar-unobservable z from the commit min) — necessary but likely NOT sufficient on its own (the lateral votes still overshoot/scatter under real radar noise).
+2. **Lower per-window radar noise** — better Doppler ego-velocity (tighter RANSAC / scale handling), longer accumulation windows, or a batch/lever-only solve fed from the deeper calibration frontier rather than per-window histogram votes.
+3. The along-track axis remains a sensor SNR wall regardless (prototype-confirmed).
