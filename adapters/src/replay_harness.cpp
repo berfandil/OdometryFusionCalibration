@@ -337,7 +337,10 @@ void ReplayHarness::write_summary(std::ostream& os) const {
                << (c.extrinsic_committed ? ",committed" : "") << ")"
                << " lever[x,y,z]=[" << c.extrinsic.t.x() << "," << c.extrinsic.t.y() << ","
                << c.extrinsic.t.z() << "] (conf " << c.translation_confidence
-               << (c.translation_committed ? ",committed" : "") << ")\n";
+               << (c.translation_committed ? ",committed" : "") << ")"
+               << " lever_committed_xyz=[" << (c.translation_committed_xyz[0] ? 1 : 0) << ","
+               << (c.translation_committed_xyz[1] ? 1 : 0) << ","
+               << (c.translation_committed_xyz[2] ? 1 : 0) << "]\n";
         }
         // Slice-19c heading-monitor diagnostics (per source, last fused step): the
         // auto-discovered rotation-channel boost + drift score + scored flag, plus the
