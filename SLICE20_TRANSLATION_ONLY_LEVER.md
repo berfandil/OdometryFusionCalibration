@@ -60,6 +60,23 @@ Real-data (orchestrator, post-merge):
 - nuScenes mini concat (5 radars `translation_only=true`, true mounts as prior, lever perturbed +0.20 m): the LATERAL lever recovers toward truth (target ~the prototype's 5-25 cm), the along-track lever is WITHHELD (not committed wrong), no garbage radar rotation commits. Compare to the pre-flag run (all conf 0 / garbage rotation).
 - Sources without the flag on the same run unchanged.
 
+## 4b. Slice 20b — per-axis lever commit (the radar unlock)
+
+**Problem**: the lever commits as a whole 3-vector (`lever_committed[i]` gated on `translation_confidence` = min over axes). For a translation_only radar the clean LATERAL axis can never commit because the observed-but-NOISY along-track axis drags the min below the gate (min-over-observed got conf to 0.19-0.55, still < 0.6). The axes are independently observable — commit them independently.
+
+**Design (per-axis commit, translation_only sources ONLY — non-flagged stay whole-lever, byte-identical)**:
+- **Calibrator accessors** (per-axis values already exist in `xyz_[3*s+c]`): add `translation_confidence_axis(id, c)` = `xyz_[3*s+c].confidence()` and `xyz_axis_mass(id, c)` = `xyz_[3*s+c].total()`. `lever_arm(id)` already returns the per-axis 3-vector.
+- **Estimator**: `bool lever_committed_xyz[kMaxSourcesCap][3]`. For a translation_only source, replace the whole-lever gate with three per-axis `commit_gate_reanchor(prev_xyz[c], conf_axis(c), mass_axis(c), commit_concentration, commit_min_votes)` (same hysteresis, per axis). On a committed axis c, publish `prior_extrinsic[i].t[c] = lever_arm(id)[c]` (the other axes stay at prior). `lever_committed[i] = OR(lever_committed_xyz[i][*])` (drives `CalibSnapshot.translation_committed` + the existing median-join / serialize). Non-flagged sources: the existing whole-lever path UNCHANGED.
+- **Diagnostics**: add `CalibSnapshot.translation_committed_xyz[3]` (per-axis flags; whole `translation_committed` = OR). The replay summary can show which axes committed.
+- **Persistence**: serialize the 3 per-axis flags (format bump v4; pre-v4 blobs cold-start). For a non-flagged source the 3 mirror the whole flag.
+- **Outcome (radar)**: lateral axis (clean, `c >= 0.6`) COMMITS + folds into the prior; along-track (noisy, `c < 0.6`) + null z (empty) held at prior — never a wrong commit.
+
+**Acceptance (added to the 8)**:
+9. Per-axis headline (sim): a translation_only source clean on the lateral axis, noisy on along-track, null on z -> ONLY the lateral axis commits (folded into prior); along-track + z held at prior; per-axis flags correct; the whole `translation_committed` = OR.
+10. Non-flagged byte-identical (whole-lever path untouched; exact-equality pin).
+11. Persistence round-trips the per-axis flags (format v4; pre-v4 cold-start).
+12. Real-data: nuScenes radar LATERAL lever commits (if its concentration clears the gate) with along-track/z held — or an honest report if per-window radar noise keeps even the lateral below the gate.
+
 ## 5. Status
 - [x] Investigated (calibration.cpp lever path) + prototyped (`tools/proto_radar_lever.py`, `8df5de8`) — lateral lever recovers, along-track is a sensor SNR wall, `R_X`-from-prior is load-bearing.
 - [x] Implemented (TDD, gate green, committed `629d379`): `translation_only` flag pins rotation to prior (skip Phase-1 direction vote / rot3d / roll), lever LS runs with `R_X = prior`, scale kept. Along-track guard = the existing concentration gate withholds (no residual gate added). 8 unit cases.
