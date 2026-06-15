@@ -114,6 +114,54 @@ def static_filter(dets, B_R, B_t, dt, tau_v, min_rho=0.5):
     return kept
 
 
+# ---------- A (3D). full-3D static-object filter (4D / imaging radar; RADAR_SCAN_ODOMETRY.md sec 2) --
+def so3_log(R):
+    # Rotation vector (axis*angle, rad) of a 3x3 rotation. R is a plain list-of-lists.
+    tr = R[0][0] + R[1][1] + R[2][2]
+    c = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    th = math.acos(c)
+    if th < 1e-9:
+        # first-order: w = [R21-R12, R02-R20, R10-R01]/2
+        return [(R[2][1] - R[1][2]) * 0.5, (R[0][2] - R[2][0]) * 0.5, (R[1][0] - R[0][1]) * 0.5]
+    k = th / (2.0 * math.sin(th))
+    return [(R[2][1] - R[1][2]) * k, (R[0][2] - R[2][0]) * k, (R[1][0] - R[0][1]) * k]
+
+
+def twist_from_se3_3d(R, t, dt):
+    # Full-3D instantaneous twist (v in R^3, omega in R^3) from the radar's expected ego-motion
+    # (R 3x3, t 3) over dt. omega = log(R)/dt; for the tiny per-scan rotation the SE(3) left-Jacobian
+    # V^-1 ~ I, so v = t/dt is accurate to second order. Returns ((vx,vy,vz),(wx,wy,wz)).
+    w = so3_log(R)
+    return (t[0] / dt, t[1] / dt, t[2] / dt), (w[0] / dt, w[1] / dt, w[2] / dt)
+
+
+def static_filter_3d(dets, B_R, B_t, dt, tau_v, min_rho=0.5):
+    # The 3D analogue of static_filter for a 4D/imaging radar. dets: list of (x,y,z, vx,vy,vz) raw
+    # detections (3D position + 3D measured velocity). The velocity a STATIC world point at sensor
+    # position r would show is v_static = -(v + omega x r) with r,v,omega in R^3 (sec 2). Keep i iff
+    # the radial component of the measured velocity matches the radial component of v_static within
+    # tau_v. Return list of (x,y,z) kept positions.
+    if dt <= 0:
+        return [(x, y, z) for (x, y, z, _vx, _vy, _vz) in dets]
+    (v, omega) = twist_from_se3_3d(B_R, B_t, dt)
+    kept = []
+    for (x, y, z, vx, vy, vz) in dets:
+        rho = math.sqrt(x * x + y * y + z * z)
+        if rho < min_rho:
+            continue
+        ux, uy, uz = x / rho, y / rho, z / rho                 # unit bearing (3D)
+        meas_radial = vx * ux + vy * uy + vz * uz
+        # omega x r
+        cx = omega[1] * z - omega[2] * y
+        cy = omega[2] * x - omega[0] * z
+        cz = omega[0] * y - omega[1] * x
+        vs = (-(v[0] + cx), -(v[1] + cy), -(v[2] + cz))        # v_static = -(v + omega x r)
+        pred_radial = vs[0] * ux + vs[1] * uy + vs[2] * uz
+        if abs(meas_radial - pred_radial) < tau_v:
+            kept.append((x, y, z))
+    return kept
+
+
 # ---------- B. per-detection descriptor (sorted inter-point distance multiset) ----------
 def build_descriptors(pts):
     # pts: list of (x, y) (DIM-agnostic; here DIM=2). Return a list of sorted numpy distance arrays,
