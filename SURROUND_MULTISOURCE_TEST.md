@@ -57,5 +57,41 @@ All 4 surround cameras, each perturbed +5 deg, recovered **simultaneously** on B
 - **Bootstrap needs a non-poisoned consensus.** At the absurd ns=1 noise, urban12 also death-spiralled the perturbed-prior run; at realistic noise it recovers on both drives. The earlier single-source `inject_calib` recovery worked because the mis-calibrated source was a MINORITY against a good consensus; if excessive noise corrupts the consensus the calibrator has nothing clean to vote against.
 - The radars are a good **per-channel split-median** test: strong translation, weak heading -> reliability floors their rotation channel, the monitor keeps them off the heading podium, and their rotation extrinsic stays unobservable — all correct.
 
-## Follow-up (user-requested next step)
-**Real nuScenes per-sensor pipeline**: 6 surround cameras + 5 radars + IMU + wheel(CAN) + GT poses, with ACTUAL per-sensor odometry (run VO on the cameras + radar ego-velocity) instead of GT-synthesized streams. Heavier (download + per-sensor odometry pipelines, no odometry-quality GT), deferred to a follow-up session. The synthesized rig here is the rehearsal: it pins the conventions, the 9-source stability, and the quality-differentiation before the real-pipeline cost.
+---
+
+# Real nuScenes pipeline — 7 REAL sources (5 radar Doppler + CAN wheel + IMU)
+
+**Done (2026-06-15)**: the follow-up to the synthesized rig, with ACTUAL per-sensor odometry instead of GT-synthesis. Converter `tools/nuscenes_to_csv.py` (`799dcb8`); data nuScenes v1.0-mini + CAN-bus expansion at `C:\workspace\data\nuScenes`; run dir `nuscenes_run/` (gitignored). Cameras (real VO) deliberately deferred — radar+CAN first cut (user-chosen).
+
+## Rig (7 real sources, per nuScenes mini scene)
+
+| id | source | from | odometry |
+|---|---|---|---|
+| 0 | wheel (ref) | CAN `vehicle_monitor` (~2 Hz) | vehicle_speed (km/h) + yaw_rate (deg/s) -> 2D odom |
+| 1 | imu | CAN `ms_imu` (~100 Hz) raw gyro + wheel speed | gyro rotation (heading-grade) + forward |
+| 2-6 | radar x5 | each radar `.pcd` Doppler (~13 Hz) | seeded-RANSAC ego-velocity (Kellner radial, RAW vx/vy) -> translation; R=I + (0.3 rad)^2 rot var (heading-blind) |
+| GT | ego_pose | LiDAR-localization global poses | absolute track |
+
+Each radar's real `calibrated_sensor` mount -> `prior_extrinsic` (a REAL multi-extrinsic rig: 5 radars at genuinely different positions). Raw streams only — the CAN `pose` message (pre-filtered) is NOT used (raw-odometry input contract). No GPS block (ego_pose is GT only -> predict + calibrate, no absolute correction).
+
+## Results (scene-0061 92 m/19 s, scene-0796 237 m/20 s)
+
+**Converter self-check (unit/convention pin):** unit auto-pick resolved vehicle_speed=km/h, yaw_rate=deg/s (the m/s / rad/s readings were 3.6x / 57x off, rejected). Each source's dead-reckoned path tracks ego_pose GT within ~10%: wheel dist-ratio 0.93/0.97, radars 0.96-1.01 — EXCEPT RADAR_FRONT_LEFT on scene-0796 (real Doppler dropout on 147/270 sweeps -> those emit zero-trans + huge cov, fusion ignores them; flagged, not masked). This validates the radar ego-velocity math (raw vx/vy radial RANSAC, not the circular ego-compensated vx_comp).
+
+| metric | scene-0061 | scene-0796 |
+|---|---|---|
+| steps / fused | 977 / 969 | 987 / 979 |
+| tail trans / rot | 5.40 m / 0.112 rad | 9.17 m / 0.059 rad |
+| rms trans / rot | 3.88 m / 0.072 rad | 5.45 m / 0.043 rad |
+| pose NEES (DOF 6) | **1.59** | **2.57** |
+
+**Verdict: real 7-source fusion works and stays bounded** on genuine nuScenes sensor noise — all 5 radar Doppler streams + CAN wheel + CAN IMU fuse with no filter divergence; NEES 1.6/2.6 (conservative, no blow-up). Drift is pure dead-reckoning (no absolute correction by design) growing with path length (9 m over 237 m).
+
+## Limits (honest)
+- **20 s scenes -> no calibration convergence** (predicted): mounts stay near their priors; this run validates real-sensor FUSION + drift/consistency with mounts pinned, NOT extrinsic recovery. Recovery needs the longer trainval logs.
+- **Heading monitor inert here**: it scores against a GPS-derived course; with no GPS block there's no anchor (`scored=no`, boost 1 all). Radar-rotation down-weighting is done instead by the split median + the per-delta (0.3 rad)^2 rot covariance (rotation taken from wheel/imu). The 19b reliability layer is quiet on 20 s scenes (only wheel rel_rot=5) — too short to warm the EMA + radar R=I is not a scatter outlier.
+
+## Natural next steps
+- **Longer logs (trainval)** -> calibration convergence on the 5 real radar mounts (the real multi-extrinsic recovery).
+- **Noisy ego_pose as a sparse GPS-style correction** -> bounds the dead-reckoning drift AND activates the heading monitor (mildly circular since ego_pose is GT; a deliberate stand-in).
+- **Camera VO** (the deferred surround half) -> 6 real visual-odometry streams; the large, separate build.
