@@ -1341,6 +1341,25 @@ Scalar Phase2Calibrator::translation_confidence(SourceId id) const {
     return std::min(cx, std::min(cy, cz));
 }
 
+// Per-axis lever gate inputs (Slice 20b). axis in {0,1,2}; 0 for any out-of-range axis /
+// unconfigured / unknown source / empty channel (the histogram's own confidence()/total()
+// already return 0 when empty, so we only guard configured + slot + axis range here).
+Scalar Phase2Calibrator::translation_confidence_axis(SourceId id, int axis) const {
+    if (!configured_) return Scalar(0);
+    if (axis < 0 || axis > 2) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return xyz_[3 * s + axis].confidence();
+}
+
+Scalar Phase2Calibrator::xyz_axis_mass(SourceId id, int axis) const {
+    if (!configured_) return Scalar(0);
+    if (axis < 0 || axis > 2) return Scalar(0);
+    const int s = slot_for(id);
+    if (s < 0) return Scalar(0);
+    return xyz_[3 * s + axis].total();
+}
+
 Scalar Phase2Calibrator::roll_vote_count(SourceId id) const {
     if (!configured_) return Scalar(0);
     const int s = slot_for(id);

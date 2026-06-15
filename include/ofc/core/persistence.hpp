@@ -43,8 +43,12 @@ namespace persist {
 //        precedent — no cross-version migration shim).
 //   v3 — Slice 17b: per-source `scale2_committed` flag appended after rot3d_committed
 //        (old v1/v2 blobs reject -> cold start; same no-migration precedent).
+//   v4 -- Slice 20b: per-source PER-AXIS lever commit `lever_committed_xyz[3]` (3 bools)
+//        appended after scale2_committed (the whole `lever_committed` is the OR, derived on
+//        restore, not stored separately). Old v1/v2/v3 blobs reject -> cold start; same
+//        no-migration precedent.
 constexpr unsigned char kMagic[4]      = { 'O', 'F', 'C', 'P' };
-constexpr std::uint32_t kFormatVersion = 3u;
+constexpr std::uint32_t kFormatVersion = 4u;
 
 // FNV-1a (64-bit) over a byte span — the config_hash hash family. Deterministic, no deps,
 // strict-core (a plain loop, no heap). Stream more bytes by threading the returned state back

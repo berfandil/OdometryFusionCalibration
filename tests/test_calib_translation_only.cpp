@@ -602,3 +602,367 @@ TEST_CASE("trans-only observability: lever needs turns; pure-straight starves; m
         CHECK((cal.lever_arm(1) - t_X).norm() < Scalar(2e-3));
     }
 }
+
+// ===========================================================================
+// Slice 20b. PER-AXIS commit machinery
+// ===========================================================================
+
+// A PURE yaw-only (planar) turning trajectory: x = along-track, y = lateral, z = the planar
+// null. Straight segments give a clean reference-driven consensus; the yaw turns excite the
+// lever's x,y axes. No pitch (so z stays unobservable, the null axis stays at the prior).
+Trajectory yaw_only_traj() {
+    Trajectory tr;
+    Vec6 straight; straight << 2.0, 0, 0, 0, 0,  0;
+    Vec6 yawL;     yawL     << 2.0, 0, 0, 0, 0,  0.6;
+    Vec6 yawR;     yawR     << 2.0, 0, 0, 0, 0, -0.6;
+    for (int rep = 0; rep < 16; ++rep) {
+        tr.add_segment(straight, 0.6);
+        tr.add_segment(yawL, 1.6);
+        tr.add_segment(straight, 0.6);
+        tr.add_segment(yawR, 1.6);
+    }
+    return tr;
+}
+
+// 9. PER-AXIS HEADLINE (sim): a translation_only source on yaw-only planar motion, one lever
+//    axis CLEAN and one with heavy sensor drift (z = the planar null). The CLEAN axis commits
+//    while the NOISY axis + null z are each WITHHELD -- the capability the whole-lever min
+//    could not deliver. CONTRAST: the whole-lever min-over-observed confidence is BELOW the
+//    commit gate (the noisy axis drags the min down -> the whole-lever gate would NOT have
+//    committed), yet the per-axis clean-axis commit fires.
+//
+// AXIS NOTE: the lever LS couples the recovered xyz channels through the yaw rotation + the
+// mount, so a sensor-frame noise direction does NOT map 1:1 to a recovered channel. With this
+// mount (yaw 20) + this geometry the sensor-x Doppler drift leaves the RECOVERED x channel
+// concentrated (clean) and scatters the RECOVERED y channel (measured below: cx ~ 0.61,
+// cy ~ 0.17). So the CLEAN committed axis here is x, the WITHHELD noisy axis is y. The slice
+// capability (one axis commits, the other is held) is what is pinned -- not a fixed label.
+TEST_CASE("trans-only 20b per-axis headline: clean axis commits, noisy axis + null z withheld") {
+    const SE3 X = make_extrinsic(20 * kPi / 180, 0, 0, Vec3(0.7, 0.25, 0.0));
+    const Vec3 t_X = X.t;
+    const Config cfg = make_p2_cfg();
+    const Scalar gate = cfg.commit_concentration;
+
+    // --- (A) CALIBRATOR-LEVEL per-axis separation (deterministic; pins the accessors) ----
+    // The same noisy along-track rig as the existing case-3 measurement. Sensor-x drift 0.5 m.
+    auto calxp = make_p2(); Phase2Calibrator& calx = *calxp;
+    REQUIRE(calx.configure(cfg, 0) == Status::Ok);
+    REQUIRE(calx.set_prior(1, X, /*scale_calib=*/true, /*translation_only=*/true) == Status::Ok);
+    feed_trans_only(calx, 1, X, t_X, 400, /*multiaxis=*/false, Vec3(Scalar(0.5), Scalar(0.01), 0));
+
+    const Scalar cx = calx.translation_confidence_axis(1, 0);
+    const Scalar cy = calx.translation_confidence_axis(1, 1);
+    const Scalar cz = calx.translation_confidence_axis(1, 2);
+    INFO("per-axis conf: cx=" << cx << " cy=" << cy << " cz=" << cz
+         << "  whole=" << calx.translation_confidence(1) << "  gate=" << gate);
+    // The CLEAN axis (x) clears the gate; the NOISY axis (y) does not; z is the empty null.
+    CHECK(cx >= gate);                          // clean axis -> per-axis commit eligible
+    CHECK(cy <  gate);                          // noisy axis -> per-axis WITHHELD
+    CHECK(cz == Scalar(0));                      // planar null z -> empty
+    // The accessors expose REAL vote mass on the observed axes, none on the null z.
+    CHECK(calx.xyz_axis_mass(1, 0) > Scalar(0));
+    CHECK(calx.xyz_axis_mass(1, 1) > Scalar(0));
+    CHECK(calx.xyz_axis_mass(1, 2) == Scalar(0));
+    // Out-of-range axis -> 0 (defensive).
+    CHECK(calx.translation_confidence_axis(1, 3) == Scalar(0));
+    CHECK(calx.xyz_axis_mass(1, -1) == Scalar(0));
+    // The recovered CLEAN-axis lever is near truth (x err < 2 cm); the recovered value lives
+    // in lever_arm()[0]. (The noisy y is scattered -- it is exactly why it is withheld.)
+    CHECK(std::abs(calx.lever_arm(1).x() - t_X.x()) < Scalar(0.02));
+    // THE CONTRAST: the whole-lever min-over-observed confidence is BELOW the gate (cy drags
+    // it down) -> the whole-lever gate would NOT have committed, yet the per-axis x clears it.
+    CHECK(calx.translation_confidence(1) < gate);
+    CHECK(cx >= gate);
+
+    // --- (B) ESTIMATOR-LEVEL per-axis commit + publish (the feedback loop) ----------------
+    // Drive the full estimator with the same kind of source; assert the per-axis COMMIT flags
+    // split (one axis committed, the other withheld) and the whole flag is the OR. The per-axis
+    // PUBLISH into the fusion prior (committed axis folded, withheld axis held at prior) is
+    // pinned via the persistence blob in the 20b persistence test (the blob carries the real
+    // prior_extrinsic; the snapshot's extrinsic.t is the calibrator lever readout, not the
+    // fusion prior). The estimator path is noisier than the calibrator, so use a drift level
+    // that splits the commit cleanly (sensor-x 0.3 m).
+    const Trajectory tr = yaw_only_traj();
+    const SE3 X1 = make_extrinsic(3 * kPi / 180, 0, 0, Vec3(0.1, 0.05, 0.0));
+    const SE3 X2 = make_extrinsic(-4 * kPi / 180, 0, 0, Vec3(-0.1, 0.0, 0.05));
+    SourceParams p0; p0.id = 0;
+    SourceParams p1; p1.id = 1; p1.X = X1;
+    SourceParams p2; p2.id = 2; p2.X = X2;
+    SyntheticSource s0(tr, p0), s1(tr, p1), s2(tr, p2);
+    RadarSource radar(3, tr, X, Vec3(Scalar(0.3), Scalar(0.002), Scalar(0.0)), /*seed=*/4242);
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[0].is_reference = true;
+    sensors[1].prior_extrinsic = X1;
+    sensors[2].prior_extrinsic = X2;
+    sensors[3].prior_extrinsic = X;
+    sensors[3].translation_only = true;
+    sensors[3].scale_calib = false;
+
+    Config ecfg; set_hists(ecfg);
+    ecfg.reference_sensor_id = 0;
+    ecfg.cold_start = ColdStart::MedianFromStart;
+    ecfg.commit_concentration = 0.5; ecfg.commit_min_votes = 30; ecfg.commit_drop = 0.2;
+    ecfg.sensors = sensors.data(); ecfg.sensor_count = 4;
+    REQUIRE(validate(ecfg) == Status::Ok);
+
+    Estimator est;
+    REQUIRE(est.init(ecfg) == Status::Ok);
+    REQUIRE(est.add_source(&s0) == Status::Ok);
+    REQUIRE(est.add_source(&s1) == Status::Ok);
+    REQUIRE(est.add_source(&s2) == Status::Ok);
+    REQUIRE(est.add_source(&radar) == Status::Ok);
+
+    const Timestamp step_ns = static_cast<Timestamp>(std::llround(1e9 / 50.0));
+    const Timestamp t_end = static_cast<Timestamp>(std::llround((tr.duration_s() - 0.1) * 1e9));
+    for (Timestamp now = static_cast<Timestamp>(std::llround(0.2 * 1e9)); now < t_end; now += step_ns) {
+        est.step(now);
+    }
+
+    const CalibSnapshot* cs = snap(est.latest(), 3);
+    REQUIRE(cs != nullptr);
+    INFO("estimator per-axis flags = {" << cs->translation_committed_xyz[0] << ","
+         << cs->translation_committed_xyz[1] << "," << cs->translation_committed_xyz[2] << "}");
+    // The per-axis commit SPLIT: exactly the clean axis (x) committed; the noisy (y) + null z
+    // are withheld. The whole flag is the OR.
+    CHECK(cs->translation_committed_xyz[0]);          // clean axis committed
+    CHECK_FALSE(cs->translation_committed_xyz[1]);    // noisy axis withheld
+    CHECK_FALSE(cs->translation_committed_xyz[2]);    // null z withheld
+    CHECK(cs->translation_committed);                  // whole flag = OR = true
+    // The whole-lever min could NOT have committed (the noisy axis keeps the min under gate),
+    // yet a per-axis commit fired -> the 20b unlock.
+    CHECK(cs->translation_confidence < ecfg.commit_concentration);
+    // The footgun stays fixed: rotation extrinsic never moved off the prior, not committed.
+    CHECK(so3::log(cs->extrinsic.R * X.R.transpose()).norm() < Scalar(1e-9));
+    CHECK_FALSE(cs->extrinsic_committed);
+}
+
+// 10. NON-FLAGGED BYTE-IDENTICAL: a NORMAL (non-translation_only) source's lever commit +
+//     published prior_extrinsic.t + per-axis snapshot flags follow the WHOLE-lever path
+//     exactly. The per-axis array mirrors the whole flag (all 3 == translation_committed),
+//     and the whole-lever publish is unchanged. (The wider byte-identical guarantee is the
+//     untouched existing calib + golden suites; here we pin the per-axis mirror invariant.)
+TEST_CASE("trans-only 20b non-flagged: per-axis array mirrors the whole-lever flag") {
+    const Trajectory tr = turn_rich_traj();
+
+    // A normal rig: reference + 3 NORMAL odom sources (NO translation_only anywhere).
+    const SE3 X1 = make_extrinsic(3 * kPi / 180, 0, 0, Vec3(0.1, 0.05, 0.0));
+    const SE3 X2 = make_extrinsic(-4 * kPi / 180, 2 * kPi / 180, 0, Vec3(-0.1, 0.0, 0.05));
+    const SE3 X3 = make_extrinsic(6 * kPi / 180, -3 * kPi / 180, 0, Vec3(0.2, -0.15, 0.08));
+
+    SourceParams p0; p0.id = 0;
+    SourceParams p1; p1.id = 1; p1.X = X1;
+    SourceParams p2; p2.id = 2; p2.X = X2;
+    SourceParams p3; p3.id = 3; p3.X = X3;
+    SyntheticSource s0(tr, p0), s1(tr, p1), s2(tr, p2), s3(tr, p3);
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[0].is_reference = true;
+    sensors[1].prior_extrinsic = X1;
+    sensors[2].prior_extrinsic = X2;
+    sensors[3].prior_extrinsic = X3;
+    sensors[3].scale_calib = false;
+    // NO translation_only flag set on any source.
+
+    Config cfg; set_hists(cfg);
+    cfg.reference_sensor_id = 0;
+    cfg.cold_start = ColdStart::MedianFromStart;
+    cfg.commit_concentration = 0.5; cfg.commit_min_votes = 30; cfg.commit_drop = 0.2;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+    REQUIRE(validate(cfg) == Status::Ok);
+
+    Estimator est;
+    REQUIRE(est.init(cfg) == Status::Ok);
+    REQUIRE(est.add_source(&s0) == Status::Ok);
+    REQUIRE(est.add_source(&s1) == Status::Ok);
+    REQUIRE(est.add_source(&s2) == Status::Ok);
+    REQUIRE(est.add_source(&s3) == Status::Ok);
+
+    const Timestamp step_ns = static_cast<Timestamp>(std::llround(1e9 / 50.0));
+    const Timestamp t_end = static_cast<Timestamp>(std::llround((tr.duration_s() - 0.1) * 1e9));
+    // Walk EVERY published snapshot: for a non-flagged source the per-axis array must, at
+    // every step, equal {whole, whole, whole} -- the whole-lever path drives all three.
+    for (Timestamp now = static_cast<Timestamp>(std::llround(0.2 * 1e9)); now < t_end; now += step_ns) {
+        est.step(now);
+        const Result& r = est.latest();
+        for (int k = 0; k < r.source_count; ++k) {
+            const CalibSnapshot& c = r.calib[k];
+            const bool whole = c.translation_committed;
+            CHECK(c.translation_committed_xyz[0] == whole);
+            CHECK(c.translation_committed_xyz[1] == whole);
+            CHECK(c.translation_committed_xyz[2] == whole);
+        }
+    }
+
+    // Source 3's lever committed via the WHOLE-lever path (the multi-axis turns observe all 3).
+    const CalibSnapshot* cs = snap(est.latest(), 3);
+    REQUIRE(cs != nullptr);
+    CHECK(cs->translation_committed);
+    CHECK(cs->translation_committed_xyz[0]);
+    CHECK(cs->translation_committed_xyz[1]);
+    CHECK(cs->translation_committed_xyz[2]);
+    CHECK((cs->extrinsic.t - X3.t).norm() < Scalar(0.04));
+}
+
+// 11. PERSISTENCE: serialize a rig with a translation_only source MID per-axis commit (lateral
+//     committed, along-track not) -> deserialize into a fresh estimator -> the per-axis flags +
+//     the per-axis folded prior round-trip; a pre-v4 (stamped v3) blob cold-starts (rejected by
+//     the version guard).
+TEST_CASE("trans-only 20b persistence: per-axis flags + folded prior round-trip; pre-v4 rejects") {
+    const Trajectory tr = yaw_only_traj();
+
+    const SE3 X1 = make_extrinsic(3 * kPi / 180, 0, 0, Vec3(0.1, 0.05, 0.0));
+    const SE3 X2 = make_extrinsic(-4 * kPi / 180, 0, 0, Vec3(-0.1, 0.0, 0.05));
+    const SE3 Xr = make_extrinsic(20 * kPi / 180, 0, 0, Vec3(0.7, 0.25, 0.0));
+
+    SourceParams p0; p0.id = 0;
+    SourceParams p1; p1.id = 1; p1.X = X1;
+    SourceParams p2; p2.id = 2; p2.X = X2;
+    SyntheticSource s0(tr, p0), s1(tr, p1), s2(tr, p2);
+    // Sensor-x 0.3 m drift -> the recovered x channel commits, the scattered y is withheld
+    // (same split as the 20b per-axis headline), so the rig is genuinely MID per-axis commit.
+    RadarSource radar(3, tr, Xr, Vec3(Scalar(0.3), Scalar(0.002), Scalar(0.0)), /*seed=*/4242);
+
+    std::vector<SensorConfig> sensors(4);
+    for (int i = 0; i < 4; ++i) sensors[i].id = static_cast<SourceId>(i);
+    sensors[0].is_reference = true;
+    sensors[1].prior_extrinsic = X1;
+    sensors[2].prior_extrinsic = X2;
+    sensors[3].prior_extrinsic = Xr;
+    sensors[3].translation_only = true;
+    sensors[3].scale_calib = false;
+
+    Config cfg; set_hists(cfg);
+    cfg.reference_sensor_id = 0;
+    cfg.cold_start = ColdStart::MedianFromStart;
+    cfg.commit_concentration = 0.5; cfg.commit_min_votes = 30; cfg.commit_drop = 0.2;
+    cfg.sensors = sensors.data(); cfg.sensor_count = 4;
+    REQUIRE(validate(cfg) == Status::Ok);
+
+    Estimator est;
+    REQUIRE(est.init(cfg) == Status::Ok);
+    REQUIRE(est.add_source(&s0) == Status::Ok);
+    REQUIRE(est.add_source(&s1) == Status::Ok);
+    REQUIRE(est.add_source(&s2) == Status::Ok);
+    REQUIRE(est.add_source(&radar) == Status::Ok);
+
+    const Timestamp step_ns = static_cast<Timestamp>(std::llround(1e9 / 50.0));
+    const Timestamp t_end = static_cast<Timestamp>(std::llround((tr.duration_s() - 0.1) * 1e9));
+    for (Timestamp now = static_cast<Timestamp>(std::llround(0.2 * 1e9)); now < t_end; now += step_ns) {
+        est.step(now);
+    }
+
+    const CalibSnapshot* cs = snap(est.latest(), 3);
+    REQUIRE(cs != nullptr);
+    // Confirm the pre-condition the round-trip must preserve: the clean x axis committed, the
+    // noisy y NOT, the null z NOT (the rig is genuinely MID per-axis commit).
+    REQUIRE(cs->translation_committed_xyz[0]);
+    REQUIRE_FALSE(cs->translation_committed_xyz[1]);
+    REQUIRE_FALSE(cs->translation_committed_xyz[2]);
+
+    // Format must be v4 (the Slice-20b bump).
+    REQUIRE(persist::kFormatVersion == 4u);
+
+    unsigned char blob[8192];
+    const Expected<int> wr = est.serialize(blob, sizeof(blob));
+    REQUIRE(wr.ok());
+
+    // PER-AXIS FOLD PIN (parse the blob's fusion prior_extrinsic directly): the persisted
+    // prior_extrinsic.t must have the COMMITTED x axis FOLDED off the prior (the recovered
+    // lever) while the withheld y + null z stay EXACTLY at the prior (Xr.t). This pins the
+    // per-axis publish (the snapshot's extrinsic.t is the calibrator readout, not the fusion
+    // prior -- so parse the blob, which carries the real prior). Schema: estimator.cpp serialize().
+    Vec3 prior_t_persisted;
+    {
+        persist::Reader pr(blob + 20, wr.value() - 24);   // skip header; drop checksum
+        const int n_rec = pr.get_i32();
+        (void)pr.get_i32();          // phase
+        (void)pr.get_bool();         // ever_fused
+        bool found = false;
+        for (int i = 0; i < n_rec; ++i) {
+            const SourceId rid = static_cast<SourceId>(pr.get_i32());
+            const SE3 Xp = pr.get_se3();
+            (void)pr.get_f64();      // prior_scale
+            (void)pr.get_f64();      // time_offset
+            // 5 base + rot3d + scale2 + 3 per-axis lever (v4) = 10 commit flags.
+            bool flags[10];
+            for (int b = 0; b < 10; ++b) flags[b] = pr.get_bool();
+            (void)pr.get_f64(); (void)pr.get_f64(); (void)pr.get_f64();   // EMA triple
+            (void)pr.get_i32();      // resid_n
+            if (rid == 3) {
+                found = true;
+                prior_t_persisted = Xp.t;
+                // The persisted per-axis flags (positions 7,8,9) match the snapshot split.
+                CHECK(flags[7]);            // x committed
+                CHECK_FALSE(flags[8]);      // y withheld
+                CHECK_FALSE(flags[9]);      // z withheld
+            }
+        }
+        REQUIRE(found);
+        REQUIRE_FALSE(pr.underflow);
+    }
+    // x folded OFF the prior (the recovered lever); y, z held EXACTLY at the prior.
+    CHECK(std::abs(prior_t_persisted.x() - Xr.t.x()) > Scalar(0.02));   // x moved off prior
+    CHECK(std::abs(prior_t_persisted.y() - Xr.t.y()) < Scalar(1e-12));  // y == prior
+    CHECK(std::abs(prior_t_persisted.z() - Xr.t.z()) < Scalar(1e-12));  // z == prior
+
+    // Restore into a fresh estimator with the SAME rig.
+    Estimator fresh;
+    REQUIRE(fresh.init(cfg) == Status::Ok);
+    REQUIRE(fresh.add_source(&s0) == Status::Ok);
+    REQUIRE(fresh.add_source(&s1) == Status::Ok);
+    REQUIRE(fresh.add_source(&s2) == Status::Ok);
+    REQUIRE(fresh.add_source(&radar) == Status::Ok);
+    REQUIRE(fresh.deserialize(blob, wr.value()) == Status::Ok);
+
+    // Drive ONE step so the restored snapshot republishes from the restored state (the commit
+    // flags are held through the empty refilling histogram by the per-axis re-fill hysteresis).
+    fresh.step(static_cast<Timestamp>(std::llround(0.2 * 1e9)));
+    const CalibSnapshot* cf = snap(fresh.latest(), 3);
+    REQUIRE(cf != nullptr);
+    INFO("restored per-axis flags = {" << cf->translation_committed_xyz[0] << ","
+         << cf->translation_committed_xyz[1] << "," << cf->translation_committed_xyz[2] << "}");
+    // The per-axis flags round-tripped (held through the empty refilling histogram).
+    CHECK(cf->translation_committed_xyz[0]);
+    CHECK_FALSE(cf->translation_committed_xyz[1]);
+    CHECK_FALSE(cf->translation_committed_xyz[2]);
+    CHECK(cf->translation_committed);                 // whole = OR
+
+    // RE-SERIALIZE round-trip: the restored estimator serializes the per-axis flags + folded
+    // prior BYTE-IDENTICAL (before any new votes shift the histogram), proving the v4 flags +
+    // the per-axis prior survive a full save -> restore -> save cycle.
+    unsigned char blob2[8192];
+    {
+        Estimator fresh2;
+        REQUIRE(fresh2.init(cfg) == Status::Ok);
+        REQUIRE(fresh2.add_source(&s0) == Status::Ok);
+        REQUIRE(fresh2.add_source(&s1) == Status::Ok);
+        REQUIRE(fresh2.add_source(&s2) == Status::Ok);
+        REQUIRE(fresh2.add_source(&radar) == Status::Ok);
+        REQUIRE(fresh2.deserialize(blob, wr.value()) == Status::Ok);
+        const Expected<int> wr2 = fresh2.serialize(blob2, sizeof(blob2));
+        REQUIRE(wr2.ok());
+        REQUIRE(wr2.value() == wr.value());
+        bool same = true;
+        for (int i = 0; i < wr.value(); ++i) if (blob[i] != blob2[i]) { same = false; break; }
+        CHECK(same);
+    }
+
+    // A pre-v4 (stamped v3) blob cold-starts (rejected by the version guard -- old blobs never
+    // restore the new per-axis flags; the established no-migration precedent).
+    {
+        unsigned char old_blob[8192];
+        for (int i = 0; i < wr.value(); ++i) old_blob[i] = blob[i];
+        old_blob[4] = 3u;                             // version word (LE) -> 3 (pre-20b)
+        old_blob[5] = old_blob[6] = old_blob[7] = 0u;
+        Estimator v3est;
+        REQUIRE(v3est.init(cfg) == Status::Ok);
+        REQUIRE(v3est.add_source(&s0) == Status::Ok);
+        REQUIRE(v3est.add_source(&s1) == Status::Ok);
+        REQUIRE(v3est.add_source(&s2) == Status::Ok);
+        REQUIRE(v3est.add_source(&radar) == Status::Ok);
+        CHECK(v3est.deserialize(old_blob, wr.value()) == Status::VersionMismatch);
+    }
+}

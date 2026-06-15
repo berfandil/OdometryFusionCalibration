@@ -79,7 +79,13 @@ struct CalibSnapshot {
     bool     committed     = false;     // TIME-OFFSET commit (Slice 5)
     bool     extrinsic_committed     = false; // rotation commit: yaw/pitch OR rot3d (Slice 8/17)
     bool     scale_committed         = false; // scale commit (Slice 8)
-    bool     translation_committed   = false; // xyz lever-arm commit (Slice 8)
+    bool     translation_committed   = false; // xyz lever-arm commit (Slice 8; = OR over axes)
+    // Per-axis lever commit (Slice 20b). For a translation_only source each lever axis
+    // commits independently (the clean lateral axis can commit while a noisy along-track /
+    // the planar-null z stay at the prior); translation_committed above is the OR. For a
+    // NON-translation_only source all three mirror the whole flag (the whole-lever path is
+    // unchanged). axis order [x, y, z]; default false.
+    bool     translation_committed_xyz[3] = { false, false, false };
 };
 
 // Per-source diagnostics (populated when Config::emit_diagnostics).

@@ -576,6 +576,16 @@ public:
     // 0 for an unvoted / unknown source.
     Scalar translation_confidence(SourceId id) const;
 
+    // Per-axis lever readouts (Slice 20b -- per-axis commit). The WHOLE-lever
+    // translation_confidence() takes a min over (observed) axes, which a single noisy axis
+    // drags below the commit gate even when the other axis is clean; PER-AXIS commit reads
+    // each axis's own concentration / vote mass so the clean axis can commit independently.
+    // `axis` in {0=x, 1=y, 2=z}. 0 for an unconfigured / unknown / out-of-range axis or an
+    // empty channel (matches the whole-lever convention for the corresponding inputs).
+    // lever_arm(id) already returns the per-axis 3-vector; these add the per-axis gate inputs.
+    Scalar translation_confidence_axis(SourceId id, int axis) const;   // xyz_[3s+c].confidence()
+    Scalar xyz_axis_mass(SourceId id, int axis) const;                 // xyz_[3s+c].total()
+
     bool     configured() const { return configured_; }
     SourceId reference()  const { return reference_id_; }
     Scalar   roll_vote_count(SourceId id) const;     // roll-histogram total mass

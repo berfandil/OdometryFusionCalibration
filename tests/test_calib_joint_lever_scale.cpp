@@ -665,8 +665,11 @@ TEST_CASE("joint lever+scale estimator: scale2 commits + folds on a turn-only ri
     }
     CHECK(seen_commit);
 
-    // --- (6) Persistence: v3 round-trip; v2-stamp reject; config-hash flip ----------
-    REQUIRE(persist::kFormatVersion == 3u);          // this slice's bump (pin it)
+    // --- (6) Persistence: current-version round-trip; old-stamp reject; config-hash flip ---
+    // The format version is now v4 (Slice 20b appended the per-axis lever flags). This test's
+    // round-trip + the old-stamp reject below are version-agnostic; we just track the live
+    // constant so a future bump that forgot this round-trip stands out.
+    REQUIRE(persist::kFormatVersion == 4u);
     unsigned char blob[8192];
     const Expected<int> wr = rig.estimator().serialize(blob, sizeof(blob));
     REQUIRE(wr.ok());

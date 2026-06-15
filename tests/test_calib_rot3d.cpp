@@ -687,7 +687,8 @@ TEST_CASE("rot3d estimator: commits on turn-only multi-axis motion, converges fr
             const SE3 Xp = pr.get_se3();
             (void)pr.get_f64();      // prior_scale
             (void)pr.get_f64();      // time_offset
-            for (int b = 0; b < 7; ++b) (void)pr.get_bool();   // 5 + rot3d + scale2 (17b) flags
+            // 5 base flags + rot3d (v2) + scale2 (v3) + 3 per-axis lever flags (v4) = 10.
+            for (int b = 0; b < 10; ++b) (void)pr.get_bool();
             (void)pr.get_f64(); (void)pr.get_f64(); (void)pr.get_f64();   // EMA triple
             (void)pr.get_i32();      // resid_n
             if (rid == 3) {

@@ -434,7 +434,14 @@ struct Estimator::Impl {
     // result is published — so a step() never sees a half-updated prior (atomic swap).
     bool     ext_committed[kMaxSourcesCap]   = {};   // yaw/pitch (so(3) direction)
     bool     roll_committed[kMaxSourcesCap]  = {};   // roll about forward
-    bool     lever_committed[kMaxSourcesCap] = {};   // xyz lever arm
+    bool     lever_committed[kMaxSourcesCap] = {};   // xyz lever arm (= OR over the 3 axes)
+    // Per-AXIS lever commit (Slice 20b). For a translation_only source each lever axis gates
+    // independently (clean lateral commits while the noisy along-track / null z stay at the
+    // prior -- the whole-lever min could never deliver that); lever_committed[i] is the OR.
+    // For a NON-translation_only source the whole-lever gate is unchanged and these 3 just
+    // MIRROR lever_committed[i] (so the publish below fires all 3 == the whole-vector publish,
+    // byte-identical, and the per-axis array stays consistent for serialize + the snapshot).
+    bool     lever_committed_xyz[kMaxSourcesCap][3] = {};
     bool     scale_committed[kMaxSourcesCap] = {};   // per-source scale
     // Turn-regime joint scale (Slice 17b, only when cfg.joint_lever_scale). The SECOND
     // scale path: calib2's scale2 (the κ axis of the joint 4-unknown lever+scale LS,
@@ -742,6 +749,8 @@ struct Estimator::Impl {
             if (id == cfg.reference_sensor_id) {
                 ext_committed[i] = roll_committed[i] = false;
                 lever_committed[i] = scale_committed[i] = false;
+                lever_committed_xyz[i][0] = lever_committed_xyz[i][1] =
+                    lever_committed_xyz[i][2] = false;   // Slice 20b: keep the array consistent
                 rot3d_committed[i] = false;
                 scale2_committed[i] = false;
                 continue;
@@ -776,10 +785,33 @@ struct Estimator::Impl {
                 cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
 
             // --- xyz lever arm -------------------------------------------------------
+            // Slice 20b PER-AXIS commit for a translation_only source: each lever axis gates
+            // on ITS OWN concentration + vote mass (same commit_gate_reanchor hysteresis as
+            // the whole gate), so the clean lateral axis commits while a noisy along-track /
+            // the empty planar-null z each stay at the prior. The whole flag = the OR (drives
+            // the snapshot translation_committed + the median-join via participates()).
+            // NON-translation_only: the EXISTING whole-lever gate is untouched (byte-identical),
+            // and the per-axis array just MIRRORS the whole flag so the publish + serialize
+            // below stay consistent (all 3 fire == the whole-vector publish).
             const bool was_lever = lever_committed[i];
-            lever_committed[i] = commit_gate_reanchor(
-                was_lever, calib2.translation_confidence(id), calib2.xyz_vote_count(id),
-                cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+            if (tonly) {
+                for (int c = 0; c < 3; ++c) {
+                    lever_committed_xyz[i][c] = commit_gate_reanchor(
+                        lever_committed_xyz[i][c],
+                        calib2.translation_confidence_axis(id, c),
+                        calib2.xyz_axis_mass(id, c),
+                        cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+                }
+                lever_committed[i] = lever_committed_xyz[i][0] ||
+                                     lever_committed_xyz[i][1] ||
+                                     lever_committed_xyz[i][2];
+            } else {
+                lever_committed[i] = commit_gate_reanchor(
+                    was_lever, calib2.translation_confidence(id), calib2.xyz_vote_count(id),
+                    cfg.commit_concentration, cfg.commit_min_votes, cfg.commit_drop);
+                lever_committed_xyz[i][0] = lever_committed_xyz[i][1] =
+                    lever_committed_xyz[i][2] = lever_committed[i];
+            }
 
             // --- scale ---------------------------------------------------------------
             const bool was_scale = scale_committed[i];
@@ -847,8 +879,15 @@ struct Estimator::Impl {
                 prior_extrinsic[i].R = roll_committed[i] ? calib2.extrinsic(id).R
                                                          : R_yp_committed;
             }
-            if (lever_committed[i]) {
-                prior_extrinsic[i].t = calib2.lever_arm(id);
+            // PER-AXIS lever publish (Slice 20b): fold each COMMITTED axis's recovered value
+            // into the fusion prior, leaving an uncommitted axis at the prior. For a non-
+            // flagged committed source all 3 fire -> byte-identical to the old whole-vector
+            // `prior_extrinsic[i].t = lever_arm(id)`. lever_arm(id) reads the running per-axis
+            // modes (empty/unobserved axis falls back to prior.t internally).
+            for (int c = 0; c < 3; ++c) {
+                if (lever_committed_xyz[i][c]) {
+                    prior_extrinsic[i].t[c] = calib2.lever_arm(id)[c];
+                }
             }
             // === ROT3D publish precedence (Slice 17) =================================
             // A committed rot3d SUPERSEDES the yaw/pitch ∘ roll rotation published above:
@@ -998,6 +1037,9 @@ Status Estimator::init(const Config& cfg) {
         impl_->ext_committed[i]     = false;
         impl_->roll_committed[i]    = false;
         impl_->lever_committed[i]   = false;
+        impl_->lever_committed_xyz[i][0] = false;   // Slice 20b: per-axis lever commit
+        impl_->lever_committed_xyz[i][1] = false;
+        impl_->lever_committed_xyz[i][2] = false;
         impl_->scale_committed[i]   = false;
         impl_->rot3d_committed[i]   = false;
         impl_->scale2_committed[i]  = false;
@@ -1792,6 +1834,13 @@ Status Estimator::step(Timestamp now) {
         // false when joint_lever_scale is off (the byte-identical default).
         cs.scale_committed       = s.scale_committed[i] || s.scale2_committed[i];
         cs.translation_committed = s.lever_committed[i];
+        // Per-axis lever commit (Slice 20b): which lever axes are individually driving the
+        // fusion prior. For a translation_only source these can differ (clean lateral committed,
+        // noisy along-track / null z held at prior); for a non-flagged source all 3 mirror the
+        // whole flag. translation_committed above is the OR.
+        cs.translation_committed_xyz[0] = s.lever_committed_xyz[i][0];
+        cs.translation_committed_xyz[1] = s.lever_committed_xyz[i][1];
+        cs.translation_committed_xyz[2] = s.lever_committed_xyz[i][2];
         // Per-source bias states (Slice 11b): the bias DOF is filled AFTER the predict/update
         // below (it reflects this step's de-bias + any absolute-ref injection), not here.
         cs.bias            = Vec6::Zero();
@@ -2181,6 +2230,13 @@ bool Estimator::rot3d_committed(SourceId id) const {
 //                                        the re-fill hold. The joint accumulator / scale2
 //                                        histogram are NOT persisted — they re-fill. Schema
 //                                        change -> format v3.)
+//     uint8  lever_committed_xyz[3]     (Slice 20b -- the PER-AXIS lever commit flags; the
+//                                        committed lever VALUE lives in prior_extrinsic.t
+//                                        above (per axis). The whole lever_committed bool is
+//                                        the OR, re-derived on restore. Each flag drives the
+//                                        per-axis re-fill hold (commit_gate_reanchor prev=true)
+//                                        through the empty post-restore xyz histogram. Schema
+//                                        change -> format v4.)
 //     f64    resid_mean, resid_var, reliability
 //     int32  resid_n
 Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
@@ -2214,6 +2270,12 @@ Expected<int> Estimator::serialize(unsigned char* buf, int cap) const {
         pw.put_bool(s.offset_committed[i]);
         pw.put_bool(s.rot3d_committed[i]);   // Slice 17 (format v2)
         pw.put_bool(s.scale2_committed[i]);  // Slice 17b (format v3)
+        // Slice 20b (format v4): the 3 PER-AXIS lever commit flags. The whole lever_committed
+        // bool above is the OR (kept in place; on restore the OR is re-derived from these so
+        // they stay consistent). For a non-flagged source all 3 == the whole flag.
+        pw.put_bool(s.lever_committed_xyz[i][0]);
+        pw.put_bool(s.lever_committed_xyz[i][1]);
+        pw.put_bool(s.lever_committed_xyz[i][2]);
         pw.put_f64(s.resid_mean[i]);
         pw.put_f64(s.resid_var[i]);
         pw.put_f64(s.reliability[i]);
@@ -2292,6 +2354,7 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         Scalar   prior_scale;
         Scalar   time_offset;
         bool     ext_c, roll_c, lever_c, scale_c, offset_c, rot3d_c, scale2_c;
+        bool     lever_c_xyz[3];   // Slice 20b (format v4)
         Scalar   resid_mean, resid_var, reliability;
         int      resid_n;
     };
@@ -2309,6 +2372,9 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         rc.offset_c        = pr.get_bool();
         rc.rot3d_c         = pr.get_bool();   // Slice 17 (format v2)
         rc.scale2_c        = pr.get_bool();   // Slice 17b (format v3)
+        rc.lever_c_xyz[0]  = pr.get_bool();   // Slice 20b (format v4)
+        rc.lever_c_xyz[1]  = pr.get_bool();
+        rc.lever_c_xyz[2]  = pr.get_bool();
         rc.resid_mean      = pr.get_f64();
         rc.resid_var       = pr.get_f64();
         rc.reliability     = pr.get_f64();
@@ -2359,7 +2425,16 @@ Status Estimator::deserialize(const unsigned char* buf, int len) {
         // effective_offset() returns it regardless; the latch fixes only the committed READING.
         s.ext_committed[slot]    = rc.ext_c;
         s.roll_committed[slot]   = rc.roll_c;
-        s.lever_committed[slot]  = rc.lever_c;
+        // Slice 20b: restore the PER-AXIS lever flags and re-derive the whole flag as the OR
+        // (the runtime invariant: lever_committed = OR(lever_committed_xyz)). Each per-axis
+        // flag drives commit_gate_reanchor(prev=true) PER AXIS in apply_calib_feedback(),
+        // holding that axis committed through the empty/refilling xyz histogram so the restored
+        // per-axis fold in prior_extrinsic.t is used immediately. (rc.lever_c == the stored OR;
+        // re-deriving from the per-axis array keeps the two provably consistent.)
+        s.lever_committed_xyz[slot][0] = rc.lever_c_xyz[0];
+        s.lever_committed_xyz[slot][1] = rc.lever_c_xyz[1];
+        s.lever_committed_xyz[slot][2] = rc.lever_c_xyz[2];
+        s.lever_committed[slot]  = rc.lever_c_xyz[0] || rc.lever_c_xyz[1] || rc.lever_c_xyz[2];
         s.scale_committed[slot]  = rc.scale_c;
         s.offset_committed[slot] = rc.offset_c;
         // Slice 17: the restored rot3d flag drives apply_calib_feedback()'s re-fill
