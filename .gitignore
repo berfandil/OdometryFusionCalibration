@@ -32,3 +32,4 @@ compile_commands.json
 /kitti_run/
 /kaist_run/
 /euroc_run/
+/nuscenes_run/
