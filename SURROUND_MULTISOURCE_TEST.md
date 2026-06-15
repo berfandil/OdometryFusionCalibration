@@ -91,7 +91,21 @@ Each radar's real `calibrated_sensor` mount -> `prior_extrinsic` (a REAL multi-e
 - **20 s scenes -> no calibration convergence** (predicted): mounts stay near their priors; this run validates real-sensor FUSION + drift/consistency with mounts pinned, NOT extrinsic recovery. Recovery needs the longer trainval logs.
 - **Heading monitor inert here**: it scores against a GPS-derived course; with no GPS block there's no anchor (`scored=no`, boost 1 all). Radar-rotation down-weighting is done instead by the split median + the per-delta (0.3 rad)^2 rot covariance (rotation taken from wheel/imu). The 19b reliability layer is quiet on 20 s scenes (only wheel rel_rot=5) — too short to warm the EMA + radar R=I is not a scatter outlier.
 
-## Natural next steps
-- **Longer logs (trainval)** -> calibration convergence on the 5 real radar mounts (the real multi-extrinsic recovery).
+## Multi-scene calibration accumulation (mini, 2026-06-15)
+
+To get past the 20 s limit WITHOUT downloading trainval: `tools/nuscenes_concat.py` (`5f68121`) concatenates all 10 mini scenes per source into one ~200 s INCREMENT megastream (re-base each scene to 0, offset by cumulative end-time + one tick; one identity seed at the start; teleport lives only in absolute GT, which calibration never touches) -> ONE persistent calibrator accumulates votes across all scenes. Verified strictly monotonic + row-exact; ~1567 deg total yaw turned / 1115 m path / ~13k RANSAC radar increments = abundant excitation.
+
+**Result: accumulation works mechanically but the radar LEVER does NOT recover** (perturbed +0.20 m -> conf 0, never committed, in EVERY config tested). What accumulates: radar SCALE commits + tightens (1.02-1.03 on one 20 s scene -> ~1.004-1.013 over 200 s, toward 1.0). The +0.20 m lever perturbation passes straight through (one radar's perturbed z = exactly +0.20000 m in the readout).
+
+**Verified across 3 configs** (single 20 s scene; 10-scene rot3d+joint ON; 10-scene plain Phase-2):
+- 10-scene vs 1-scene: scale + the (held) rotation prior commit in BOTH -> accumulation is NOT a vote-count problem.
+- rot3d+joint ON: the rot3d/joint gate keys off the SOURCE's rotation excitation, which a heading-blind radar (R=I) never has -> the lever path never opens -> conf 0 (rotation stays at the true prior).
+- rot3d+joint OFF (plain Phase-2): the lever is STILL conf 0, AND Phase-1 now commits GARBAGE radar rotation (e.g. front radar rx -0.984 rad vs true ~0, at conf 0.95) -- a heading-blind source has no real rotation to calibrate, so Phase-1 fits noise. (Footgun: do NOT run rotation calibration on a translation-only source; pin its rotation prior.)
+
+**Verdict (verified): trainval will NOT fix the radar lever -- it is a CALIBRATOR-DESIGN limit, not a data-quantity gap.** The lever-arm signal physically EXISTS in the radar's turn-velocity (`v_sensor = v_ego + omega x lever`, omega from wheel/imu), so the lever is observable IN PRINCIPLE -- but the hand-eye lever rows are coupled to a source rotation the heading-blind radar cannot provide (rot3d gate never opens; Phase-1 gives garbage R_X). Extracting it needs a PURPOSE-BUILT translation-only-source lever estimator (correlate the radar's measured velocity against the base omega over turns) -- a core feature, not a download. What accumulation DID prove: votes accumulate continuously across concatenated increment streams (a reusable short-log pattern), and radar scale converges.
+
+## Natural next steps (revised by the accumulation finding)
+- **Translation-only-source lever estimator** (core feature) -> the real unlock for radar (and any velocity-only sensor) lever calibration; trainval data alone will not.
+- **Camera VO** (the deferred surround half) -> 6 real FULL-6DOF visual-odometry streams; cameras CAN self-calibrate rotation (unlike radar) -> the proper venue for real multi-extrinsic recovery on nuScenes. The large, separate build.
 - **Noisy ego_pose as a sparse GPS-style correction** -> bounds the dead-reckoning drift AND activates the heading monitor (mildly circular since ego_pose is GT; a deliberate stand-in).
-- **Camera VO** (the deferred surround half) -> 6 real visual-odometry streams; the large, separate build.
+- **Trainval** is now LOW priority for calibration (won't fix the lever); still useful only for more fusion/drift variety.
