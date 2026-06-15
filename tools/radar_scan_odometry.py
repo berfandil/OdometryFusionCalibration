@@ -432,16 +432,16 @@ def radar_scan_odometry(stream, calib, vm, blobroot, gt_ts, gt_R, gt_p,
             stats["n_fallback"] += 1
             R_inc, t_inc = R3, t3
         else:
-            # Kabsch gave r_prev ~= R2 r_curr + t2, i.e. the map CURR->PREV (over [t_{k-N}, t_k]). The
-            # increment-form contract is the body motion FROM the partner TO curr (so integrating
-            # increments walks the trajectory forward). That forward body delta is the INVERSE of the
-            # curr->prev map:  R_inc = R2^T ,  t_inc = -R2^T t2  (planar; z=0).
-            R2T = R2.T
-            ti = -R2T @ t2
-            R_inc = [[R2T[0, 0], R2T[0, 1], 0.0],
-                     [R2T[1, 0], R2T[1, 1], 0.0],
+            # Kabsch gave r_prev ~= R2 r_curr + t2 = M_prev^-1 M_curr (M = radar pose), which IS the
+            # forward body delta over [t_{k-N}, t_k] (pose_curr = pose_prev o delta) -> the increment
+            # is the Kabsch map DIRECTLY: R_inc = R2, t_inc = t2 (planar; z row = identity). The earlier
+            # R2^T / -R2^T t2 was a yaw-SIGN FLIP (invisible on noise-dominated real 2D radar where the
+            # rotation is unusable either way, but a clean -97 vs +98 deg inversion on clean dense data
+            # -- caught + verified by the synth_4d_radar planted-yaw round-trip vs B_radar_gt).
+            R_inc = [[float(R2[0, 0]), float(R2[0, 1]), 0.0],
+                     [float(R2[1, 0]), float(R2[1, 1]), 0.0],
                      [0.0, 0.0, 1.0]]
-            t_inc = [float(ti[0]), float(ti[1]), 0.0]
+            t_inc = [float(t2[0]), float(t2[1]), 0.0]
             stats["n_recov"] += 1
             # confidence variances: scale rot var by inlier count (more inliers -> tighter)
             s_t = (0.05) ** 2                          # ~5 cm/scan translation floor
