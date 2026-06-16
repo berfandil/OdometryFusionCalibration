@@ -346,6 +346,7 @@ def report_cam(channel, perframe, stats):
         "yaw_corr": pearson(est_yaws, gt_yaws),
         "cum_est_yaw_deg": math.degrees(cum_est_yaw),
         "cum_gt_yaw_deg": math.degrees(cum_gt_yaw),
+        "rot_errs": rot_errs,
     }
 
 
@@ -357,7 +358,10 @@ def emit_vo_csv(path, comment, rows, t0_us):
     f.close()
 
 
-def convert_scene(dataroot, out_dir, scene_name, tables, args):
+def scene_gt_and_speed(dataroot, scene_name, tables):
+    # Shared per-scene setup: GT ego_pose track (timestamps + R + p) and the CAN-derived speed
+    # scale for the nominal translation placeholder. Returns (gt, t0_us, gt_ts, gt_R, gt_p, vm,
+    # speed_scale). REUSED by the single-camera convert_scene AND the 6-camera surround driver.
     scene, sample_tokens = n2c.scene_sample_tokens(tables, scene_name)
     gt = n2c.ego_pose_track(tables, sample_tokens)
     if len(gt) < 2:
@@ -368,7 +372,6 @@ def convert_scene(dataroot, out_dir, scene_name, tables, args):
     gt_p = [list(p["translation"]) for p in gt]
 
     vm = n2c.load_can(dataroot, scene_name, "vehicle_monitor")
-    # unit scale for the nominal translation placeholder (km/h vs m/s); reuse the radar-tool picker
     speed_scale = 1.0 / 3.6
     if vm:
         try:
@@ -376,18 +379,38 @@ def convert_scene(dataroot, out_dir, scene_name, tables, args):
             speed_scale, _yaw_scale = wheel_unit_scales(vm, gt_R)
         except Exception:  # noqa: BLE001
             speed_scale = 1.0 / 3.6
+    return sample_tokens, gt, t0_us, gt_ts, gt_R, gt_p, vm, speed_scale
 
-    calib, stream = cam_stream(tables, sample_tokens, CAM_CHANNEL)
+
+def run_channel_vo(channel, dataroot, scene_name, tables, sample_tokens, t0_us,
+                   gt_ts, gt_R, gt_p, vm, speed_scale, args):
+    # Run the proven monocular VO on ONE camera channel. Returns (calib, rows, stats, perframe)
+    # where rows are increment-CSV tuples in the EMITTED frame (raw camera optical if
+    # args.raw_cam_frame, else ego/body) and perframe is the body-frame vs-GT validation. The
+    # camera's own intrinsic K + ego_from_cam mount come from its calibrated_sensor. This is the
+    # per-camera core the 6-camera surround driver loops over (NO file IO -- the caller emits).
+    calib, stream = cam_stream(tables, sample_tokens, channel)
     if not stream:
-        raise ValueError("no %s frames in scene %s" % (CAM_CHANNEL, scene_name))
+        return None, None, None, None
     args.K = np.array(calib["camera_intrinsic"], dtype=float)
-
     blobroot = n2c.blob_dir(dataroot)
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.join(out_dir, scene_name)
-
     rows, stats, perframe = vo_scene(stream, calib, blobroot, gt_ts, gt_R, gt_p,
                                      vm, speed_scale, args)
+    return calib, stream, (rows, stats, perframe)
+
+
+def convert_scene(dataroot, out_dir, scene_name, tables, args):
+    (sample_tokens, gt, t0_us, gt_ts, gt_R, gt_p,
+     vm, speed_scale) = scene_gt_and_speed(dataroot, scene_name, tables)
+
+    calib, stream, vo = run_channel_vo(CAM_CHANNEL, dataroot, scene_name, tables, sample_tokens,
+                                       t0_us, gt_ts, gt_R, gt_p, vm, speed_scale, args)
+    if stream is None:
+        raise ValueError("no %s frames in scene %s" % (CAM_CHANNEL, scene_name))
+    rows, stats, perframe = vo
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, scene_name)
     suf = "_camframe" if args.raw_cam_frame else ""
     outp = base + "_camvo_front" + suf + ".csv"
     frame_note = "raw OpenCV camera optical frame (mount left in for calibration)" \
