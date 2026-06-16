@@ -123,8 +123,18 @@ To get past the 20 s limit WITHOUT downloading trainval: `tools/nuscenes_concat.
 
 **Verdict: the real 6-cam surround fuses + recovers the camera ROTATION extrinsics simultaneously on real VO** — the first real-data MULTI-extrinsic rotation recovery, the venue the heading-blind radar could not be. Honest limits: (1) mount YAW recovers but optical-axis ROLL is weakly observable on planar urban (the camera analogue of the radar lever limit — yaw is the headline metric); (2) levers stay conf-0 on 20 s scenes (too short to warm the lever estimator, same as the synth surround); (3) side/back cameras recover worse than front/front-corner (less forward parallax, higher fallback) — reported per-camera, not hidden; (4) the heading monitor is inert without GPS (same as the 7-source radar run).
 
+### Lever accumulation across scenes (`tools/nuscenes_surround_concat.py`, `2cf90fb`)
+
+To test limit (2): concatenated the 6-cam VO + CAN reference across all 10 mini scenes into one ~200 s persistent-calibrator megastream (the `nuscenes_concat.py` increment-space pattern; 555.7° total turn / 1114.7 m / ~2330 VO increments/cam). RECOVER (+5° yaw / +0.10 m lever perturbation per camera):
+- **Levers WARMED off conf-0** — CAM_FRONT lever conf 0 → **0.12**, CAM_FRONT_RIGHT 0 → **0.15** (the reference wheel/imu levers also warmed, 0.21/0.18) — where a single 20 s scene left every camera lever at EXACTLY 0. **Confirms the levers were conf-0 for SCENE LENGTH, not observability** (the predicted contrast with the structurally-stuck heading-blind radar, whose lever stays conf-0 even with accumulation — `nuscenes_concat.py`).
+- **But no lever COMMITS** (`lever_committed_xyz=[0,0,0]` all cameras): the remaining barrier is the PLANAR-urban lever limit + 555° of turn spread thinly across 10 DISJOINT 20 s fragments. A DATA-variety limit (continuous + non-planar excitation), not a calibrator one.
+- **Accumulation also TIGHTENS rotation**: 5/6 cameras commit rotation (vs fewer single-scene), and it RESCUED the single-scene CAM_BACK_RIGHT failure (geodesic 56.7° → **2.25°**) — cross-scene voting averages out the worst single-scene camera.
+- Drift/NEES are GT-teleport-corrupted at the 9 boundaries (calib never uses GT); the honest local-window p50 = 5.9 m / 0.045 rad, bounded.
+
+**So the camera lever is precisely diagnosed**: observable (it warms with data, unlike the radar) but needs CONTINUOUS NON-PLANAR drives to COMMIT — which nuScenes (always 20 s, planar urban) structurally cannot provide. The unlock is a dataset with long continuous + elevation-rich motion, not a calibrator change.
+
 ## Natural next steps
 - **Translation-only-source lever estimator** (core feature) → the radar (velocity-only) lever unlock; trainval data alone will not (the algorithm-bound is the calibrator; the SENSOR-bound radar rotation is unlocked by a 4D radar — `RADAR_SCAN_ODOMETRY.md`).
 - **Real 4D radar dataset** (View-of-Delft / K-Radar) → confirm the synth-4D radar rotation unlock on real imaging radar (download-gated; the converter + 3D path are ready).
-- **Longer camera scenes (trainval)** → warm the camera LEVER estimator past the 20 s limit (the levers were conf-0 only for scene length, not observability); also closes the optical-axis-roll gap with more motion variety.
+- ~~**Longer camera scenes (trainval)** → warm the camera LEVER estimator past the 20 s limit~~ **DONE (`2cf90fb`)**: 10-scene accumulation WARMED the levers off conf-0 (length confirmed as the limit) but they don't COMMIT — the barrier is now CONTINUOUS NON-PLANAR data (nuScenes can't provide it; trainval is also 20 s fragments + planar). **A long continuous + elevation-rich driving dataset** is the camera-lever-commit unlock — not nuScenes, not the calibrator.
 - **Noisy ego_pose as a sparse GPS-style correction** → bounds the dead-reckoning drift AND activates the heading monitor on nuScenes (mildly circular since ego_pose is GT; a deliberate stand-in).
