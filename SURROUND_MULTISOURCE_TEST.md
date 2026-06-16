@@ -104,8 +104,27 @@ To get past the 20 s limit WITHOUT downloading trainval: `tools/nuscenes_concat.
 
 **Verdict (verified): trainval will NOT fix the radar lever -- it is a CALIBRATOR-DESIGN limit, not a data-quantity gap.** The lever-arm signal physically EXISTS in the radar's turn-velocity (`v_sensor = v_ego + omega x lever`, omega from wheel/imu), so the lever is observable IN PRINCIPLE -- but the hand-eye lever rows are coupled to a source rotation the heading-blind radar cannot provide (rot3d gate never opens; Phase-1 gives garbage R_X). Extracting it needs a PURPOSE-BUILT translation-only-source lever estimator (correlate the radar's measured velocity against the base omega over turns) -- a core feature, not a download. What accumulation DID prove: votes accumulate continuously across concatenated increment streams (a reusable short-log pattern), and radar scale converges.
 
-## Natural next steps (revised by the accumulation finding)
-- **Translation-only-source lever estimator** (core feature) -> the real unlock for radar (and any velocity-only sensor) lever calibration; trainval data alone will not.
-- **Camera VO** (the deferred surround half) -> 6 real FULL-6DOF visual-odometry streams; cameras CAN self-calibrate rotation (unlike radar) -> the proper venue for real multi-extrinsic recovery on nuScenes. The large, separate build.
-- **Noisy ego_pose as a sparse GPS-style correction** -> bounds the dead-reckoning drift AND activates the heading monitor (mildly circular since ego_pose is GT; a deliberate stand-in).
-- **Trainval** is now LOW priority for calibration (won't fix the lever); still useful only for more fusion/drift variety.
+---
+
+# Real camera surround — 6-cam VO multi-extrinsic recovery (the deferred half, now REAL)
+
+**Done (2026-06-16)**: the camera surround half, with ACTUAL monocular visual odometry (not GT-synth). The proper venue for real multi-extrinsic recovery — cameras self-calibrate rotation, unlike the heading-blind radar. Tools `tools/nuscenes_cam_vo.py` (`a39521d`) + `tools/nuscenes_surround.py` + `tools/nuscenes_surround_score.py` (`fc74b72`); opencv 4.13 (relaxed-edge, tool-only).
+
+**1-cam de-risk (`a39521d`, GO)**: ORB+KLT + Essential-matrix pose on CAM_FRONT (scene-0061) → per-frame rotation median **0.05–0.10°**, yaw correlation **0.87–0.97** on turning scenes (low on straight = correct), translation-DIRECTION error 1–4° (monocular up-to-scale; the calibrator recovers scale). Stretch: the camera fuses as a FULL-DOF source and its rotation extrinsic IS observable (perturbed +5° → recovered to **2.08°**, conf 0.68, committed; scale committed) — the exact contrast with the radar's structural conf-0.
+
+**6-cam surround (`fc74b72`)**: VO on all 6 cameras (each its own K + `ego_from_cam` mount) → 8-source fuse (CAN wheel ref + imu + 6 VO cams), split_median, no GPS, no `translation_only`. RECOVER run (+5° yaw perturbation per camera):
+
+| metric | result |
+|---|---|
+| cameras recovering +5° → <3° yaw err | **5 of 6** (scene-0061; CAM_BACK_RIGHT the miss, worst VO conf 0.17) |
+| fused NEES (CTRL) | 0.11–0.12 (bounded, conservative) |
+| tail drift | 1.76–2.07 m |
+| 6-cam vs 1-cam cumulative heading (high-fallback scene) | +22.1° → **+2.0°** (redundancy closes the gap) |
+
+**Verdict: the real 6-cam surround fuses + recovers the camera ROTATION extrinsics simultaneously on real VO** — the first real-data MULTI-extrinsic rotation recovery, the venue the heading-blind radar could not be. Honest limits: (1) mount YAW recovers but optical-axis ROLL is weakly observable on planar urban (the camera analogue of the radar lever limit — yaw is the headline metric); (2) levers stay conf-0 on 20 s scenes (too short to warm the lever estimator, same as the synth surround); (3) side/back cameras recover worse than front/front-corner (less forward parallax, higher fallback) — reported per-camera, not hidden; (4) the heading monitor is inert without GPS (same as the 7-source radar run).
+
+## Natural next steps
+- **Translation-only-source lever estimator** (core feature) → the radar (velocity-only) lever unlock; trainval data alone will not (the algorithm-bound is the calibrator; the SENSOR-bound radar rotation is unlocked by a 4D radar — `RADAR_SCAN_ODOMETRY.md`).
+- **Real 4D radar dataset** (View-of-Delft / K-Radar) → confirm the synth-4D radar rotation unlock on real imaging radar (download-gated; the converter + 3D path are ready).
+- **Longer camera scenes (trainval)** → warm the camera LEVER estimator past the 20 s limit (the levers were conf-0 only for scene length, not observability); also closes the optical-axis-roll gap with more motion variety.
+- **Noisy ego_pose as a sparse GPS-style correction** → bounds the dead-reckoning drift AND activates the heading monitor on nuScenes (mildly circular since ego_pose is GT; a deliberate stand-in).
