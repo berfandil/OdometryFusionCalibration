@@ -62,18 +62,18 @@ Conventions: **type** is the logical type; **default** is the shipped value; **r
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
 | `enabled` | bool | true | — | Master on/off (off if inputs are pre-synced). |
-| `match_metric` | enum | `l2` | {`l1`, `l2`, `ratio`, `ncc`} | Cross-correlation cost between ‖ω‖ signals (worth sweeping). |
+| `match_metric` | enum | `l2` | {`l1`, `l2`, `ratio`, `ncc`} | Cross-correlation cost between ‖ω‖ signals. **Swept (Slice-14 placeholder sweep, `e51788d`)**: all four resolve the offset sub-sample on the sim; `l2` is in the best band (≈ `ncc`, beats `ratio`) — default justified. |
 | `max_lag_s` | double | 0.1 | (0, 2] | Bounded search range for the offset. |
-| `excitation_min_var` | double | tuned | ≥0 | Minimum variance of ‖ω‖ to accept a window's estimate. |
+| `excitation_min_var` | double | 1e-4 | ≥0 | Minimum variance of ‖ω‖ to accept a window's estimate. **Swept (`e51788d`)**: the excited ramp recovers + flat/straight is rejected across `[0 .. 1e-2]` (breaks only at 1e-1); `1e-4` is mid-plateau with ≥2 decades margin each side — default justified. |
 | `offset_hist` | HistogramConfig | — | — | Per-source offset histogram (see §8). |
 
 ## 6. Calibration gates (`GateConfig`)
 
 | Knob | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `straight_omega_max` | double (rad/s) | 0.05 | ≥0 | Phase-1 straight gate: `‖ω‖ < ε_ω`. |
-| `straight_trans_min` | double (m) | 0.05 | ≥0 | Phase-1 motion gate: `‖t‖ > δ_v`. Per-step **displacement** (not a speed) → cadence-dependent; tune per tick rate. |
-| `turn_omega_min` | double (rad/s) | 0.2 | ≥0 | Phase-2 turn gate: `‖ω‖ > θ_ω` (distinct from straight gate). |
+| `straight_omega_max` | double (rad/s) | 0.05 | ≥0 | Phase-1 straight gate: `‖ω‖ < ε_ω`. **Swept (`e51788d`)**: the observability spine (straight converges yaw/pitch+scale, turn frozen) holds across `[0.005, 0.4]`; default ~12× below the turn rate — wide margin, justified. |
+| `straight_trans_min` | double (m) | 0.05 | ≥0 | Phase-1 motion gate: `‖t‖ > δ_v`. Per-step **displacement** (not a speed) → **cadence-dependent**. **Swept (`e51788d`) — the one non-robust default**: at 50 Hz, `0.05 m` gates OUT a straight run below ~2.5 m/s (a 2 m/s run = 0.04 m/step < 0.05) — it only votes for >2.5 m/s @ 50 Hz. Not a cliff (fewer votes, not garbage; real KAIST has enough fast straight segments so calibration works), but for slow/high-cadence rigs **lower it toward `0.02 m` (the value every calib test uses)** — rule: `δ_v ≲ v_min · dt`. Default KEPT (changing a core default off a sim sweep deferred); tune per tick rate + min speed. |
+| `turn_omega_min` | double (rad/s) | 0.2 | ≥0 | Phase-2 turn gate: `‖ω‖ > θ_ω` (distinct from straight gate). **Swept (`e51788d`)**: the spine (turn converges roll+lever, straight frozen) holds across `[0.05, 0.6]`; default ~3.3× below the turn rate and strictly above `straight_omega_max` (gates don't overlap) — justified. |
 | `reverse_fold` | bool | true | — | Fold reverse motion into the consensus hemisphere before voting. |
 | `ref_cross_check` | bool | false | — | Require the reference sensor to also read "straight fwd/back" (ice-slide / drone niche). |
 
@@ -124,7 +124,7 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 | `modeled_noise_per_m` | double | tuned | ≥0 | Synthetic translation noise (per metre). |
 | `modeled_noise_per_rad` | double | tuned | ≥0 | Synthetic rotation noise (per radian). |
 | `per_sensor_kf` | bool | false | — | Enable the per-sensor fixed-lag RTS twist smoother feeding calibration (Slice 10, **wired**). On ⇒ calibration runs at the deeper frontier `now − delay − L` with two-sided (zero-phase) smoothed twists; OFF ⇒ byte-identical to no-smoothing. |
-| `kf_process_noise` | double | tuned | ≥0 | Smoothing strength `q` (larger = looser/closer-tracking; only `q/r` shapes smoothing, `r` fixed at 1.0). **Note**: a single shared smoother uses the MAX `q` over enabled sources (not yet per-source). |
+| `kf_process_noise` | double | 1.0 | ≥0 | Smoothing strength `q` (larger = looser/closer-tracking; only `q/r` shapes smoothing, `r` fixed at 1.0). **Swept (`e51788d`)**: ON sharpens both calib peaks (ext_conf 0.045→0.156, scale_conf 0.040→0.182 at q=1) and stays unbiased/zero-phase for q∈{0.5..20} — robust band, default not at a cliff (q is a smoothing-strength knob; larger just tracks closer, all unbiased). Justified. **Note**: a single shared smoother uses the MAX `q` over enabled sources (not yet per-source). |
 | `scale_calib` | bool | true | — | Calibrate scale; if false, fixed at `prior_scale`. |
 | `bias_states` | bool | false | — | Add nuisance-bias states (GPS/INS-style drift removal); enable for raw-IMU sources. **Slice-11b Option A**: when set on the SINGLE source that drives the predict alone, the ESKF augments to 18-DOF `[pose;twist;bias]` and an absolute-ref update removes the bias via the pose↔bias cross-covariance. `>1` source set → `InvalidConfig` UNLESS `multi_bias_enabled` (Slice 18, ≤4 sources). |
 | `bias_process_noise` | double / 6×double | 1e-4 | ≥0 | Random-walk process noise for the per-source bias state. **Per-DOF since Slice 18**: 1 value = uniform, 6 values = per-twist-DOF `[v;ω]`; a DOF set to **0 is PINNED at zero** (excluded from estimation — e.g. `0 0 0 0 0 1e-10` = yaw-rate-only bias). **SCALE TO YOUR SENSOR** (with `multi_bias_cov0`): real yaw-rate biases are ~1e-4 rad/s; sim-scale values (1e-4..1e-6) on real data make the bias a junk sink (a single GPS fix kicked the estimate to +9870°/h on KAIST — see D28). |
@@ -159,4 +159,4 @@ Shared by every calibrated quantity (so(3), roll, xyz, scale, time-offset).
 
 ---
 
-*Defaults marked "tuned" are placeholders pending the simulation-rig sweep (see [`ISSUES.md`](./ISSUES.md), validation slice). `q_scale` was recalibrated against the true interior median (`1142e41`, now `0.7`); the remaining placeholders (`excitation_min_var`, `kf_process_noise`, `match_metric`, the straight/turn calibration gates) are a separate future pass — they are calibration/smoothing knobs the observability self-tests already pin functionally, not covariance-consistency knobs.*
+*Placeholder sweep DONE (Slice-14, `e51788d`, `tests/test_placeholder_sweep.cpp`): `q_scale` (covariance, `1142e41`→0.7) + `match_metric`, `excitation_min_var`, `kf_process_noise`, `straight_omega_max`, `turn_omega_min` are all now **swept + justified** (each KEEP, mid-plateau with margin — see the rows). The ONE finding: `straight_trans_min`=0.05 m is cadence-coupled and gates out <2.5 m/s @ 50 Hz (use ~0.02 for slow/high-cadence rigs; default kept). No core default changed. The non-covariance placeholder pass is closed.*
