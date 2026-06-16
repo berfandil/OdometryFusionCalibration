@@ -39,6 +39,7 @@ add_executable(ofc_tests
     test_persistence.cpp
     test_cov_calibration.cpp
     test_cov_calibration_split.cpp
+    test_placeholder_sweep.cpp
 )
 target_link_libraries(ofc_tests PRIVATE ofc_core ofc_sim doctest::doctest)
 set_target_properties(ofc_tests PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
