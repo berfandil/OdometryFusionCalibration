@@ -85,7 +85,15 @@ void HeadingMonitor::reset() {
         fix_fwd_[i] = Scalar(0);
         anc_yaw_[i] = Scalar(0);
         track_[i]   = Track{};
+        // Clear the per-source warm-start prior to neutral (1.0); the estimator re-binds the
+        // configured rot_weight_prior via set_rot_weight_prior after each (re)configure.
+        rot_weight_prior_[i] = Scalar(1);
     }
+}
+
+void HeadingMonitor::set_rot_weight_prior(int i, Scalar prior) {
+    if (i < 0 || i >= kMaxSources) return;
+    rot_weight_prior_[i] = prior;
 }
 
 void HeadingMonitor::configure(int n) {
@@ -288,7 +296,14 @@ int HeadingMonitor::scored_count() const {
 Scalar HeadingMonitor::boost(int i, Scalar boost_max) const {
     const Scalar cap = std::max(Scalar(1), boost_max);
     if (i < 0 || i >= n_) return Scalar(1);
-    // ABSTAIN until >= 2 sources are scored (insufficient data -> all boosts 1.0).
+    // WARM-START (Slice 19d): the abstain / unscored fallback is source i's configured
+    // rot_weight_prior CLAMPED to [1, cap], NOT a flat 1.0. The monitor ABSORBS rot_weight_prior
+    // (the estimator drops the separate * rot_weight_prior when the monitor is on), so the prior
+    // applies from t=0 with no discovery latency; with the default prior 1.0 this is exactly 1.0
+    // (the 19c byte-identical abstain pin holds). Once scored, the computed boost below takes
+    // over and already ranks -- the prior is NOT re-multiplied (no double-count).
+    const Scalar warm = std::min(cap, std::max(Scalar(1), rot_weight_prior_[i]));
+    // ABSTAIN until >= 2 sources are scored (insufficient data -> warm-start prior).
     int sc = 0;
     Scalar best = Scalar(0);
     bool   have_best = false;
@@ -301,7 +316,7 @@ Scalar HeadingMonitor::boost(int i, Scalar boost_max) const {
         const Scalar s = std::max(score(j), kScoreFloor);
         if (!have_best || s < best) { best = s; have_best = true; }
     }
-    if (sc < 2 || !scored(i)) return Scalar(1);                        // abstain / unscored
+    if (sc < 2 || !scored(i)) return warm;                            // abstain / unscored
     // Floor the denominator too: an exactly-zero (or sub-floor) drift no longer jumps to the
     // full cap -- it floors to kScoreFloor like every other below-resolvability source, so the
     // boost is continuous (boost = clip(cap * best / max(score_i, floor), 1, cap)).

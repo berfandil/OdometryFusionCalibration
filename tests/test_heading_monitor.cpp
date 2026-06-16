@@ -127,7 +127,7 @@ struct EstRun {
 };
 
 EstRun run_split_gps_rig(bool monitor_on, double span_s, Scalar drift_wz,
-                         void (*tweak)(Config&) = nullptr) {
+                         void (*tweak)(Config&) = nullptr, Scalar prior1 = Scalar(2.0)) {
     const double kRate = 20.0;
     Vec6 xi_clean;  xi_clean  << 5.0, 0, 0, 0, 0, 0;
     Vec6 xi_drift   = xi_clean;
@@ -142,7 +142,7 @@ EstRun run_split_gps_rig(bool monitor_on, double span_s, Scalar drift_wz,
 
     SensorConfig sensors[3];
     for (int i = 0; i < 3; ++i) sensors[i].id = static_cast<SourceId>(i);
-    sensors[1].rot_weight_prior = 2.0;   // non-neutral: pins the boost x prior composition
+    sensors[1].rot_weight_prior = prior1;   // non-neutral (default 2.0): pins boost x prior
 
     Config cfg;
     cfg.max_sources      = 3;
@@ -691,26 +691,37 @@ TEST_CASE("19c review: zero-drift boost is continuous (floored, not special-case
 }
 
 // ===========================================================================
-// REVIEW FIX (HIGH-RISK 3) -- ABSTAIN-ON BYTE-IDENTICAL. The OFF contract has TWO halves: the
-// OFF flag is neutral (item 7), AND monitor-ON-but-ABSTAINING (< 120 s / < 2 scored, boosts
-// exactly 1.0) reproduces the monitor-OFF fusion BYTE-IDENTICALLY. A short run (60 s) cannot
-// form a slope baseline, so monitor-ON abstains; its frontier pose/cov/weights must bit-match
-// the monitor-OFF run, and every boost must be exactly 1.0.
+// REVIEW FIX (HIGH-RISK 3) + Slice 19d WARM-START -- ABSTAIN-ON BYTE-IDENTICAL FUSION. The OFF
+// contract has TWO halves: the OFF flag is neutral (item 7), AND monitor-ON-but-ABSTAINING
+// (< 120 s / < 2 scored) reproduces the monitor-OFF FUSION BYTE-IDENTICALLY. A short run (60 s)
+// cannot form a slope baseline, so monitor-ON abstains; its frontier pose/cov/weights must
+// bit-match the monitor-OFF run. Slice 19d changes ONLY the boost DIAGNOSTIC in this state: the
+// abstain boost is now the clamped rot_weight_prior warm-start (not a flat 1.0), but because the
+// estimator drops the separate *rot_weight_prior when the monitor is on, the rotation weight --
+// and thus the fusion -- is unchanged (see the body).
 // ===========================================================================
-TEST_CASE("19c review: abstain-ON is byte-identical to OFF (boosts exactly 1.0)") {
-    // 60 s is below the 120 s slope baseline -> the ON monitor scores nothing -> it abstains
-    // (every boost 1.0), so ON and OFF must produce bit-identical fusion. (Mirrors the item-7
-    // pin's literal-capture style, but pins ON==OFF directly rather than against HEAD literals.)
+TEST_CASE("19d: abstain-ON fusion is byte-identical to OFF (warm-start ABSORBS the prior)") {
+    // 60 s is below the 120 s slope baseline -> the ON monitor scores nothing -> it abstains.
+    // Slice 19d WARM-START: an abstaining source returns its rot_weight_prior (clamped to
+    // [1,cap]) as its boost, and the estimator DROPS the separate * rot_weight_prior when the
+    // monitor is on. So the rotation weight is clamp(w_base*rel)*prior in BOTH runs:
+    //   OFF:  w_rot = clamp(w_base*rel) * rot_weight_prior * 1.0(hm)
+    //   ON:   w_rot = clamp(w_base*rel) * hm_boost(= warm-start = clamp(prior,[1,cap]))
+    // -> the fusion is STILL bit-identical even with a NON-neutral prior (the rig sets
+    // sensors[1].rot_weight_prior = 2.0). What CHANGES vs Slice 19c is ONLY the boost DIAGNOSTIC:
+    // abstain no longer reports a flat 1.0, it reports the warm-start prior (this is the
+    // intentional 19d behavior change -- the prior applies from t=0, no discovery latency).
     const EstRun on  = run_split_gps_rig(true,  60.0, 0.005);
     const EstRun off = run_split_gps_rig(false, 60.0, 0.005);
 
-    // Abstain state: nothing scored, every boost EXACTLY 1.0 (not Approx -- full precision).
-    for (int i = 0; i < 3; ++i) {
-        CHECK_FALSE(on.scored[i]);
-        CHECK(on.boost[i] == Scalar(1));
-    }
+    // Abstain state: nothing scored. The boost now WARM-STARTS to the clamped prior:
+    // sources 0/2 (prior 1.0) -> exactly 1.0; source 1 (prior 2.0) -> exactly 2.0.
+    for (int i = 0; i < 3; ++i) CHECK_FALSE(on.scored[i]);
+    CHECK(on.boost[0] == Scalar(1));      // prior 1.0 -> warm-start 1.0 (19c pin: prior=1 abstain)
+    CHECK(on.boost[1] == Scalar(2));      // prior 2.0 -> warm-start 2.0 (the new behavior)
+    CHECK(on.boost[2] == Scalar(1));      // prior 1.0 -> warm-start 1.0
 
-    // Frontier pose: bit-identical to the OFF run.
+    // Frontier pose: bit-identical to the OFF run (warm-start reproduces the OFF prior factor).
     CHECK(on.tx  == off.tx);
     CHECK(on.ty  == off.ty);
     CHECK(on.tz  == off.tz);
@@ -719,8 +730,8 @@ TEST_CASE("19c review: abstain-ON is byte-identical to OFF (boosts exactly 1.0)"
     // Frontier covariance: bit-identical.
     CHECK(on.c0  == off.c0);
     CHECK(on.c7  == off.c7);
-    // Published weights (rotation boost composes into these) + per-channel reliabilities: bit-
-    // identical (boost = 1.0 leaves w_rot = clamp(w_base*rel)*prior*1.0 unchanged).
+    // Published (translation-channel) weights + per-channel reliabilities: bit-identical (the
+    // warm-start touches only weights_rot, and there it reproduces the OFF prior exactly).
     CHECK(on.w0  == off.w0);
     CHECK(on.w1  == off.w1);
     CHECK(on.w2  == off.w2);
@@ -728,4 +739,126 @@ TEST_CASE("19c review: abstain-ON is byte-identical to OFF (boosts exactly 1.0)"
     CHECK(on.rt2 == off.rt2);
     // Correction bookkeeping: the same number of fixes applied (the monitor never gates fusion).
     CHECK(on.corr_applied_total == off.corr_applied_total);
+}
+
+// ===========================================================================
+// Slice 19d ITEM 1 -- WARM-START (unit). While abstaining/unscored, boost() returns the source's
+// configured rot_weight_prior CLAMPED to [1, boost_max], NOT a flat 1.0 -> the config prior is
+// applied from t=0 with no discovery latency. Pinned directly on the HeadingMonitor.
+// ===========================================================================
+TEST_CASE("19d item 1: warm-start -- abstain boost is the clamped rot_weight_prior, not 1.0") {
+    HeadingMonitor mon;
+    mon.configure(3);
+    mon.set_rot_weight_prior(0, Scalar(1));     // neutral
+    mon.set_rot_weight_prior(1, Scalar(7));     // heading-grade prior (within the cap)
+    mon.set_rot_weight_prior(2, Scalar(1));
+
+    // No fixes submitted -> nothing scored -> ABSTAIN. The warm-start applies from the FIRST
+    // step: the high-prior source already outweighs the neutral ones in the rotation channel.
+    REQUIRE(mon.scored_count() == 0);
+    CHECK(mon.boost(0, 10.0) == Scalar(1));     // neutral prior -> 1.0
+    CHECK(mon.boost(1, 10.0) == Scalar(7));     // prior 7 -> warm-start 7 (NOT 1.0)
+    CHECK(mon.boost(2, 10.0) == Scalar(1));
+    // The rotation median is preferred toward source 1 from t=0: its boost > the others'.
+    CHECK(mon.boost(1, 10.0) > mon.boost(0, 10.0));
+    CHECK(mon.boost(1, 10.0) > mon.boost(2, 10.0));
+
+    // A prior ABOVE the cap clamps to the cap (warm-start never exceeds boost_max).
+    mon.set_rot_weight_prior(1, Scalar(25));
+    CHECK(mon.boost(1, 10.0) == Scalar(10));    // clamp to boost_max
+    // A prior BELOW 1 clamps UP to 1 (never demotes below neutral).
+    mon.set_rot_weight_prior(1, Scalar(0.3));
+    CHECK(mon.boost(1, 10.0) == Scalar(1));
+
+    // A still-unscored source with two OTHERS scored also warm-starts to its prior (the
+    // unscored-i path, not just the global abstain). configure clears the priors, so re-bind.
+    HeadingMonitor mon2;
+    mon2.configure(3);
+    mon2.set_rot_weight_prior(0, Scalar(4));
+    // (No fixes for source 0's track -> it stays unscored; with <2 scored we are in abstain
+    // anyway, so this also exercises the warm-start return value being the prior, not 1.0.)
+    CHECK(mon2.boost(0, 10.0) == Scalar(4));
+}
+
+// ===========================================================================
+// Slice 19d ITEM 2 -- NO DOUBLE-COUNT. With the monitor ON the rotation weight is
+// clamp(w_base*rel) * hm_boost (the SEPARATE *rot_weight_prior is DROPPED -- the monitor absorbs
+// it). The published heading_boost IS that single rotation multiplier. The no-double-count
+// invariants:
+//   (a) once SCORED, the boost is the COMPUTED ranking value -- purely score-based, INDEPENDENT
+//       of the configured prior. So sensors[1].rot_weight_prior = 2.0 vs 1.0 yields the SAME
+//       scored boost (the old code's *prior*boost would have differed).
+//   (b) the boost (== the rotation multiplier on wr) NEVER exceeds boost_max, even with a >1
+//       prior. The old wiring's effective rotation factor was prior*boost = up to 2*10 = 20x;
+//       absorbed, it is capped at boost_max (10x). Pinning heading_boost <= boost_max proves the
+//       rotation channel is no longer double-scaled.
+//   (c) the translation channel is prior-independent in BOTH runs (rot_weight_prior never
+//       touches it) -- a sanity guard the change did not leak into translation.
+// (Full trajectory equality is NOT pinned: the warm-start INTENTIONALLY differs in the abstain
+// window -- prior=2 weights source 1's rotation 2x from t=0 while prior=1 weights it 1x -- so the
+// trajectories legitimately diverge there. That early-window difference IS the erased latency;
+// the no-double-count claim is specifically about the SCORED regime, items (a)/(b).)
+// ===========================================================================
+TEST_CASE("19d item 2: no double-count -- scored boost is prior-independent and capped") {
+    // Default rig: sensors[1].rot_weight_prior = 2.0; same rig with the prior forced to 1.0.
+    const EstRun prior2 = run_split_gps_rig(true, 400.0, 0.005, nullptr, Scalar(2.0));
+    const EstRun prior1 = run_split_gps_rig(true, 400.0, 0.005, nullptr, Scalar(1.0));
+
+    // Both fully scored by end-of-drive (the computed boost path is active, not the warm-start).
+    for (int i = 0; i < 3; ++i) { CHECK(prior2.scored[i]); CHECK(prior1.scored[i]); }
+    // (a) The scored boost is the score-based ranking value -> IDENTICAL regardless of the prior
+    //     (the prior is absorbed; the old *prior*boost wiring would have differed by the 2x).
+    CHECK(prior2.boost[0] == prior1.boost[0]);
+    CHECK(prior2.boost[1] == prior1.boost[1]);
+    CHECK(prior2.boost[2] == prior1.boost[2]);
+    // (b) The boost (== the single rotation multiplier on wr) never exceeds boost_max even with
+    //     the >1 prior -> no double-count (the old prior*boost would reach 2*10 = 20 here).
+    for (int i = 0; i < 3; ++i) {
+        CHECK(prior2.boost[i] <= Scalar(10.0));
+        CHECK(prior2.boost[i] >= Scalar(1.0));
+    }
+    CHECK(prior2.boost[1] == doctest::Approx(10.0));   // clean source 1 -> the cap, NOT 2*cap
+    // (c) The translation channel is untouched by rot_weight_prior in EITHER run.
+    CHECK(prior2.w0 == prior1.w0);
+    CHECK(prior2.w1 == prior1.w1);
+    CHECK(prior2.w2 == prior1.w2);
+}
+
+// ===========================================================================
+// Slice 19d ITEM 5 -- TRANSITION smoothness. The warm-start handoff (abstain=clamped prior ->
+// scored=computed boost) must not chatter: the boost is bounded in [1, cap] across the whole
+// transition, and the established slow-update / hysteresis machinery (item 6) still governs the
+// scored regime. We drive a single rig from abstain through to scored and confirm the boost
+// stays in-band the whole way (no spike, no inversion) and lands on the computed value.
+// ===========================================================================
+TEST_CASE("19d item 5: warm-start -> scored transition stays in-band (no chatter)") {
+    // Source 1 carries a heading-grade prior of 6 (within the cap); sources 0/2 neutral. Source 2
+    // is the planted drifter. The clean sources should end boosted toward the cap; the drifter
+    // floored. Throughout, every boost stays within [1, cap].
+    MonRig r(/*drift_idx=*/2, /*drift_wz=*/0.005);
+    r.mon.set_rot_weight_prior(0, Scalar(1));
+    r.mon.set_rot_weight_prior(1, Scalar(6));
+    r.mon.set_rot_weight_prior(2, Scalar(1));
+
+    // ABSTAIN: the warm-start gives source 1 its prior, the others 1.0.
+    CHECK(r.mon.boost(0, 10.0) == Scalar(1));
+    CHECK(r.mon.boost(1, 10.0) == Scalar(6));   // warm-start to the prior
+    CHECK(r.mon.boost(2, 10.0) == Scalar(1));
+
+    // Feed fixes in chunks; at every checkpoint the boosts stay bounded in [1, cap] (no chatter
+    // spike on the warm-start -> scored handoff).
+    for (int chunk = 0; chunk < 10; ++chunk) {
+        r.straight(20);
+        for (int i = 0; i < 3; ++i) {
+            const Scalar b = r.mon.boost(i, 10.0);
+            CHECK(b >= Scalar(1));
+            CHECK(b <= Scalar(10));
+        }
+    }
+    REQUIRE(r.mon.scored_count() == 3);
+    // SCORED end-state: computed boost takes over (prior-independent). The clean sources are
+    // boosted, the drifter floored -- the slow weighted-median ranking, NOT the prior.
+    CHECK(r.mon.boost(2, 10.0) == doctest::Approx(1.0));   // drifter floored
+    CHECK(r.mon.boost(0, 10.0) > Scalar(1.5));             // clean source boosted by SCORE
+    CHECK(r.mon.boost(1, 10.0) > Scalar(1.5));             // (not by its prior 6 -> absorbed)
 }

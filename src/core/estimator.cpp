@@ -466,7 +466,8 @@ struct Estimator::Impl {
     SE3    aligned[kMaxSourcesCap];
     Scalar weights[kMaxSourcesCap];
     // Split-median per-step scratch (Slice 19; written only when cfg.split_median):
-    // weights_rot = weights * rot_weight_prior (the rotation channel's weight set);
+    // weights_rot is the rotation channel's weight set: clamp(w_base*rel_rot) * rot_weight_prior
+    // (monitor OFF) or * hm_boost (monitor ON -- the boost ABSORBS the prior, Slice 19d);
     // wrot_final / wtrans_final receive the FINAL (veto-scaled effective) channel weights
     // from solve_split — fed to the block-diagonal median influence so the Slice-18
     // coupling describes the median actually solved.
@@ -1234,7 +1235,22 @@ Status Estimator::add_source(const ISource* src) {
     // Heading-monitor (Slice 19c): track the live registered count so it ranks exactly the
     // registered sources by slot. Reconfiguring clears the monitor's (still empty) state —
     // sources are always added before the first step(), so no in-flight history is lost.
-    if (impl_->heading_active) impl_->heading_mon.configure(impl_->source_count);
+    // Slice 19d: configure() also clears the warm-start priors, so re-bind every registered
+    // slot's rot_weight_prior afterward (the monitor returns it, clamped to [1, boost_max], as
+    // the abstain/unscored boost so the config prior applies from t=0 with no discovery latency).
+    if (impl_->heading_active) {
+        impl_->heading_mon.configure(impl_->source_count);
+        for (int j = 0; j < impl_->source_count; ++j) {
+            impl_->heading_mon.set_rot_weight_prior(j, impl_->rot_weight_prior[j]);
+            // Seed the causal hm_boost with the WARM-START now, so the FIRST step (before the
+            // first boost publish) already carries the prior. The monitor has no scored source
+            // yet, so boost() returns exactly the clamped warm-start prior -- this makes the
+            // monitor-ON abstain rotation weight (wr * hm_boost) match the monitor-OFF
+            // (wr * rot_weight_prior) from step 1 (the 19c/19d byte-identical abstain pin).
+            impl_->hm_boost[j] =
+                impl_->heading_mon.boost(j, impl_->cfg.heading_monitor_boost_max);
+        }
+    }
     return Status::Ok;
 }
 
@@ -1433,12 +1449,21 @@ Status Estimator::step(Timestamp now) {
                 const Scalar wr = std::max(cfg.weight_floor, std::min(cfg.weight_cap,
                                            w_base * s.reliability_rot[i]));
                 s.weights[n]     = wt;
-                // Slice 19c: the heading-monitor boost slots beside the config prior — same
-                // position OUTSIDE the clamp (Slice-19 contract): w_rot = clamp(w_base *
-                // rel_rot) * rot_weight_prior * monitor_boost. hm_boost is the PRIOR step's
-                // published boost (causal, like reliability), exactly 1.0 while the monitor is
-                // off / abstaining, so the monitor-off path stays byte-identical to 19b.
-                s.weights_rot[n] = wr * s.rot_weight_prior[i] * s.hm_boost[i];
+                // Rotation-channel weight (OUTSIDE the clamp, Slice-19 contract). Two paths:
+                //   monitor OFF: w_rot = clamp(w_base * rel_rot) * rot_weight_prior (Slice 19b;
+                //     byte-identical to before -- no monitor term).
+                //   monitor ON (Slice 19d): w_rot = clamp(w_base * rel_rot) * hm_boost. The
+                //     SEPARATE * rot_weight_prior is DROPPED -- hm_boost now CARRIES the prior:
+                //     it WARM-STARTS to clamp(rot_weight_prior,[1,cap]) while abstaining (prior
+                //     from t=0, no discovery latency) and becomes the computed ranking boost once
+                //     scored (which already ranks). Folding it into hm_boost erases the latency
+                //     AND removes the old double-count (prior * boost both scaling rotation).
+                //     hm_boost is the PRIOR step's published boost (causal, like reliability);
+                //     with rot_weight_prior=1 (default) the abstain warm-start is exactly 1.0, so
+                //     the monitor-ON abstain path stays byte-identical to monitor-OFF (19c pin).
+                s.weights_rot[n] = s.heading_active
+                                       ? (wr * s.hm_boost[i])
+                                       : (wr * s.rot_weight_prior[i]);
                 h.weight         = wt;   // legacy diagnostic = the translation channel
             } else {
                 s.weights[n] = w;

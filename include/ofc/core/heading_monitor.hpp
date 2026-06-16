@@ -98,8 +98,19 @@ public:
 
     // Bind the active source COUNT (the registered participants whose yaw the monitor ranks)
     // and clear all state. n is clamped to [0, kMaxSources]. The monitor is INERT (every boost
-    // 1.0) while n < 3 (the median consensus degenerates below three sources).
+    // 1.0) while n < 3 (the median consensus degenerates below three sources). Clears the
+    // per-source rot_weight_prior warm-starts (all reset to 1.0); the estimator re-binds them
+    // via set_rot_weight_prior after each (re)configure.
     void configure(int n);
+
+    // Bind source `i`'s configured rot_weight_prior (Slice 19d WARM-START). When the monitor is
+    // ON, an ABSTAINING / unscored source returns this prior (clamped to [1, boost_max]) from
+    // boost() instead of a neutral 1.0, so the config prior applies from t=0 with no discovery
+    // latency; once the source is scored the computed boost takes over (the prior is NOT
+    // re-multiplied -- the monitor ABSORBS rot_weight_prior, no double-count). Out-of-range `i`
+    // is ignored; a prior < 1 is stored as-is (it is clamped UP to 1 inside boost(), so it never
+    // demotes a source below neutral). Idempotent; safe to call after configure().
+    void set_rot_weight_prior(int i, Scalar prior);
 
     // Drop all accumulated state (keeps the source count). Called from configure() and the
     // estimator's init()/reset paths.
@@ -128,9 +139,12 @@ public:
 
     // Per-source ROTATION-channel boost for the given cap (>= 1). The weight rule
     // boost_i = clip(boost_max * min_j score_j / score_i, 1, boost_max) over the SCORED
-    // sources; ABSTAIN (returns exactly 1.0 for every source) until >= 2 are scored. An
-    // unscored source always returns 1.0 (it cannot be ranked yet). boost_max < 1 is clamped
-    // to 1 (a degenerate cap disables boosting). No heap; bounded.
+    // sources. WARM-START (Slice 19d): while ABSTAINING (< 2 scored) OR for an unscored source,
+    // boost returns that source's bound rot_weight_prior CLAMPED to [1, boost_max] (default 1.0
+    // when no prior was set) rather than a flat 1.0 -- the config prior applies from t=0 (no
+    // discovery latency); once the source is scored the computed boost takes over and ABSORBS
+    // the prior (no double-count). boost_max < 1 is clamped to 1 (a degenerate cap disables
+    // boosting). No heap; bounded.
     Scalar boost(int i, Scalar boost_max) const;
 
     // Anchor / pair counters (diagnostics + tests).
@@ -190,6 +204,12 @@ private:
     Scalar  anc_yaw_[kMaxSources] = {};
 
     Track   track_[kMaxSources];
+    // Per-source configured rot_weight_prior (Slice 19d warm-start). Bound by the estimator via
+    // set_rot_weight_prior after configure; the abstain/unscored boost paths return this value
+    // clamped to [1, boost_max] (default 1.0 -> the prior-1 abstain stays a flat 1.0, the 19c
+    // byte-identical pin). Runtime state, NOT persisted (the prior already lives in the config
+    // hash via SensorConfig::rot_weight_prior).
+    Scalar  rot_weight_prior_[kMaxSources];
     Scalar  t_valid_ = 0;                // total valid pair time (event-rate denominator)
 
     int     anchors_ = 0;
