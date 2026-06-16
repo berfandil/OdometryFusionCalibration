@@ -77,7 +77,7 @@ Real-data (orchestrator, post-merge — KAIST urban07/12/17, recommended urban c
 | run | local rot p50 | rot mean | trans p50 | notes |
 |---|---|---|---|---|
 | urban07 | 0.0276 → **0.0161 rad** | 0.0346 → **0.0191** | 1.35 → **0.98 m** | better everywhere (max 8.4→5.2 m) |
-| urban12 | 0.0133 → **0.0041 rad (0.23°)** | 0.0308 → **0.0183 (1.05°)** | 0.477 → **0.194 m** | full-drive rms rot 5.4° ≈ the FOG floor (4.6°); the 5–30°/61°-spike band GONE; tail ~same (1.88 m); ONE worst window regressed 120→211 m (recorded; everything else better) |
+| urban12 | 0.0133 → **0.0041 rad (0.23°)** | 0.0308 → **0.0183 (1.05°)** | 0.477 → **0.194 m** | full-drive rms rot 5.4° ≈ the FOG floor (4.6°); the 5–30°/61°-spike band GONE; tail ~same (1.88 m); ONE worst window regressed 120→211 m — **RESOLVED 2026-06-16 by the `cov_floor_m2=300` bank: worst window now 110.8 m, BELOW the pre-split 120 m (heading prize intact: local rot p50 0.23°, tail 1.94 m). The R-side under-confidence was over-trusting noisy GPS in that window; cov_floor=300 fixed it.** |
 | urban17 | 0.0055 (=) | 0.0087 (=) | 0.533 (=) | neutral — no regression |
 
 **The fused heading now tracks the best heading source.** Acceptance (<10° full-drive) met. Follow-ups logged: ~~layer (b) per-channel scatter reliability~~ (DONE — Slice 19b `51b86bf`), layer (c) GPS-course drift monitor (auto-discovery of the FOG), the one urban12 window regression, veto floors vs ≫1 s windows.
