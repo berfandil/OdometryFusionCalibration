@@ -133,8 +133,23 @@ To test limit (2): concatenated the 6-cam VO + CAN reference across all 10 mini 
 
 **So the camera lever is precisely diagnosed**: observable (it warms with data, unlike the radar) but needs CONTINUOUS NON-PLANAR drives to COMMIT — which nuScenes (always 20 s, planar urban) structurally cannot provide. The unlock is a dataset with long continuous + elevation-rich motion, not a calibrator change.
 
+### Noisy ego_pose-as-GPS (`tools/nuscenes_gps_from_gt.py`, 2026-06-21)
+
+Tested the last bullet below: feed the nuScenes ego_pose GT track, NOISED, as a GPS-style absolute-position correction into the 7-source replay (CAN wheel+imu + 5 radar Doppler). The tool inverts the `ofc_adapters::GpsCorrection` geodetic pipeline EXACTLY (ENU->ECEF->WGS-84 geodetic with the adapter's constants, `odom_from_enu=identity`, round-trip < 1e-9 m) so the noised ego x,y,z re-emerges as a position fix in the odom frame; adds zero-mean Gaussian noise (sigma_h horizontal, sigma_v vertical) at a GPS rate (2 Hz, subsampled from the ~169 Hz GT); and patches the manifest with a `[gps]` block (`cov_floor_m2 = sigma_h^2`) + `correction_rot_suppress_kappa = 0.8` (the urban recipe — kills the heading kick a large-residual position fix injects via the trans-rot cross-cov).
+
+**(1) Drift bounding — WORKS (the win):**
+
+| scene | baseline tail (no GPS) | GPS sigma_h=0.5 m (RTK) | GPS sigma_h=1.5 m (consumer) |
+|---|---|---|---|
+| scene-0061 | 5.40 m | **0.58 m** | 1.30 m |
+| scene-0103 | 6.51 m | **2.62 m** | — |
+
+All fixes applied (39/39, 0 rejected), NIS ~2.6 (vs DOF 3, consistent). The position-only GPS adds a small HEADING cost (scene-0061 local rot 2.6deg -> 7.9deg at sigma 0.5; tail_rot stays ~2.8deg) — inherent to a position-only absolute ref (no heading info; it perturbs yaw through the cross-cov), mitigated by `suppress_kappa` + cleaner GPS. Net: the GPS bounds the unbounded dead-reckoning drift across scenes.
+
+**(2) Heading-monitor activation — STRUCTURALLY BLOCKED on nuScenes (honest negative):** the monitor stays `scored=no` on every run. Root cause = `heading_monitor_const::kMinBase = 120 s` (the minimum slope baseline before `score()` returns a real value). **nuScenes scenes are ~19 s — 6x too short to ever accumulate the 120 s baseline.** The 10-scene `mini_concat` (200 s) clears 120 s but is a DIVERGENT stitch (baseline tail **867 m** with NO GPS — built for calib accumulation, not trajectory continuity), so the fused estimate runs away from the GT-frame GPS and the Mahalanobis gate rejects 356/397 fixes. No nuScenes vehicle is BOTH > 120 s AND a continuous trackable drive. **The GPS-course heading monitor is a KAIST-class long-continuous-drive tool; nuScenes's 20 s scene granularity is below its activation floor — not a tuning issue, a dataset-structure one** (lowering `kMinBase` is a core change that would re-base golden/cov-cal — not worth it for a stand-in GPS). Tool: `tools/nuscenes_gps_from_gt.py`.
+
 ## Natural next steps
 - **Translation-only-source lever estimator** (core feature) → the radar (velocity-only) lever unlock; trainval data alone will not (the algorithm-bound is the calibrator; the SENSOR-bound radar rotation is unlocked by a 4D radar — `RADAR_SCAN_ODOMETRY.md`).
 - **Real 4D radar dataset** (View-of-Delft / K-Radar) → confirm the synth-4D radar rotation unlock on real imaging radar (download-gated; the converter + 3D path are ready).
 - ~~**Longer camera scenes (trainval)** → warm the camera LEVER estimator past the 20 s limit~~ **DONE (`2cf90fb`)**: 10-scene accumulation WARMED the levers off conf-0 (length confirmed as the limit) but they don't COMMIT — the barrier is now CONTINUOUS NON-PLANAR data (nuScenes can't provide it; trainval is also 20 s fragments + planar). **A long continuous + elevation-rich driving dataset** is the camera-lever-commit unlock — not nuScenes, not the calibrator.
-- **Noisy ego_pose as a sparse GPS-style correction** → bounds the dead-reckoning drift AND activates the heading monitor on nuScenes (mildly circular since ego_pose is GT; a deliberate stand-in).
+- ~~**Noisy ego_pose as a sparse GPS-style correction** → bounds the dead-reckoning drift AND activates the heading monitor~~ **DONE (`nuscenes_gps_from_gt.py`, 2026-06-21)**: drift-bounding WORKS (scene-0061 tail 5.40 -> 0.58 m RTK / 1.30 m consumer; scene-0103 6.51 -> 2.62 m; NIS consistent), but the **heading monitor is STRUCTURALLY BLOCKED on nuScenes** — its 120 s slope baseline can't be met by 19 s scenes, and `mini_concat` (200 s) is a divergent stitch (867 m baseline). The monitor needs a long continuous drive (KAIST); nuScenes's 20 s granularity is below its floor. See the Noisy-ego_pose-as-GPS section above.
