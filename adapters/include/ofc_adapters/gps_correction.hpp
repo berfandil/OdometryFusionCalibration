@@ -26,6 +26,8 @@
 #include "ofc/core/absolute_ref.hpp"
 #include "ofc/core/types.hpp"
 
+#include <vector>
+
 namespace ofc {
 namespace adapters {
 
@@ -63,6 +65,22 @@ struct GpsConfig {
     // Optional R inflation / floor (m^2 added to the ENU cov diagonal before rotating into odom)
     // for robustness against an over-optimistic receiver covariance. Default 0.
     double cov_floor_m2 = 0.0;
+
+    // INNOVATION-ADAPTIVE ROBUST R (off by default; GPS_R_NEES_SWEEP.md follow-up). A scalar
+    // cov_floor cannot be cross-drive consistent: the honest GPS measurement R varies ~2 -> 22 m^2
+    // across KAIST drives, and a multipath drive (urban12) carries a population of gross outliers.
+    // When adaptive_r is true, evaluate() sets R from the ROBUST scale (MAD) of the last
+    // `adaptive_window` innovations (z - h) per odom axis instead of the cov_enu+floor path:
+    //   R_odom = diag( max( (1.4826*MAD_i)^2, adaptive_r_floor_m2 ) ).
+    // MAD tracks the BULK spread (outlier-immune), so R stays small on a clean drive (consistent
+    // NIS) and gross multipath fixes show a LARGE NIS -> the estimator's Mahalanobis gate rejects
+    // them, instead of a uniform cov_floor inflation that over-distrusts the GOOD fixes too. The
+    // ring fills causally (R for fix k uses fixes [k-window, k-1]); until `adaptive_min_samples`
+    // innovations are seen it falls back to the cov_enu+floor path. Relaxed-edge: heap ring.
+    bool   adaptive_r           = false;
+    int    adaptive_window      = 60;     // innovations in the robust-scale window
+    int    adaptive_min_samples = 10;     // fall back to cov_floor until this many seen
+    double adaptive_r_floor_m2  = 0.25;   // R floor (m^2) — the best-case receiver noise
 };
 
 // A production ICorrection that emits a dim=3 GPS position fix at the current frontier state.
@@ -112,6 +130,11 @@ private:
     mutable bool      have_pending_ = false;          // an unconsumed valid fix is waiting
     mutable GpsFix    pending_;                       // the most recent unconsumed valid fix
     mutable Vec3      last_enu_     = Vec3::Zero();    // last computed ENU (diagnostics)
+
+    // Adaptive-R: a causal ring of the last innovations (odom-frame z - h) + a helper that returns
+    // the robust per-axis variance (MAD^2) over the ring, or false if fewer than min_samples.
+    mutable std::vector<Vec3> innov_ring_;            // most-recent at the back; trimmed to window
+    bool adaptive_var(Vec3& var_out) const;
 };
 
 } // namespace adapters

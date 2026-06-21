@@ -405,3 +405,68 @@ TEST_CASE("GPS end-to-end: removes fused-odometry drift through the estimator an
 
     MESSAGE("baseline tail-mean err = " << baseline_tail << " m, GPS tail-mean err = " << gps_tail << " m");
 }
+
+// ---------------------------------------------------------------------------------------------
+// 7. Innovation-adaptive robust R (GPS_R_NEES_SWEEP.md follow-up). A scalar cov_floor cannot be
+//    cross-drive consistent; adaptive_r sets R from the robust (MAD) scale of recent innovations.
+//    Default OFF == the cov_enu+cov_floor path (byte-identical); ON tracks the BULK spread, is
+//    floored on a tight stream, and IMMUNE to a gross outlier (the multipath case). Identity pose
+//    -> innovation == z == the fix ENU, so the fixes control the innovation directly.
+// ---------------------------------------------------------------------------------------------
+TEST_CASE("GPS adaptive-R: default off byte-identical; on = bulk spread, floored, outlier-immune") {
+    const double lat0 = 47.0, lon0 = 8.0, alt0 = 400.0;
+    State x;  // identity pose -> innovation == z == fix ENU
+
+    auto feed = [&](GpsCorrection& g, double dlat, double dlon, double dalt, Vec3& rdiag) {
+        g.submit_fix(make_fix(lat0 + dlat, lon0 + dlon, alt0 + dalt));
+        Measurement m;
+        REQUIRE(g.evaluate(x, m));
+        rdiag = m.R.topLeftCorner<3, 3>().diagonal();
+    };
+
+    // --- default OFF: R == cov_enu(I) + cov_floor*I (the unchanged path) ---
+    {
+        GpsConfig c = datum_cfg(lat0, lon0, alt0);
+        c.cov_floor_m2 = 4.0;                       // 1 + 4 = 5 on each axis
+        GpsCorrection g(c);
+        Vec3 r; feed(g, 1e-5, 0, 0, r);
+        CHECK(r.x() == doctest::Approx(5.0).epsilon(1e-9));
+        CHECK(r.y() == doctest::Approx(5.0).epsilon(1e-9));
+        CHECK(r.z() == doctest::Approx(5.0).epsilon(1e-9));
+    }
+
+    // --- adaptive ON, TIGHT stream (identical fixes -> zero spread) -> R == floor ---
+    {
+        GpsConfig c = datum_cfg(lat0, lon0, alt0);
+        c.adaptive_r = true; c.adaptive_min_samples = 10; c.adaptive_r_floor_m2 = 0.25;
+        GpsCorrection g(c);
+        Vec3 r; for (int k = 0; k < 14; ++k) feed(g, 1e-5, 1e-5, 0.0, r);
+        CHECK(r.x() == doctest::Approx(0.25).epsilon(1e-6));
+        CHECK(r.y() == doctest::Approx(0.25).epsilon(1e-6));
+        CHECK(r.z() == doctest::Approx(0.25).epsilon(1e-6));
+    }
+
+    // --- adaptive ON, ONE gross outlier among a tight stream -> R STAYS floored (MAD-immune) ---
+    {
+        GpsConfig c = datum_cfg(lat0, lon0, alt0);
+        c.adaptive_r = true; c.adaptive_min_samples = 10; c.adaptive_r_floor_m2 = 0.25;
+        GpsCorrection g(c);
+        Vec3 r;
+        for (int k = 0; k < 13; ++k) feed(g, 1e-5, 1e-5, 0.0, r);  // tight bulk
+        feed(g, 5e-3, 5e-3, 0.0, r);                                // gross multipath fix (~hundreds m)
+        feed(g, 1e-5, 1e-5, 0.0, r);                                // R now uses the ring incl. the outlier
+        CHECK(r.x() == doctest::Approx(0.25).epsilon(1e-6));        // median-immune -> still floored
+        CHECK(r.y() == doctest::Approx(0.25).epsilon(1e-6));
+    }
+
+    // --- adaptive ON, a real bulk SPREAD -> R rises above the floor ---
+    {
+        GpsConfig c = datum_cfg(lat0, lon0, alt0);
+        c.adaptive_r = true; c.adaptive_min_samples = 10; c.adaptive_r_floor_m2 = 0.01;
+        GpsCorrection g(c);
+        Vec3 r;
+        for (int k = 0; k < 20; ++k) feed(g, 0.0, k * 1e-5, 0.0, r);  // East ramp 0..~14 m (unimodal spread)
+        CHECK(r.x() > 0.5);                                          // East spread -> real R
+        CHECK(r.y() == doctest::Approx(0.01).epsilon(1e-6));         // North flat -> floor
+    }
+}

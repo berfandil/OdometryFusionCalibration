@@ -205,6 +205,10 @@ std::string parse_manifest(const std::string& text, Manifest& m) {
             else if (key == "lever_y" && to_double(val, d)) { m.gps_cfg.lever_arm_base.y() = d; }
             else if (key == "lever_z" && to_double(val, d)) { m.gps_cfg.lever_arm_base.z() = d; }
             else if (key == "cov_floor_m2" && to_double(val, d)) { m.gps_cfg.cov_floor_m2 = d; }
+            else if (key == "adaptive_r") { m.gps_cfg.adaptive_r = (val == "true" || val == "1"); }
+            else if (key == "adaptive_window" && to_double(val, d)) { m.gps_cfg.adaptive_window = static_cast<int>(d); }
+            else if (key == "adaptive_min_samples" && to_double(val, d)) { m.gps_cfg.adaptive_min_samples = static_cast<int>(d); }
+            else if (key == "adaptive_r_floor_m2" && to_double(val, d)) { m.gps_cfg.adaptive_r_floor_m2 = d; }
             else return err("unknown [gps] key '" + key + "'");
             continue;
         }

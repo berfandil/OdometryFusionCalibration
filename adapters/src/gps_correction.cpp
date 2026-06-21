@@ -6,7 +6,9 @@
 
 #include "ofc/core/lie.hpp"   // so3::hat (skew of the lever arm)
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace ofc {
 namespace adapters {
@@ -91,6 +93,26 @@ void GpsCorrection::submit_fix(const GpsFix& fix) {
     last_enu_     = fix_to_enu(fix);
 }
 
+// Robust per-axis variance (MAD^2) of the innovation ring. Returns false (caller falls back to the
+// cov_floor path) until adaptive_min_samples innovations are seen. MAD = median(|r - median(r)|),
+// scaled by 1.4826 to a Gaussian sigma; outlier-immune so gross multipath fixes do not inflate R.
+bool GpsCorrection::adaptive_var(Vec3& var_out) const {
+    const int n = static_cast<int>(innov_ring_.size());
+    if (n < cfg_.adaptive_min_samples) return false;
+    std::vector<double> col(static_cast<std::size_t>(n));
+    for (int ax = 0; ax < 3; ++ax) {
+        for (int k = 0; k < n; ++k) col[static_cast<std::size_t>(k)] = innov_ring_[static_cast<std::size_t>(k)][ax];
+        std::nth_element(col.begin(), col.begin() + n / 2, col.end());
+        const double med = col[static_cast<std::size_t>(n / 2)];
+        for (int k = 0; k < n; ++k) col[static_cast<std::size_t>(k)] = std::abs(col[static_cast<std::size_t>(k)] - med);
+        std::nth_element(col.begin(), col.begin() + n / 2, col.end());
+        const double mad   = col[static_cast<std::size_t>(n / 2)];
+        const double sigma = 1.4826 * mad;
+        var_out[ax] = std::max(sigma * sigma, cfg_.adaptive_r_floor_m2);
+    }
+    return true;
+}
+
 bool GpsCorrection::evaluate(const State& x, Measurement& out) const {
     if (!have_pending_ || !have_datum_) return false;   // no fresh fix this step
 
@@ -106,7 +128,8 @@ bool GpsCorrection::evaluate(const State& x, Measurement& out) const {
     // --- residual = z (-) h(x) -----------------------------------------------------------------
     out.dim = 3;
     out.residual.setZero();
-    out.residual.head<3>() = z - h;
+    const Vec3 innov = z - h;
+    out.residual.head<3>() = innov;
 
     // --- Jacobian H = [ R | -R*[l]x | 0_3x6 ]  (3x12) ------------------------------------------
     // Right-error tangent: h(eta) = t + R*rho + R*(I+[theta]x)*l => dh/drho = R, dh/dtheta = -R*[l]x
@@ -115,11 +138,29 @@ bool GpsCorrection::evaluate(const State& x, Measurement& out) const {
     out.H.block<3, 3>(0, 0) = x.pose.R;
     out.H.block<3, 3>(0, 3) = -x.pose.R * so3::hat(l);
 
-    // --- noise R_odom = R_align*(cov_enu + floor*I3)*R_align^T ----------------------------------
-    const Mat3 cov_enu_floored = pending_.cov_enu + cfg_.cov_floor_m2 * Mat3::Identity();
-    const Mat3 R_align         = cfg_.odom_from_enu.R;
+    // --- noise R_odom ---------------------------------------------------------------------------
     out.R.setZero();
-    out.R.block<3, 3>(0, 0) = R_align * cov_enu_floored * R_align.transpose();
+    Vec3 avar;
+    if (cfg_.adaptive_r && adaptive_var(avar)) {
+        // INNOVATION-ADAPTIVE: R from the robust scale of recent innovations (odom-axis diagonal).
+        // S = HPH^T + R then matches the bulk innovation spread per drive (cross-drive consistent),
+        // while gross multipath fixes exceed it -> the estimator gate rejects them.
+        out.R.block<3, 3>(0, 0) = avar.asDiagonal();
+    } else {
+        // DEFAULT (byte-identical when adaptive_r off): R_align*(cov_enu + floor*I3)*R_align^T.
+        const Mat3 cov_enu_floored = pending_.cov_enu + cfg_.cov_floor_m2 * Mat3::Identity();
+        const Mat3 R_align         = cfg_.odom_from_enu.R;
+        out.R.block<3, 3>(0, 0) = R_align * cov_enu_floored * R_align.transpose();
+    }
+
+    // Causal ring update: record THIS innovation AFTER R was set from the prior window, so fix k's R
+    // depends only on fixes [k-window, k-1]. Every evaluated fix (accepted or later gate-rejected)
+    // feeds the robust scale -- the MAD is immune to the rejected outliers it sees.
+    if (cfg_.adaptive_r) {
+        innov_ring_.push_back(innov);
+        const std::size_t w = static_cast<std::size_t>(cfg_.adaptive_window > 0 ? cfg_.adaptive_window : 1);
+        if (innov_ring_.size() > w) innov_ring_.erase(innov_ring_.begin());
+    }
 
     // Stamp policy: the FIX's own acquisition time (a real sensor stamp), not x.stamp. See header.
     out.stamp = pending_.stamp;

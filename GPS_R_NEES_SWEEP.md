@@ -40,4 +40,39 @@
 ## 4. Status
 - [x] Sweep run (urban07 full, urban17 to cov 3200, urban12 to cov 200) + analyzed.
 - [x] Docs updated (CONFIG `cov_floor_m2` note; ISSUES per-fix-R / GPS-vs-GT-confound item) + **recipe banked: urban `cov_floor_m2 = 300`** (HANDOFF URBAN TRAJECTORY RECIPE, `28339aa`+bank).
-- [ ] (follow-up) per-fix/multipath-aware `R` model + GPS-vs-GT frame-offset characterization; un-gated-NIS R calibration methodology.
+- [x] (follow-up DONE, 2026-06-21) un-gated-NIS methodology + bias/spread decomposition + an innovation-adaptive ROBUST `R` model — see §5.
+
+---
+
+## 5. Follow-up: un-gated NIS, bias/spread decomposition, innovation-adaptive R (2026-06-21)
+
+Built the un-gated-NIS methodology the §3 recommendation pointed to: `tools/gps_innovation_analysis.py` computes the per-fix innovation `nu = z_gps - h(x_fused)` OFFLINE (from the replay `out.csv` fused pose + cov diag and the GPS CSV, exact geodetic transform), DECOMPOSES it into MEAN (frame offset / bias) + COVARIANCE (measurement spread), and reports the un-gated NIS over ALL fixes (the sweep had only the gate-biased-low accepted NIS).
+
+**Decomposition (urban07/12/17, cov_floor 25):**
+
+| drive | mean nu \|bias\| | spread rms | honest R_spread | un-gated NIS (mean) |
+|---|---|---|---|---|
+| urban07 | **0.48 m** | 3.1 m | ~2 m^2 | 0.35 |
+| urban17 | **0.30 m** | 5.2 m | ~22 m^2 | 0.97 |
+| urban12 | **181 m** | 538 m | ~1.4e5 m^2 | 2495 (median 0.42) |
+
+**Sharpened findings:**
+1. **The GPS-vs-FUSED bias is SMALL on the clean drives (0.3-0.5 m)** — the fused state TRACKS the GPS. The ~8-26 m the §2 sweep saw is the GPS/fused-vs-**GT** offset (the NEES confound), NOT in the innovation. So the huge pose-NEES is a GT-frame disagreement, confirmed with innovation numbers.
+2. **The honest measurement `R` is SMALL and cross-drive-VARYING** (urban07 ~2, urban17 ~22 m^2), and the un-gated NIS is FAR below 3 -> `cov_floor = 25/300` is OVER-conservative for the clean-drive MEASUREMENT (the inflation was band-aiding the GT-frame NEES + urban12's outliers).
+3. **urban12 is an OUTLIER-multipath drive**, not a uniform-R one: median NIS 0.42 (bulk fine), but a population of ~180 m gross fixes (GPS-hostile canyon) -> mean NIS 2495. A bigger uniform R is the wrong tool; the fix is per-fix robust rejection.
+
+**The model — innovation-adaptive ROBUST `R`** (`GpsConfig::adaptive_r`, `gps_correction.{hpp,cpp}`; opt-in, default-off byte-identical, manifest keys `adaptive_r`/`adaptive_window`/`adaptive_min_samples`/`adaptive_r_floor_m2`): `evaluate()` sets `R_odom = diag(max((1.4826*MAD_i)^2, floor))` from the robust scale of the last `window` innovations per odom axis. MAD tracks the BULK spread (outlier-immune), so R stays small on a clean drive and gross multipath fixes show a LARGE NIS -> the estimator's Mahalanobis gate rejects them. Causal (R for fix k uses fixes [k-window, k-1]); the ring sees every evaluated fix (the MAD is immune to the rejects it sees).
+
+**In-loop result (adaptive vs the banked `cov_floor = 300`):**
+
+| drive | NEES (b300 -> adapt) | NIS (b300 -> adapt) | local p50 drift | rejects |
+|---|---|---|---|---|
+| urban07 | 18.9 -> 1808 | 0.06 -> **1.36** | 1.02 -> 1.54 m | 90 |
+| urban12 | 254 -> 23902 | 0.23 -> **0.68** | 0.67 -> **0.30** m | 1140 |
+| urban17 | 156 -> 28667 | 0.03 -> **1.13** | 0.51 -> **0.37** m | 158 |
+
+**Verdict — the adaptive R SURGICALLY SEPARATES the two error sources the scalar sweep conflated:**
+- It makes the **NIS consistent + cross-drive self-calibrating** (1.36/0.68/1.13 vs the scalar's 0.06/0.23/0.03 -> the measurement model is now honest), AND improves the typical (p50) drift on the OUTLIER drives (urban12 0.67->0.30, urban17 0.51->0.37 — the robust rejection working).
+- But **NEES-vs-GT EXPLODES** (18.9->1808 etc.): with honest-small R the filter confidently tracks the GPS, which is offset from GT -> confident-but-wrong. **This PROVES the consistency problem is a GT-frame BIAS, not measurement `R`** — the `cov_floor` inflation was band-aiding the bias; an honest R cannot fix it. The clean drive (urban07) accuracy also slightly degrades (over-trusts the offset GPS).
+
+So the adaptive R is **the principled MEASUREMENT model** (NIS-honest, cross-drive, helps multipath drift) shipped opt-in (default-off, like the Slice-15 Huber) — NOT a drop-in accuracy win, because the dominant KAIST GPS error is the **GPS-vs-GT frame offset** (a SLAM-vs-VRS alignment bias), which is the real remaining open item and needs a bias model (alignment / lever / SLAM-drift), not an R model. Tools: `tools/gps_innovation_analysis.py`; feature in `adapters/{include,src}/.../gps_correction.*` + a `test_gps_correction` adaptive-R case.
